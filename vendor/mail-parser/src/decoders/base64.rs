@@ -65,6 +65,38 @@ pub fn base64_decode_stream<'x>(
 
 impl<'x> MessageStream<'x> {
     pub fn decode_base64_mime(&mut self, boundary: &[u8]) -> (usize, Cow<'x, [u8]>) {
+        if let Some(decoded) = self.decode_base64_mime_simd(boundary) {
+            return decoded;
+        }
+        self.decode_base64_mime_scalar(boundary)
+    }
+
+    fn decode_base64_mime_simd(&mut self, boundary: &[u8]) -> Option<(usize, Cow<'x, [u8]>)> {
+        if boundary.is_empty() {
+            return None;
+        }
+        let start = self.offset();
+        let rest = self.bytes(start..start + self.remaining());
+        let dashes = memchr::memmem::find(rest, b"--")?;
+        let encoded = &rest[..dashes];
+        if !rest[dashes + 2..].starts_with(boundary)
+            || memchr::memchr2(b'-', b'\x0c', encoded).is_some()
+            || !padding_only_at_the_end(encoded)
+        {
+            return None;
+        }
+        let whitespace = memchr::memchr3_iter(b' ', b'\t', b'\r', encoded).count()
+            + memchr::memchr_iter(b'\n', encoded).count();
+        if (encoded.len() - whitespace) % 4 != 0 {
+            return None;
+        }
+        let decoded = base64_simd::forgiving_decode_to_vec(encoded).ok()?;
+        let end_pos = start + crate::parsers::mime::end_before_delimiter(encoded);
+        self.skip_bytes(dashes + 2 + boundary.len());
+        Some((end_pos, decoded.into()))
+    }
+
+    pub(crate) fn decode_base64_mime_scalar(&mut self, boundary: &[u8]) -> (usize, Cow<'x, [u8]>) {
         let mut chunk: u32 = 0;
         let mut byte_count: u8 = 0;
 
@@ -390,6 +422,14 @@ pub static BASE64_MAP: &[&[u32]] = &[
     ],
 ];
 
+fn padding_only_at_the_end(encoded: &[u8]) -> bool {
+    memchr::memchr(b'=', encoded).is_none_or(|first| {
+        encoded[first..]
+            .iter()
+            .all(|&byte| matches!(byte, b'=' | b' ' | b'\t' | b'\r' | b'\n'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parsers::MessageStream;
@@ -477,5 +517,47 @@ mod tests {
                 "Failed for {encoded_str:?}",
             );
         }
+    }
+
+    #[test]
+    fn simd_and_scalar_decoders_agree_on_generated_parts() {
+        let alphabet: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n \t-_!\x0c";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut fast_path_hits = 0;
+        for _ in 0..200_000 {
+            let len = (next() % 40) as usize;
+            let mut body: Vec<u8> = (0..len)
+                .map(|_| {
+                    let pick = next() % 100;
+                    let index = if pick < 85 { next() % 64 } else { next() % alphabet.len() as u64 };
+                    alphabet[index as usize]
+                })
+                .collect();
+            if next() % 3 == 0 {
+                body.extend_from_slice(if next() % 2 == 0 { b"==" } else { b"=" });
+            }
+            if next() % 2 == 0 {
+                body.extend_from_slice(b"\r\n");
+            } else if next() % 2 == 0 {
+                body.push(b'\n');
+            }
+            body.extend_from_slice(b"--boundary\nrest");
+            let mut fast = MessageStream::new(&body);
+            let mut slow = MessageStream::new(&body);
+            let expected = slow.decode_base64_mime_scalar(b"boundary");
+            let actual = fast.decode_base64_mime(b"boundary");
+            assert_eq!(actual, expected, "input {:?}", String::from_utf8_lossy(&body));
+            assert_eq!(fast.offset(), slow.offset(), "resume offset for {:?}", String::from_utf8_lossy(&body));
+            if MessageStream::new(&body).decode_base64_mime_simd(b"boundary").is_some() {
+                fast_path_hits += 1;
+            }
+        }
+        assert!(fast_path_hits > 20_000, "fast path ran {fast_path_hits} times");
     }
 }

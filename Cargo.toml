@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/mboxturbo", "crates/mboxturbo-py"]
+exclude = ["vendor/mail-parser"]
 
 [workspace.package]
 version = "0.1.0"
@@ -99,3 +100,6 @@ codegen-units = 1
 [profile.bench]
 inherits = "release"
 debug = "line-tables-only"
+
+[patch.crates-io]
+mail-parser = { path = "vendor/mail-parser" }

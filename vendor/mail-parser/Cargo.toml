@@ -104,3 +104,9 @@ version = "1.0"
 
 [profile.bench]
 debug = 2
+
+[dependencies.base64-simd]
+version = "0.8"
+
+[dependencies.memchr]
+version = "2.8"
