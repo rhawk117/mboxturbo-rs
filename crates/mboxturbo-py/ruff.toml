@@ -1,0 +1,106 @@
+target-version = "py314"
+line-length = 90
+indent-width = 4
+src = ["src"]
+show-fixes = true
+unsafe-fixes = false
+output-prefer-rule-codes = true
+respect-gitignore = true
+force-exclude = true
+
+[format]
+preview = true
+quote-style = "single"
+
+[lint]
+preview = true
+explicit-preview-rules = true
+
+extend-select = [
+    "A", "ANN", "ARG", "ASYNC", "B", "BLE", "C4", "C90", "DTZ", "E", "EM", "ERA",
+    "EXE", "F", "FBT", "FLY", "FURB", "G", "I", "ICN", "LOG", "N", "PERF", "PGH",
+    "PIE", "PL", "PT", "PTH", "PYI", "RET", "RSE", "RUF", "S", "SIM", "SLF", "SLOT",
+    "T10", "T20", "TID", "TRY", "UP", "W",
+    "COM818", "ISC001",
+    "E201", "E202", "E203", "E204", "E211", "E221", "E222", "E223", "E224", "E225",
+    "E226", "E227", "E228", "E231", "E241", "E242", "E251", "E252", "E261", "E262",
+    "E265", "E266", "E271", "E272", "E273", "E274", "E275", "E301", "E302", "E303",
+    "E304", "E305", "E306", "E502",
+    "B043", "B909", "PLC2701", "PLC2801", "PLE1141", "PLE4703", "PLR0904", "PLR0914",
+    "PLR0916", "PLR1702", "PLW0244", "PLW0717", "PLW1514", "PLW3201", "RUF027",
+    "RUF045", "RUF052", "RUF054", "RUF066", "RUF071", "RUF072", "RUF074", "PT029",
+    "UP052",
+    "pytest-fixture-autouse",
+]
+
+ignore = [
+    "E111", "E114", "E117", "W191", "EM101",
+    "ASYNC109",
+    "RET504",
+]
+dummy-variable-rgx = "^_.*$"
+
+[lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[lint.flake8-annotations]
+allow-star-arg-any = false
+ignore-fully-untyped = false
+mypy-init-return = false
+suppress-dummy-args = false
+suppress-none-returning = false
+
+[lint.flake8-bandit]
+check-typed-exception = true
+
+[lint.flake8-builtins]
+strict-checking = true
+
+[lint.flake8-pytest-style]
+fixture-parentheses = false
+mark-parentheses = false
+parametrize-names-type = "tuple"
+parametrize-values-type = "list"
+parametrize-values-row-type = "tuple"
+
+[lint.flake8-unused-arguments]
+ignore-variadic-names = false
+
+[lint.mccabe]
+max-complexity = 6
+
+[lint.pylint]
+max-args = 4
+max-positional-args = 3
+max-branches = 6
+max-statements = 20
+max-locals = 8
+max-bool-expr = 3
+max-nested-blocks = 2
+max-statements-in-try = 2
+max-public-methods = 8
+
+[lint.flake8-tidy-imports.banned-api]
+"__future__.annotations".msg = "Python 3.14 evaluates annotations lazily."
+"functools.partial".msg = "Use a named function or a class with a verb method."
+"asyncio.gather".msg = "Use asyncio.TaskGroup."
+"importlib.import_module".msg = "Import statically."
+"importlib.reload".msg = "Import statically."
+"importlib.util.spec_from_file_location".msg = "Import statically."
+"sys.path".msg = "Path hacks break editor intellisense; install the package."
+"sys.modules".msg = "Path hacks break editor intellisense; install the package."
+"abc.ABC".msg = "Use a runtime_checkable Protocol."
+"abc.ABCMeta".msg = "Use a runtime_checkable Protocol."
+"abc.abstractmethod".msg = "Use a runtime_checkable Protocol."
+"typing.cast".msg = "Fix the type instead of casting it."
+"os.chdir".msg = "Pass paths explicitly."
+"sys.exit".msg = "Return an exit code and raise SystemExit(main())."
+"inspect.currentframe".msg = "Frame inspection is banned."
+"os.execl".msg = "Use subprocess."
+"os.execle".msg = "Use subprocess."
+"os.execlp".msg = "Use subprocess."
+"os.execlpe".msg = "Use subprocess."
+"os.execv".msg = "Use subprocess."
+"os.execve".msg = "Use subprocess."
+"os.execvp".msg = "Use subprocess."
+"os.execvpe".msg = "Use subprocess."

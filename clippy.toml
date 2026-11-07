@@ -1,0 +1,13 @@
+msrv = "1.97"
+avoid-breaking-exported-api = false
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+cognitive-complexity-threshold = 15
+too-many-lines-threshold = 60
+too-many-arguments-threshold = 5
+max-fn-params-bools = 1
+max-struct-bools = 2
