@@ -68,7 +68,7 @@ pub struct Timestamp {
 }
 
 /// A decoded attachment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment<'a> {
     /// File name from `Content-Disposition` or `Content-Type`.
     pub filename: Option<&'a str>,
@@ -77,7 +77,7 @@ pub struct Attachment<'a> {
     /// Media subtype, such as `pdf`.
     pub media_subtype: Option<&'a str>,
     /// Contents with the transfer encoding (base64, quoted-printable) removed.
-    pub data: &'a [u8],
+    pub data: Cow<'a, [u8]>,
 }
 
 impl Attachment<'_> {

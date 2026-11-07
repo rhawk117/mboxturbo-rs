@@ -14,7 +14,7 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
-use mail_parser::{HeaderName, MessageParser};
+use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -217,18 +217,20 @@ fn depth_for(columns: &[Column]) -> Depth {
     if !columns.iter().any(Column::needs_parsing) {
         return Depth::Nothing;
     }
-    let ignoring_the_rest = MessageParser::new().default_header_ignore();
+    let ignoring_the_rest = MessageParser::new().unknown_headers(HeaderForm::Ignore);
     Depth::Headers(
         columns
             .iter()
             .fold(ignoring_the_rest, |parser, column| match column {
-                Column::From => parser.header_address(HeaderName::From),
-                Column::To => parser.header_address(HeaderName::To),
-                Column::Cc => parser.header_address(HeaderName::Cc),
-                Column::ReplyTo => parser.header_address(HeaderName::ReplyTo),
-                Column::Subject => parser.header_text(HeaderName::Subject),
-                Column::Date | Column::DateOffsetMinutes => parser.header_date(HeaderName::Date),
-                Column::MessageId => parser.header_id(HeaderName::MessageId),
+                Column::From => parser.header(HeaderName::From, HeaderForm::Addresses),
+                Column::To => parser.header(HeaderName::To, HeaderForm::Addresses),
+                Column::Cc => parser.header(HeaderName::Cc, HeaderForm::Addresses),
+                Column::ReplyTo => parser.header(HeaderName::ReplyTo, HeaderForm::Addresses),
+                Column::Subject => parser.header(HeaderName::Subject, HeaderForm::Text),
+                Column::Date | Column::DateOffsetMinutes => {
+                    parser.header(HeaderName::Date, HeaderForm::Date)
+                }
+                Column::MessageId => parser.header(HeaderName::MessageId, HeaderForm::MessageIds),
                 Column::Position
                 | Column::Offset
                 | Column::Size
@@ -341,7 +343,7 @@ impl AttachmentSlot {
                 builder.append(true);
             }
             Self::Sha256(builder) => {
-                let digests = attachments.map(|attachment| Some(sha256_hex(attachment.data)));
+                let digests = attachments.map(|attachment| Some(sha256_hex(&attachment.data)));
                 builder.values().extend(digests);
                 builder.append(true);
             }
@@ -367,7 +369,7 @@ enum AddressHeader {
 }
 
 impl AddressHeader {
-    fn of<'a>(self, mail: &'a Mail<'a>) -> Option<&'a mail_parser::Address<'a>> {
+    fn of<'a>(self, mail: &'a Mail<'a>) -> Option<AddressList<'a>> {
         match self {
             Self::From => mail.from(),
             Self::To => mail.to(),

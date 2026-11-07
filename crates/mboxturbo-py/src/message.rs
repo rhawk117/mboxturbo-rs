@@ -127,7 +127,7 @@ impl Message {
             .map(|attachment| Attachment {
                 filename: attachment.filename.map(str::to_owned),
                 content_type: attachment.content_type(),
-                data: PyBytes::new(py, attachment.data).unbind(),
+                data: PyBytes::new(py, &attachment.data).unbind(),
             })
             .collect()
     }

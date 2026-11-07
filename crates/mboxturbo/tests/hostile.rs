@@ -32,7 +32,7 @@ mod hostile {
         );
         black_box(message.text_bodies().chain(message.html_bodies()).count());
         message.attachments().for_each(|attachment| {
-            black_box((attachment.data, attachment.content_type()));
+            black_box((&attachment.data, attachment.content_type()));
         });
         black_box(message.raw());
     }

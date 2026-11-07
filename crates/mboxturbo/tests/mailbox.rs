@@ -188,7 +188,7 @@ AAEC\n\
             Some("application/octet-stream"),
             "media type"
         );
-        assert_eq!(attachments[0].data, [0, 1, 2], "base64 removed");
+        assert_eq!(*attachments[0].data, [0, 1, 2], "base64 removed");
         let html: Vec<_> = message.html_bodies().collect();
         assert!(html[0].contains("<p>hello</p>"), "html body");
     }
