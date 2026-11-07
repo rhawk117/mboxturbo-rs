@@ -20,6 +20,9 @@ dev = [
 polars = [
     "polars>=2.1.0",
 ]
+security = [
+    "pysentry-rs>=0.5.0",
+]
 
 [tool.maturin]
 module-name = "mboxturbo._core"

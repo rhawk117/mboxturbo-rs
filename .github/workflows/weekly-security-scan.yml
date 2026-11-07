@@ -1,0 +1,81 @@
+name: Weekly Supply Chain Audit
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 8 * * 1"
+
+permissions: {}
+concurrency:
+  group: weekly-security-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  audit-python-dependencies:
+    if: ${{ github.event.repository.fork != true }}
+    name: 🔍 Audit Python Dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ vars.UV_VERSION }}
+          cache-dependency-glob: crates/mboxturbo-py/uv.lock
+
+      - name: Audit Dependencies
+        uses: ./.github/actions/pysentry
+        with:
+          uv-version: ${{ vars.UV_VERSION }}
+          project-directory: crates/mboxturbo-py
+          force-scan: "true"
+          upload-sarif: "true"
+
+  audit-rust-dependencies:
+    if: ${{ github.event.repository.fork != true }}
+    name: 🦀 Audit Rust Dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check RustSec Advisories (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
+  report-security-findings:
+    if: ${{ always() && !cancelled() && github.event.repository.fork != true }}
+    name: 📣 Report Security Findings
+    needs: [audit-python-dependencies, audit-rust-dependencies]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report Audit Results
+        run: bash ./.github/scripts/report-security.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AUDIT_RESULT: ${{ needs.audit-python-dependencies.result == 'success' && needs.audit-rust-dependencies.result || needs.audit-python-dependencies.result }}

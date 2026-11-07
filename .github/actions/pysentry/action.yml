@@ -1,0 +1,118 @@
+name: PySentry Dependency Audit
+description: |
+  Audit uv-locked Python dependencies with pysentry-rs. A clean result is cached and reused for the rest of the ISO
+  week until pyproject.toml or uv.lock changes; force-scan always rescans and seeds that cache. The repository must
+  already be checked out.
+
+  Required job permissions:
+    contents: read          checkout and code scanning upload
+    security-events: write  only when upload-sarif is 'true'
+    actions: read           only when upload-sarif is 'true' in a private or internal repository
+
+  Cache and artifact steps use the runner's Actions runtime token, not GITHUB_TOKEN. Cache writes follow the job's
+  effective cache-mode, so low-trust triggers restore but never seed.
+
+inputs:
+  uv-version:
+    description: Exact uv version to install. Required; the action fails when it is empty.
+    required: true
+  force-scan:
+    description: "'true' skips the cached result, rescans, and preserves the SARIF report as the pysentry-weekly artifact."
+    required: false
+    default: "false"
+  sarif-path:
+    description: Path of the SARIF report, relative to the workspace.
+    required: false
+    default: pysentry-results.sarif
+  project-directory:
+    description: Directory holding the uv project's pyproject.toml and uv.lock.
+    required: false
+    default: "."
+  upload-sarif:
+    description: "'true' uploads findings to code scanning. Set it only for events whose token can hold security-events: write; fork pull requests cannot."
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Inputs
+      shell: bash
+      env:
+        UV_VERSION: ${{ inputs.uv-version }}
+        FORCE_SCAN: ${{ inputs.force-scan }}
+        UPLOAD_SARIF: ${{ inputs.upload-sarif }}
+      run: |
+        require_boolean() {
+          case "$2" in
+            true | false) ;;
+            *)
+              echo "::error title=Invalid input::$1 must be 'true' or 'false'"
+              exit 1
+              ;;
+          esac
+        }
+        if [[ -z "$UV_VERSION" ]]; then
+          echo "::error title=Missing input::uv-version is required"
+          exit 1
+        fi
+
+        require_boolean force-scan "$FORCE_SCAN"
+        require_boolean upload-sarif "$UPLOAD_SARIF"
+
+    - name: Resolve Audit Cache Key
+      id: audit-key
+      shell: bash
+      run: echo "value=pysentry-v1-${RUNNER_OS}-$(date -u +%G-W%V)-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+      env:
+        LOCK_HASH: ${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
+
+    - id: cache
+      if: ${{ inputs.force-scan != 'true' }}
+      uses: actions/cache/restore@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      name: Restore Previously Cached Scan
+      with:
+        path: ${{ inputs.sarif-path }}
+        key: ${{ steps.audit-key.outputs.value }}
+
+    - name: Validate Lockfile
+      if: ${{ inputs.force-scan == 'true' || steps.cache.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: uv lock --check --project "$PROJECT_DIRECTORY"
+      env:
+        UV_MALWARE_CHECK: 1
+        PROJECT_DIRECTORY: ${{ inputs.project-directory }}
+
+    - id: audit
+      if: ${{ inputs.force-scan == 'true' || steps.cache.outputs.cache-hit != 'true' }}
+      name: Audit Dependencies
+      shell: bash
+      run: |
+        uv run --project "$PROJECT_DIRECTORY" --locked --only-group security \
+          pysentry-rs "$PROJECT_DIRECTORY" --format sarif --output "$SARIF_PATH"
+      env:
+        SARIF_PATH: ${{ inputs.sarif-path }}
+        PROJECT_DIRECTORY: ${{ inputs.project-directory }}
+
+    - name: Save Clean Audit
+      if: ${{ steps.audit.outcome == 'success' }}
+      uses: actions/cache/save@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      with:
+        path: ${{ inputs.sarif-path }}
+        key: ${{ steps.audit-key.outputs.value }}
+
+    - name: Preserve Weekly Audit Report
+      if: ${{ inputs.force-scan == 'true' && !cancelled() && hashFiles(inputs.sarif-path) != '' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: pysentry-weekly
+        path: ${{ inputs.sarif-path }}
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Upload Security Findings
+      if: ${{ inputs.upload-sarif == 'true' && !cancelled() && hashFiles(inputs.sarif-path) != '' }}
+      uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      with:
+        sarif_file: ${{ inputs.sarif-path }}
+        category: pysentry

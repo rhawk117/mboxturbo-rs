@@ -1,0 +1,190 @@
+name: Continuous Integration (CI)
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mboxturbo-ci-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHON_PROJECT: crates/mboxturbo-py
+
+jobs:
+  labeler:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    name: 📎 Label Pull Request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Apply Labels (labeler.yml)
+        id: apply-labels
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          repo-token: ${{ github.token }}
+          configuration-path: .github/labeler.yml
+          sync-labels: true
+          dot: true
+
+      - name: Summarize PR Labels
+        if: ${{ !cancelled() }}
+        run: bash ./.github/scripts/label-summary.sh
+        env:
+          LABELER_OUTCOME: ${{ steps.apply-labels.outcome }}
+          NEW_LABELS: ${{ steps.apply-labels.outputs.new-labels }}
+          ALL_LABELS: ${{ steps.apply-labels.outputs.all-labels }}
+
+  rust-checks:
+    name: 🦀 Rust Quality Checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Pinned Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Restore Cargo Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            .
+            vendor/mail-parser
+
+      - name: Check Formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy (Strict Workspace Lints)
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Build Documentation
+        run: cargo doc --no-deps --workspace --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Run Workspace Tests
+        run: cargo test --workspace --locked
+
+      - name: Verify Vendored Parser Equivalence
+        working-directory: vendor/mail-parser
+        run: cargo test --features serde,full_encoding
+
+  python-checks:
+    name: 🐍 Python Checks (${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.14"
+            groups: --group dev --group polars
+          - python: "3.14t"
+            groups: --group dev
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ vars.UV_VERSION }}
+          cache-dependency-glob: crates/mboxturbo-py/uv.lock
+
+      - name: Install Pinned Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Restore Cargo Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: python-${{ matrix.python }}
+
+      - name: 🔒 Supply Chain Audit
+        if: ${{ matrix.python == '3.14' }}
+        uses: ./.github/actions/pysentry
+        with:
+          uv-version: ${{ vars.UV_VERSION }}
+          project-directory: crates/mboxturbo-py
+          upload-sarif: ${{ github.event.repository.fork != true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+
+      - name: Build Extension and Synchronize Dependencies
+        working-directory: ${{ env.PYTHON_PROJECT }}
+        run: |
+          read -ra dependency_groups <<<"$DEPENDENCY_GROUPS"
+          uv sync --locked --no-default-groups "${dependency_groups[@]}" --python "$PYTHON_VERSION"
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+          DEPENDENCY_GROUPS: ${{ matrix.groups }}
+
+      - name: Check Formatting (ruff)
+        working-directory: ${{ env.PYTHON_PROJECT }}
+        run: uv run --no-sync ruff format --check .
+
+      - name: Lint (ruff)
+        working-directory: ${{ env.PYTHON_PROJECT }}
+        run: uv run --no-sync ruff check .
+
+      - name: Type Check (ty)
+        working-directory: ${{ env.PYTHON_PROJECT }}
+        run: uv run --no-sync ty check src tests
+
+      - name: Run Test Suite
+        working-directory: ${{ env.PYTHON_PROJECT }}
+        run: uv run --no-sync pytest -rs
+        env:
+          HYPOTHESIS_PROFILE: ci
+
+  workflow-narrator:
+    name: 🔉 Workflow Narrator
+    needs: [labeler, rust-checks, python-checks]
+    if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      NARRATOR_JOB_NAME: 🔉 Workflow Narrator
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Publish Workflow Summary
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { default: narrate } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/narrator.mjs`);
+            await narrate({ github, context, core });
