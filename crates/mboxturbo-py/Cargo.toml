@@ -1,0 +1,24 @@
+[package]
+name = "mboxturbo-py"
+description = "Python bindings for mboxturbo"
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+mboxturbo = { version = "0.1.0", path = "../mboxturbo" }
+pyo3 = "0.30.1"
+
+[lints]
+workspace = true
