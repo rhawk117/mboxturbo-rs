@@ -69,9 +69,7 @@ jobs:
       - name: Restore Cargo Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: |
-            .
-            vendor/mail-parser
+          workspaces: .
 
       - name: Check Formatting
         run: cargo fmt --all --check
@@ -86,10 +84,6 @@ jobs:
 
       - name: Run Workspace Tests
         run: cargo test --workspace --locked
-
-      - name: Verify Vendored Parser Equivalence
-        working-directory: vendor/mail-parser
-        run: cargo test --features serde,full_encoding
 
   python-checks:
     name: 🐍 Python Checks (${{ matrix.python }})

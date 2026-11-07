@@ -78,15 +78,6 @@ let received: Vec<_> = message.header_values("Received").collect();
 
 The index scan runs at about 18 GB/s on two threads from a warm cache. Cold, a buffered `read()` scan beat mmap by about 38% in testing; the mmap path is kept because it is about 80% faster warm and a saved index skips the scan entirely.
 
-## Vendored mail-parser
-
-`vendor/mail-parser` is mail-parser 0.11.2 (Apache-2.0 OR MIT) with three hot loops replaced, wired in through `[patch.crates-io]`:
-
-- `decode_base64_mime` finds the closing delimiter with SIMD `memmem` and decodes the span with `base64-simd`, falling back to the original byte loop for anything the strict decoder would treat differently (`=` before the end, a stray `-`, a form feed, a length that is not a multiple of four).
-- `mime_part` and `seek_next_part` find `--<boundary>` with `memmem` instead of a byte loop.
-
-Each replacement is checked against the original loop on 200,000 generated inputs (`cargo test --features serde,full_encoding` inside the vendored crate), and mail-parser's own corpus tests still pass. Re-apply the three functions when moving to mail-parser 1.x.
-
 ## Development
 
 The workspace denies warnings, clippy `all`, `pedantic`, `nursery` and `cargo`, and 48 restriction lints. `unsafe` is denied except for the single read-only mmap call.
@@ -108,7 +99,7 @@ UV_PROJECT_ENVIRONMENT=.venv-ft uv run -p 3.14t --no-group polars pytest
 ## CI and releases
 
 Workflows follow the same shape as `mightymodels`:
-- `ci.yml` runs on pull requests to `main` and as a reusable workflow. Rust: fmt, strict clippy, rustdoc, tests, and the vendored parser's equivalence tests. Python on 3.14 and 3.14t: ruff, ty, pytest, plus a `pysentry` audit. It also runs the labeler and the workflow narrator.
+- `ci.yml` runs on pull requests to `main` and as a reusable workflow. Rust: fmt, strict clippy, rustdoc and tests. Python on 3.14 and 3.14t: ruff, ty, pytest, plus a `pysentry` audit. It also runs the labeler and the workflow narrator.
 - `cd.yml` (Release) is a manual dispatch from `main` with `recover`, `patch`, `minor` or `major`. It runs CI, then `.github/scripts/release.sh` bumps `pyproject.toml` (the version source of truth) and syncs the Cargo workspace version and both lockfiles. It commits, tags and pushes atomically, builds abi-specific wheels for CPython 3.14 and 3.14t on Linux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, and attaches them to the GitHub Release.
 - `weekly-security-scan.yml` audits the uv lockfile with `pysentry` and Cargo dependencies against RustSec, then opens or updates a tracking issue.
 

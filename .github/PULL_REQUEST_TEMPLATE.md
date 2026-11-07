@@ -8,7 +8,7 @@
 
 ## Verification
 
-<!-- Commands run and their outcomes. For performance changes: the benchmark before and after. For vendor/mail-parser changes: the equivalence tests. -->
+<!-- Commands run and their outcomes. For performance changes: the benchmark before and after. -->
 
 ```
 ```
