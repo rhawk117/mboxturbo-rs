@@ -33,6 +33,9 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::Error) -> PyErr {
         }
         mboxturbo::Error::CorruptIndex { .. } => CorruptIndexError::new_err(message),
         mboxturbo::Error::StaleIndex { .. } => StaleIndexError::new_err(message),
+        mboxturbo::Error::Arrow { .. } | mboxturbo::Error::Parquet { .. } => {
+            MboxTurboError::new_err(message)
+        }
     }
 }
 

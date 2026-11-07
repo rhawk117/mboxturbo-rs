@@ -7,6 +7,7 @@ from mboxturbo._core import (
     Mailbox,
     MboxTurboError,
     Message,
+    Selection,
     StaleIndexError,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     'Mailbox',
     'MboxTurboError',
     'Message',
+    'Selection',
     'StaleIndexError',
 ]

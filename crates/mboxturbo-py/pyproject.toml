@@ -12,9 +12,13 @@ dependencies = []
 dev = [
     "hypothesis>=6",
     "maturin>=1.16.0",
+    "pyarrow>=26.0.1",
     "pytest>=9",
     "ruff>=0.16.10",
     "ty>=0.0.99",
+]
+polars = [
+    "polars>=2.1.0",
 ]
 
 [tool.maturin]
@@ -34,6 +38,7 @@ markers = [
 ]
 
 [tool.uv]
+default-groups = ["dev", "polars"]
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "src/**/*.rs" },

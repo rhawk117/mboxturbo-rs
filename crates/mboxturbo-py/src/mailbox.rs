@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PySlice, PyTuple};
 
 use crate::errors::{closed, into_py_err};
+use crate::export::{Selection, select_columns};
 use crate::message::Message;
 
 type Shared = Arc<mboxturbo::Mailbox>;
@@ -121,6 +122,14 @@ impl Mailbox {
             size,
             cursor: Cursor::new(),
         })
+    }
+
+    /// Selects columns for export; ``None`` selects every column that needs only headers.
+    /// Name columns from the catalogue (``subject``, ``received``, ``attachment_sha256``…) or
+    /// as ``header:<Name>`` for any header's raw values.
+    #[pyo3(signature = (columns = None, *, batch_size = 8192))]
+    fn select(&self, columns: Option<Vec<String>>, batch_size: usize) -> PyResult<Selection> {
+        select_columns(self.slot.get()?, columns, batch_size)
     }
 
     /// Writes the message index to ``path`` atomically.
