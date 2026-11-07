@@ -3,7 +3,7 @@ name = "mboxturbo"
 version = "0.1.0"
 description = "Offset-indexed random access, parallel indexing and Rust-parsed messages for large mbox files"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 authors = [{ name = "rhawk117", email = "noplaceLike127dot0dot0dot1@proton.me" }]
 requires-python = ">=3.14"
 dependencies = []
