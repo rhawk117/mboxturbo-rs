@@ -246,7 +246,8 @@ AAEC\n\
     #[test]
     fn a_stale_cache_is_rebuilt_and_rewritten() {
         let fixture = Fixture::new();
-        Mailbox::open_cached(&fixture.mbox, &fixture.index).expect("build");
+        let built = Mailbox::open_cached(&fixture.mbox, &fixture.index).expect("build");
+        assert_eq!(built.len(), 3, "initial cache indexes the fixture messages");
         fixture.append(BARE);
         let mailbox = Mailbox::open_cached(&fixture.mbox, &fixture.index).expect("rebuild");
         assert_eq!(mailbox.len(), 4, "new message indexed");
@@ -257,7 +258,8 @@ AAEC\n\
     #[test]
     fn a_corrupt_cache_is_reported_and_left_in_place() {
         let fixture = Fixture::new();
-        Mailbox::open_cached(&fixture.mbox, &fixture.index).expect("build");
+        let built = Mailbox::open_cached(&fixture.mbox, &fixture.index).expect("build");
+        assert_eq!(built.len(), 3, "initial cache indexes the fixture messages");
         let mut damaged = fs::read(&fixture.index).expect("cache");
         damaged[60] ^= 0xFF;
         fs::write(&fixture.index, &damaged).expect("damage cache");

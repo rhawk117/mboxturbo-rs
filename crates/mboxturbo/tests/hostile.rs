@@ -18,23 +18,24 @@ mod hostile {
     }
 
     fn exercise(message: &Message) {
-        black_box((message.subject(), message.message_id(), message.date()));
-        black_box((
+        let _envelope = black_box((message.subject(), message.message_id(), message.date()));
+        let _headers = black_box((
             message.header("received"),
             message.header_values("x.trace").count(),
         ));
-        black_box(
+        let _addresses = black_box(
             message
                 .from()
                 .chain(message.to())
                 .chain(message.cc())
                 .count(),
         );
-        black_box(message.text_bodies().chain(message.html_bodies()).count());
-        message.attachments().for_each(|attachment| {
-            black_box((&attachment.data, attachment.content_type()));
-        });
-        black_box(message.raw());
+        let _bodies = black_box(message.text_bodies().chain(message.html_bodies()).count());
+        let _attachments = message
+            .attachments()
+            .map(|attachment| black_box((attachment.data.len(), attachment.content_type().is_some())))
+            .count();
+        let _raw = black_box(message.raw());
     }
 
     fn only_message(contents: &[u8]) -> (TempDir, Message) {
