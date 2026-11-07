@@ -125,6 +125,7 @@ impl Index {
             .map_err(|source| Error::io(path, source))?;
         staged
             .persist(path)
+            .map(|_persisted| ())
             .map_err(|failure| Error::io(path, failure.error))?;
         Ok(())
     }

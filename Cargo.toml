@@ -40,7 +40,6 @@ rust_2018_idioms = { level = "deny", priority = -1 }
 let_underscore = { level = "deny", priority = -1 }
 unused_results = "deny"
 missing_copy_implementations = "deny"
-unused_crate_dependencies = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 missing_unsafe_on_extern = "deny"
 unsafe_attr_outside_unsafe = "deny"

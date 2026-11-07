@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::ops::Range;
+use std::panic::resume_unwind;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
@@ -152,6 +153,7 @@ impl Pipeline {
         let rows = self.encode_parquet(mailbox, file, compression, path)?;
         staged
             .persist(path)
+            .map(|_persisted| ())
             .map_err(|failure| Error::io(path, failure.error))?;
         Ok(rows)
     }
@@ -178,14 +180,22 @@ impl Pipeline {
         let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
         let mut reader = self.reader(mailbox);
         let produced = thread::scope(|scope| {
-            scope.spawn(move || reader.try_for_each(|batch| sender.send(batch).map_err(drop)));
-            receiver.iter().try_fold(0_u64, |rows, batch| {
+            let reader_thread =
+                scope.spawn(move || reader.try_for_each(|batch| sender.send(batch).map_err(drop)));
+            let rows = receiver.into_iter().try_fold(0_u64, |rows, batch| {
                 let batch = batch.map_err(|source| Error::Arrow { source })?;
                 writer.write(&batch).map_err(parquet_error)?;
                 Ok::<u64, Error>(rows.saturating_add(widen(batch.num_rows())))
-            })
+            });
+            match reader_thread.join() {
+                Ok(_) => rows,
+                Err(payload) => resume_unwind(payload),
+            }
         })?;
-        writer.close().map_err(parquet_error)?;
+        writer
+            .close()
+            .map(|_metadata| ())
+            .map_err(parquet_error)?;
         Ok(produced)
     }
 

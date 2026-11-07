@@ -166,7 +166,7 @@ impl Mailbox {
             .into_par_iter()
             .filter_map(|position| self.message(position))
             .inspect(|message| {
-                message.parse();
+                let _found_mime_part = message.parse();
             })
             .collect()
     }
