@@ -2,44 +2,12 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use mail_parser::{HeaderName, MessageParser, MessagePart, MimeHeaders};
 use memmap2::Mmap;
 
+use crate::fields::{self, FULL_PARSER, contain_parser_panic, strip_separator};
 use cell::Parsed;
-
-const SEPARATOR: &[u8] = b"From ";
-
-static PARSER: LazyLock<MessageParser> = LazyLock::new(builtin_table_with_raw_received);
-
-fn builtin_table_with_raw_received() -> MessageParser {
-    MessageParser::new()
-        .with_mime_headers()
-        .with_date_headers()
-        .with_address_headers()
-        .with_message_ids()
-        .header_text(HeaderName::Subject)
-        .header_text(HeaderName::Comments)
-        .header_address(HeaderName::ListArchive)
-        .header_address(HeaderName::ListHelp)
-        .header_address(HeaderName::ListId)
-        .header_address(HeaderName::ListOwner)
-        .header_address(HeaderName::ListPost)
-        .header_address(HeaderName::ListSubscribe)
-        .header_address(HeaderName::ListUnsubscribe)
-        .header_id(HeaderName::ReturnPath)
-        .header_comma_separated(HeaderName::Keywords)
-        .header_comma_separated(HeaderName::ContentLanguage)
-        .header_raw(HeaderName::Received)
-}
-
-fn contain_parser_panic<'a>(
-    parse: impl FnOnce() -> Option<mail_parser::Message<'a>>,
-) -> Option<mail_parser::Message<'a>> {
-    catch_unwind(AssertUnwindSafe(parse)).ok().flatten()
-}
 
 #[derive(Debug, Clone)]
 struct Source {
@@ -53,15 +21,7 @@ impl Source {
     }
 
     fn rfc822(&self) -> &[u8] {
-        let bytes = self.bytes();
-        if !bytes.starts_with(SEPARATOR) {
-            return bytes;
-        }
-        bytes
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .and_then(|newline| bytes.get(newline.strict_add(1)..))
-            .unwrap_or_default()
+        strip_separator(self.bytes())
     }
 }
 
@@ -173,34 +133,24 @@ impl Message {
 
     /// Every address in `From:`.
     pub fn from(&self) -> impl Iterator<Item = Address<'_>> {
-        self.addresses(mail_parser::Message::from)
+        fields::addresses(self.head().and_then(mail_parser::Message::from))
     }
 
     /// Every address in `To:`.
     pub fn to(&self) -> impl Iterator<Item = Address<'_>> {
-        self.addresses(mail_parser::Message::to)
+        fields::addresses(self.head().and_then(mail_parser::Message::to))
     }
 
     /// Every address in `Cc:`.
     pub fn cc(&self) -> impl Iterator<Item = Address<'_>> {
-        self.addresses(mail_parser::Message::cc)
+        fields::addresses(self.head().and_then(mail_parser::Message::cc))
     }
 
     /// `Date:` resolved to UTC, or `None` when absent or invalid. A numeric zone such as
     /// `+1300` is read from the header itself, so offsets past twelve hours stay exact.
     #[must_use]
     pub fn date(&self) -> Option<Timestamp> {
-        let date = self.head()?.date().filter(|date| date.is_valid())?;
-        let offset_minutes = self
-            .header_values("date")
-            .last()
-            .and_then(|raw| raw.split_whitespace().rev().find_map(numeric_zone_minutes))
-            .unwrap_or_else(|| parsed_zone_minutes(date));
-        let offset_seconds = i64::from(offset_minutes).strict_mul(60);
-        Some(Timestamp {
-            unix_seconds: date.to_timestamp_local().strict_sub(offset_seconds),
-            offset_minutes,
-        })
+        self.head().and_then(fields::date)
     }
 
     /// `Message-ID:` without the angle brackets.
@@ -219,43 +169,24 @@ impl Message {
     /// line each. Values are raw: encoded words such as `=?utf-8?...?=` are left as written.
     pub fn header_values<'a>(&'a self, name: &str) -> impl Iterator<Item = Cow<'a, str>> + use<'a> {
         let wanted = name.to_owned();
-        self.head().into_iter().flat_map(move |mail| {
-            let raw = mail.raw_message();
-            let wanted = wanted.clone();
-            mail.headers()
-                .iter()
-                .filter(move |header| header.name.as_str().eq_ignore_ascii_case(&wanted))
-                .filter_map(move |header| raw_header_value(raw, header))
-        })
+        self.head()
+            .into_iter()
+            .flat_map(move |mail| fields::header_values(mail, wanted.clone()))
     }
 
     /// Plain-text bodies; an HTML-only message yields its HTML converted to text.
     pub fn text_bodies(&self) -> impl Iterator<Item = Cow<'_, str>> {
-        self.whole().into_iter().flat_map(|mail| {
-            (0..mail.text_body_count()).filter_map(move |position| mail.body_text(position))
-        })
+        self.whole().into_iter().flat_map(fields::text_bodies)
     }
 
     /// HTML bodies; a text-only message yields its text converted to HTML.
     pub fn html_bodies(&self) -> impl Iterator<Item = Cow<'_, str>> {
-        self.whole().into_iter().flat_map(|mail| {
-            (0..mail.html_body_count()).filter_map(move |position| mail.body_html(position))
-        })
+        self.whole().into_iter().flat_map(fields::html_bodies)
     }
 
     /// Every attachment, decoded.
     pub fn attachments(&self) -> impl Iterator<Item = Attachment<'_>> {
-        self.whole().into_iter().flat_map(|mail| {
-            mail.attachments().map(|part| {
-                let content_type = part.content_type();
-                Attachment {
-                    filename: part.attachment_name(),
-                    media_type: content_type.map(mail_parser::ContentType::ctype),
-                    media_subtype: content_type.and_then(mail_parser::ContentType::subtype),
-                    data: attachment_bytes(part),
-                }
-            })
-        })
+        self.whole().into_iter().flat_map(fields::attachments)
     }
 
     fn head(&self) -> Option<&mail_parser::Message<'_>> {
@@ -264,7 +195,7 @@ impl Message {
             .unwrap_or_else(|| {
                 self.head.get_or_init(|| {
                     Parsed::new(self.source.clone(), |source| {
-                        contain_parser_panic(|| PARSER.parse_headers(source.rfc822()))
+                        contain_parser_panic(|| FULL_PARSER.parse_headers(source.rfc822()))
                     })
                 })
             })
@@ -276,79 +207,11 @@ impl Message {
         self.whole
             .get_or_init(|| {
                 Parsed::new(self.source.clone(), |source| {
-                    contain_parser_panic(|| PARSER.parse(source.rfc822()))
+                    contain_parser_panic(|| FULL_PARSER.parse(source.rfc822()))
                 })
             })
             .borrow_dependent()
             .as_ref()
-    }
-
-    fn addresses<'a>(
-        &'a self,
-        field: fn(&'a mail_parser::Message<'a>) -> Option<&'a mail_parser::Address<'a>>,
-    ) -> impl Iterator<Item = Address<'a>> {
-        self.head()
-            .and_then(field)
-            .into_iter()
-            .flat_map(mail_parser::Address::iter)
-            .map(|addr| Address {
-                name: addr.name.as_deref(),
-                email: addr.address.as_deref(),
-            })
-    }
-}
-
-fn attachment_bytes<'a>(part: &'a MessagePart<'_>) -> &'a [u8] {
-    part.message()
-        .map_or_else(|| part.contents(), |nested| nested.raw_message.as_ref())
-}
-
-fn parsed_zone_minutes(date: &mail_parser::DateTime) -> i32 {
-    let minutes = i32::from(date.tz_hour)
-        .strict_mul(60)
-        .strict_add(i32::from(date.tz_minute));
-    if date.tz_before_gmt {
-        minutes.strict_neg()
-    } else {
-        minutes
-    }
-}
-
-fn numeric_zone_minutes(token: &str) -> Option<i32> {
-    let (direction, digits) = token
-        .strip_prefix('+')
-        .map(|digits| (1, digits))
-        .or_else(|| token.strip_prefix('-').map(|digits| (-1, digits)))?;
-    if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let (hours, minutes) = digits.split_at_checked(2)?;
-    let hours = hours.parse::<i32>().ok().filter(|&hours| hours < 24)?;
-    let minutes = minutes
-        .parse::<i32>()
-        .ok()
-        .filter(|&minutes| minutes < 60)?;
-    Some(
-        hours
-            .strict_mul(60)
-            .strict_add(minutes)
-            .strict_mul(direction),
-    )
-}
-
-fn raw_header_value<'a>(raw: &'a [u8], header: &mail_parser::Header<'_>) -> Option<Cow<'a, str>> {
-    let start = usize::try_from(header.offset_start).ok()?;
-    let end = usize::try_from(header.offset_end).ok()?;
-    Some(unfold(String::from_utf8_lossy(raw.get(start..end)?)))
-}
-
-fn unfold(text: Cow<'_, str>) -> Cow<'_, str> {
-    if text.contains(['\r', '\n']) {
-        return Cow::Owned(text.lines().collect::<String>().trim().to_owned());
-    }
-    match text {
-        Cow::Borrowed(borrowed) => Cow::Borrowed(borrowed.trim()),
-        Cow::Owned(owned) => Cow::Owned(owned.trim().to_owned()),
     }
 }
 
@@ -357,8 +220,8 @@ mod tests {
     use std::borrow::Cow;
     use std::fs;
 
-    use super::unfold;
     use crate::Mailbox;
+    use crate::fields::unfold;
 
     const MESSAGE: &[u8] = b"From a@example.com Mon Jan  1 00:00:00 2024\n\
 From: A <a@example.com>\nSubject: lazy\nMessage-ID: <m@example.com>\n\

@@ -17,17 +17,22 @@
               while thiserror 2 uses syn 3; mail-parser 1.x on Rust 1.98 removes the split"
 )]
 
+mod columns;
 mod error;
+mod fields;
 mod fingerprint;
 mod hint;
 mod index;
 mod mailbox;
 mod message;
+mod pipeline;
 mod scan;
 mod width;
 
+pub use columns::Column;
 pub use error::{Corruption, Error};
 pub use fingerprint::Fingerprint;
 pub use index::Index;
 pub use mailbox::Mailbox;
 pub use message::{Address, Attachment, Message, Timestamp};
+pub use pipeline::{BatchReader, Compression, Pipeline};

@@ -6,6 +6,7 @@
 )]
 
 mod errors;
+mod export;
 mod mailbox;
 mod message;
 
@@ -16,6 +17,8 @@ use pyo3::prelude::*;
 mod _core {
     #[pymodule_export]
     use super::errors::{CorruptIndexError, MboxTurboError, StaleIndexError};
+    #[pymodule_export]
+    use super::export::Selection;
     #[pymodule_export]
     use super::mailbox::Mailbox;
     #[pymodule_export]

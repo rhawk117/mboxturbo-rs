@@ -1,0 +1,2 @@
+# Vendored upstream sources keep their exact bytes (mail-parser fixtures rely on CRLF).
+vendor/** -text
