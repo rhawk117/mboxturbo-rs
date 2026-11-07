@@ -37,10 +37,10 @@ find_existing_issue() {
 
   existing_issue=$(gh issue list \
     --state open \
-    --search '"Weekly supply chain audit failed" in:title' \
+    --search "\"${ISSUE_TITLE}\" in:title" \
     --limit 100 \
     --json number,title,author \
-    --jq '[.[] | select(.title == "Weekly supply chain audit failed" and .author.login == "github-actions[bot]") | .number][0] // empty')
+    --jq "[.[] | select(.title == \"${ISSUE_TITLE}\" and .author.login == \"app/github-actions\") | .number][0] // empty")
 
   log::step_end
 }
