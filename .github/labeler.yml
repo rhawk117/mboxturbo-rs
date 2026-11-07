@@ -22,11 +22,6 @@ python:
           - crates/mboxturbo-py/uv.lock
           - crates/mboxturbo-py/ruff.toml
 
-vendor:
-  - changed-files:
-      - any-glob-to-any-file:
-          - vendor/**
-
 tests:
   - changed-files:
       - any-glob-to-any-file:

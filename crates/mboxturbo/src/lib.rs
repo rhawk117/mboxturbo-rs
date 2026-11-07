@@ -13,8 +13,8 @@
 )]
 #![expect(
     clippy::multiple_crate_versions,
-    reason = "build-time only: mail-parser 0.11, pinned for Rust 1.97, compiles hashify on syn 2 \
-              while thiserror 2 uses syn 3; mail-parser 1.x on Rust 1.98 removes the split"
+    reason = "build-time only: arrow's ahash compiles zerocopy-derive on syn 2 while thiserror 2 \
+              uses syn 3"
 )]
 
 mod columns;

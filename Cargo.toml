@@ -1,13 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/mboxturbo", "crates/mboxturbo-py"]
-exclude = ["vendor/mail-parser"]
 
 [workspace.package]
 version = "0.1.0"
 authors = ["rhawk117 <noplaceLike127dot0dot0dot1@proton.me>"]
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "Apache-2.0"
 repository = "https://github.com/rhawk117/mboxturbo"
 readme = "README.md"
@@ -100,6 +99,3 @@ codegen-units = 1
 [profile.bench]
 inherits = "release"
 debug = "line-tables-only"
-
-[patch.crates-io]
-mail-parser = { path = "vendor/mail-parser" }
