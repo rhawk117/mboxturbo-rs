@@ -1,0 +1,168 @@
+name: Release
+permissions: {}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version-bump:
+        options: [recover, patch, minor, major]
+        type: choice
+        default: recover
+        required: true
+        description: Semantic version bump or recover an existing release
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  VERSION_BUMP: ${{ inputs.version-bump }}
+  REPOSITORY_IS_FORK: ${{ github.event.repository.fork }}
+
+jobs:
+  release-guard:
+    name: 🛡️ Validate Release Context
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Verify Repository and Branch
+        run: |
+          if [[ "$REPOSITORY_IS_FORK" != false ]]; then
+            echo "::error::Releases are disabled in forks."
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::Releases must originate from main."
+            exit 1
+          fi
+
+  continuous-integration:
+    name: 🔁 Run CI Pipeline
+    needs: [release-guard]
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      security-events: write
+
+  prepare-release:
+    name: 🚀 Prepare Release
+    needs: [continuous-integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.prepare.outputs.version }}
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ vars.UV_VERSION }}
+          cache-dependency-glob: crates/mboxturbo-py/uv.lock
+
+      - name: Install Pinned Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - id: prepare
+        name: 🚀 Prepare Release
+        run: bash ./.github/scripts/release.sh
+
+  build-wheels:
+    name: 🛞 Build Wheels (${{ matrix.target }})
+    needs: [prepare-release]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout Release Tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+          persist-credentials: false
+
+      - name: Build Wheels for CPython 3.14 and 3.14t
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: crates/mboxturbo-py
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          args: --release --locked --out dist --interpreter 3.14 3.14t
+
+      - name: Upload Wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-${{ matrix.target }}
+          path: crates/mboxturbo-py/dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: 📦 Publish GitHub Release
+    needs: [prepare-release, build-wheels]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download Wheels
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if (( ${#wheels[@]} == 0 )); then
+            echo "::error::No wheels were built for ${RELEASE_TAG}."
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${wheels[@]}" --clobber
+            echo "::notice::Refreshed ${#wheels[@]} wheels on existing release: ${RELEASE_TAG}"
+            exit 0
+          fi
+
+          gh release create "$RELEASE_TAG" "${wheels[@]}" \
+            --title "Release $RELEASE_TAG" \
+            --generate-notes \
+            --verify-tag
+
+          echo "::notice::Published GitHub Release: ${RELEASE_TAG} with ${#wheels[@]} wheels"
