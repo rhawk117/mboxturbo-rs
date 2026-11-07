@@ -104,3 +104,19 @@ uv run pytest
 UV_PROJECT_ENVIRONMENT=.venv-ft uv sync -p 3.14t --no-group polars
 UV_PROJECT_ENVIRONMENT=.venv-ft uv run -p 3.14t --no-group polars pytest
 ```
+
+## CI and releases
+
+Workflows follow the same shape as `mightymodels`:
+- `ci.yml` runs on pull requests to `main` and as a reusable workflow. Rust: fmt, strict clippy, rustdoc, tests, and the vendored parser's equivalence tests. Python on 3.14 and 3.14t: ruff, ty, pytest, plus a `pysentry` audit. It also runs the labeler and the workflow narrator.
+- `cd.yml` (Release) is a manual dispatch from `main` with `recover`, `patch`, `minor` or `major`. It runs CI, then `.github/scripts/release.sh` bumps `pyproject.toml` (the version source of truth) and syncs the Cargo workspace version and both lockfiles. It commits, tags and pushes atomically, builds abi-specific wheels for CPython 3.14 and 3.14t on Linux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, and attaches them to the GitHub Release.
+- `weekly-security-scan.yml` audits the uv lockfile with `pysentry` and Cargo dependencies against RustSec, then opens or updates a tracking issue.
+
+Before the first release:
+1. Set the repository variable `UV_VERSION`.
+2. Push the bootstrap tag. `release.sh` requires the previous release's tag:
+
+```sh
+git tag -a v0.1.0 -m "Release v0.1.0" && git push origin v0.1.0
+```
+
