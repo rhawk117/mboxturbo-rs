@@ -166,7 +166,12 @@ impl Mailbox {
             .into_par_iter()
             .filter_map(|position| self.message(position))
             .inspect(|message| {
-                let _found_mime_part = message.parse();
+                // This only warms the parse cache. A message without a MIME part, or whose parser
+                // panicked (contained as `None` in `whole()`), stays in the batch and reports
+                // `None` from its accessors, exactly as with lazy parsing, so no failure is lost.
+                if !message.parse() {
+                    // Nothing to do: the unparsed message is kept as it is.
+                }
             })
             .collect()
     }
