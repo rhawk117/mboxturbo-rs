@@ -1,0 +1,40 @@
+github:
+  - changed-files:
+      - any-glob-to-any-file:
+          - .github/**
+
+rust:
+  - changed-files:
+      - any-glob-to-any-file:
+          - crates/mboxturbo/**
+          - crates/mboxturbo-py/src/**/*.rs
+          - Cargo.toml
+          - Cargo.lock
+          - clippy.toml
+          - rustfmt.toml
+          - rust-toolchain.toml
+
+python:
+  - changed-files:
+      - any-glob-to-any-file:
+          - crates/mboxturbo-py/src/mboxturbo/**
+          - crates/mboxturbo-py/pyproject.toml
+          - crates/mboxturbo-py/uv.lock
+          - crates/mboxturbo-py/ruff.toml
+
+vendor:
+  - changed-files:
+      - any-glob-to-any-file:
+          - vendor/**
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/tests/**"
+          - "**/conftest.py"
+          - "**/test_*.py"
+
+scripts:
+  - changed-files:
+      - any-glob-to-any-file:
+          - scripts/**
