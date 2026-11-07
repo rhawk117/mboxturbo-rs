@@ -53,6 +53,22 @@ pub enum Error {
         /// The rejected index file.
         path: PathBuf,
     },
+    /// Extracted columns could not be assembled into an Arrow batch.
+    #[error("cannot assemble an Arrow batch")]
+    Arrow {
+        /// The Arrow failure.
+        #[source]
+        source: arrow_schema::ArrowError,
+    },
+    /// Writing a Parquet file failed.
+    #[error("cannot write Parquet file {}", path.display())]
+    Parquet {
+        /// The Parquet file being written.
+        path: PathBuf,
+        /// The Parquet failure.
+        #[source]
+        source: parquet::errors::ParquetError,
+    },
 }
 
 impl Error {
