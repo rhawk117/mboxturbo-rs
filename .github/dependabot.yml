@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: uv
-    directory: /crates/mboxturbo-py
+    directory: /
     target-branch: "main"
     open-pull-requests-limit: 30
     versioning-strategy: "auto"

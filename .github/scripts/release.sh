@@ -4,7 +4,7 @@ set -euo pipefail
 
 readonly VERSION_BUMP="${VERSION_BUMP:-recover}"
 readonly LOGGING_UTILS="./scripts/log.sh"
-readonly PYTHON_PROJECT="crates/mboxturbo-py"
+readonly PYTHON_PROJECT="."
 readonly CARGO_MANIFEST="Cargo.toml"
 readonly RELEASE_BOT_USERNAME="github-actions[bot]"
 readonly RELEASE_BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
@@ -119,7 +119,7 @@ record_version_bump() {
   git config user.name "${RELEASE_BOT_USERNAME}"
   git config user.email "${RELEASE_BOT_EMAIL}"
 
-  git add -- "$CARGO_MANIFEST" Cargo.lock "$PYTHON_PROJECT/pyproject.toml" "$PYTHON_PROJECT/uv.lock"
+  git add -- "$CARGO_MANIFEST" Cargo.lock pyproject.toml uv.lock
 
   git commit -m "release: $release_tag"
   git tag -a "$release_tag" -m "Release $release_tag"

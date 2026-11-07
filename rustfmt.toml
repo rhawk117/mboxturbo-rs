@@ -4,3 +4,21 @@ max_width = 100
 newline_style = "Unix"
 use_field_init_shorthand = true
 use_try_shorthand = true
+
+# Nightly-only options: prek runs `cargo +nightly-2026-10-15 fmt`; stable rustfmt ignores them.
+unstable_features = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
+reorder_impl_items = true
+wrap_comments = true
+comment_width = 100
+normalize_comments = true
+normalize_doc_attributes = true
+format_code_in_doc_comments = true
+doc_comment_code_block_width = 100
+format_macro_matchers = true
+hex_literal_case = "Upper"
+condense_wildcard_suffixes = true
+match_block_trailing_comma = true
+error_on_line_overflow = true
+error_on_unformatted = true

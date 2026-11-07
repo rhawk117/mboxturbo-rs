@@ -1,0 +1,287 @@
+# Run with `uv run prek run --all-files`; install the git hooks with `uv run prek install`.
+
+default_install_hook_types = [
+    "pre-commit",
+    "commit-msg",
+    "pre-push",
+]
+default_stages = [
+    "pre-commit",
+    "pre-push",
+    "manual",
+]
+fail_fast = false
+exclude = '^(target/|\.venv/|uv\.lock$|Cargo\.lock$)'
+
+[[repos]]
+repo = "builtin"
+
+[[repos.hooks]]
+id = "trailing-whitespace"
+
+[[repos.hooks]]
+id = "end-of-file-fixer"
+
+[[repos.hooks]]
+id = "mixed-line-ending"
+args = [
+    "--fix=lf",
+]
+
+[[repos.hooks]]
+id = "fix-byte-order-marker"
+
+[[repos.hooks]]
+id = "check-merge-conflict"
+
+[[repos.hooks]]
+id = "check-added-large-files"
+args = [
+    "--enforce-all",
+    "--maxkb=256",
+]
+
+[[repos.hooks]]
+id = "check-case-conflict"
+
+[[repos.hooks]]
+id = "check-illegal-windows-names"
+
+[[repos.hooks]]
+id = "check-executables-have-shebangs"
+
+[[repos.hooks]]
+id = "check-shebang-scripts-are-executable"
+
+[[repos.hooks]]
+id = "check-symlinks"
+
+[[repos.hooks]]
+id = "destroyed-symlinks"
+
+[[repos.hooks]]
+id = "forbid-new-submodules"
+
+[[repos.hooks]]
+id = "detect-private-key"
+
+[[repos.hooks]]
+id = "check-toml"
+
+[[repos.hooks]]
+id = "check-yaml"
+
+[[repos.hooks]]
+id = "check-json"
+
+[[repos.hooks]]
+id = "no-commit-to-branch"
+args = [
+    "--branch",
+    "main",
+]
+
+[[repos.hooks]]
+id = "deny-pattern"
+alias = "rust-terse-expect-message"
+name = "rust-tests.md 4: expect messages say what the expectation means"
+args = [
+    '\.expect(_err)?\("[^" ]*( [^" ]*)?"\)',
+]
+files = '^crates/.*\.rs$'
+
+[[repos.hooks]]
+id = "deny-pattern"
+alias = "rust-bare-prop-assert"
+name = "rust-tests.md 4: prop_assert carries a message"
+args = [
+    'prop_assert(_eq|_ne)?!\([^"\n]*\);\s*$',
+]
+files = '^crates/.*\.rs$'
+
+[[repos.hooks]]
+id = "deny-pattern"
+alias = "rust-display-assertion"
+name = "rust-tests.md 3: assert errors by variant, not Display"
+args = [
+    '\.to_string\(\)\s*\.(contains|starts_with|ends_with)\(',
+]
+files = '^crates/.*\.rs$'
+
+[[repos.hooks]]
+id = "deny-pattern"
+alias = "rust-name-echo-doc"
+name = "rust.md 5: doc comments state the contract, not the name"
+args = [
+    '^\s*//[/!]\s*[A-Za-z_]+\.?\s*$',
+]
+files = '^crates/.*\.rs$'
+
+[[repos.hooks]]
+id = "deny-pattern"
+alias = "no-todo-markers"
+name = "no TODO, FIXME, XXX or HACK markers: open an issue"
+args = [
+    '\b(TODO|FIXME|XXX|HACK)\b',
+]
+exclude = '^prek\.toml$'
+
+[[repos.hooks]]
+id = "require-pattern"
+alias = "conventional-commit"
+name = "commit subject is type(scope): subject"
+args = [
+    "--multiline",
+    '\A((build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)\([a-z0-9][a-z0-9-]*\)!?: \S|Merge |Revert "|fixup! |squash! |amend! )',
+]
+stages = [
+    "commit-msg",
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "rustfmt"
+name = "rustfmt (pinned nightly)"
+language = "system"
+entry = "cargo +nightly-2026-10-15 fmt --all --check"
+files = '(\.rs|rustfmt\.toml)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "clippy"
+name = "clippy (workspace lints)"
+language = "system"
+entry = "cargo clippy --workspace --all-targets --all-features --locked"
+files = '(\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "rustdoc"
+name = "rustdoc (deny warnings)"
+language = "system"
+entry = "env RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps --workspace --all-features --locked"
+files = '(\.rs|Cargo\.toml)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-deny"
+name = "cargo-deny (advisories, bans, licenses, sources)"
+language = "system"
+entry = "cargo deny --all-features check"
+files = '(Cargo\.toml|Cargo\.lock|deny\.toml)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-machete"
+name = "cargo-machete (unused dependencies)"
+language = "system"
+entry = "cargo machete --with-metadata"
+files = 'Cargo\.toml$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-test"
+name = "cargo test"
+language = "system"
+entry = "cargo test --workspace --all-features --locked"
+files = '(\.rs|Cargo\.toml|Cargo\.lock)$'
+pass_filenames = false
+stages = [
+    "pre-push",
+    "manual",
+]
+
+[[repos.hooks]]
+id = "ruff-format"
+name = "ruff format"
+language = "system"
+entry = "uv run --no-sync ruff format --check"
+types_or = [
+    "python",
+    "pyi",
+]
+
+[[repos.hooks]]
+id = "ruff"
+name = "ruff check"
+language = "system"
+entry = "uv run --no-sync ruff check"
+types_or = [
+    "python",
+    "pyi",
+]
+
+[[repos.hooks]]
+id = "ty"
+name = "ty check"
+language = "system"
+entry = "uv run --no-sync ty check crates/mboxturbo-py/src crates/mboxturbo-py/tests"
+types_or = [
+    "python",
+    "pyi",
+]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "pytest"
+name = "pytest (rebuilds the extension)"
+language = "system"
+entry = "uv run pytest -q"
+files = '(\.py|\.pyi|\.rs|Cargo\.toml|pyproject\.toml)$'
+pass_filenames = false
+stages = [
+    "pre-push",
+    "manual",
+]
+
+[[repos.hooks]]
+id = "typos"
+name = "typos"
+language = "system"
+entry = "uv run --no-sync typos --force-exclude"
+types = [
+    "text",
+]
+
+[[repos.hooks]]
+id = "taplo-fmt"
+name = "taplo fmt"
+language = "system"
+entry = "uv run --no-sync taplo fmt --check"
+types = [
+    "toml",
+]
+
+[[repos.hooks]]
+id = "taplo-lint"
+name = "taplo lint"
+language = "system"
+entry = "uv run --no-sync taplo lint"
+types = [
+    "toml",
+]
+
+[[repos.hooks]]
+id = "shellcheck"
+name = "shellcheck (all optional checks)"
+language = "system"
+entry = "shellcheck --enable=all --severity=style --external-sources"
+types = [
+    "shell",
+]
+
+[[repos.hooks]]
+id = "actionlint"
+name = "actionlint"
+language = "system"
+entry = "uv run --no-sync actionlint"
+files = '^\.github/workflows/.*\.ya?ml$'
+
+[[repos.hooks]]
+id = "zizmor"
+name = "zizmor (pedantic)"
+language = "system"
+entry = "uv run --no-sync zizmor --persona=pedantic --offline"
+files = '^\.github/(workflows|actions)/.*\.ya?ml$'

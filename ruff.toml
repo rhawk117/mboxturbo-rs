@@ -1,7 +1,7 @@
 target-version = "py314"
 line-length = 90
 indent-width = 4
-src = ["src"]
+src = ["crates/mboxturbo-py/src", "crates/mboxturbo-py/tests"]
 show-fixes = true
 unsafe-fixes = false
 output-prefer-rule-codes = true
@@ -41,7 +41,7 @@ ignore = [
 dummy-variable-rgx = "^_.*$"
 
 [lint.per-file-ignores]
-"tests/**" = ["S101"]
+"crates/mboxturbo-py/tests/**" = ["S101"]
 
 [lint.flake8-annotations]
 allow-star-arg-any = false

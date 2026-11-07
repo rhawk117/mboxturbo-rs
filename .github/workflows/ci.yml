@@ -17,7 +17,6 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
-  PYTHON_PROJECT: crates/mboxturbo-py
 
 jobs:
   labeler:
@@ -51,8 +50,50 @@ jobs:
           NEW_LABELS: ${{ steps.apply-labels.outputs.new-labels }}
           ALL_LABELS: ${{ steps.apply-labels.outputs.all-labels }}
 
+  prek:
+    name: 🧹 Lint (prek)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ vars.UV_VERSION }}
+          cache-dependency-glob: uv.lock
+
+      - name: Install Pinned Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install Pinned Nightly rustfmt (prek.toml)
+        run: rustup toolchain install nightly-2026-10-15 --profile minimal --component rustfmt
+
+      - name: Restore Cargo Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: prek
+
+      - name: Install cargo-deny and cargo-machete
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny,cargo-machete
+
+      - name: Synchronize Lint Tools
+        run: uv sync --locked --no-install-project
+
+      - name: Run Every Hook
+        run: uv run --no-sync prek run --all-files --show-diff-on-failure
+        env:
+          SKIP: no-commit-to-branch
+
   rust-checks:
-    name: 🦀 Rust Quality Checks
+    name: 🦀 Rust Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -70,17 +111,6 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: .
-
-      - name: Check Formatting
-        run: cargo fmt --all --check
-
-      - name: Run Clippy (Strict Workspace Lints)
-        run: cargo clippy --workspace --all-targets --locked
-
-      - name: Build Documentation
-        run: cargo doc --no-deps --workspace --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
 
       - name: Run Workspace Tests
         run: cargo test --workspace --locked
@@ -111,7 +141,7 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ vars.UV_VERSION }}
-          cache-dependency-glob: crates/mboxturbo-py/uv.lock
+          cache-dependency-glob: uv.lock
 
       - name: Install Pinned Toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
@@ -126,11 +156,10 @@ jobs:
         uses: ./.github/actions/pysentry
         with:
           uv-version: ${{ vars.UV_VERSION }}
-          project-directory: crates/mboxturbo-py
+          project-directory: .
           upload-sarif: ${{ github.event.repository.fork != true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
 
       - name: Build Extension and Synchronize Dependencies
-        working-directory: ${{ env.PYTHON_PROJECT }}
         run: |
           read -ra dependency_groups <<<"$DEPENDENCY_GROUPS"
           uv sync --locked --no-default-groups "${dependency_groups[@]}" --python "$PYTHON_VERSION"
@@ -138,20 +167,7 @@ jobs:
           PYTHON_VERSION: ${{ matrix.python }}
           DEPENDENCY_GROUPS: ${{ matrix.groups }}
 
-      - name: Check Formatting (ruff)
-        working-directory: ${{ env.PYTHON_PROJECT }}
-        run: uv run --no-sync ruff format --check .
-
-      - name: Lint (ruff)
-        working-directory: ${{ env.PYTHON_PROJECT }}
-        run: uv run --no-sync ruff check .
-
-      - name: Type Check (ty)
-        working-directory: ${{ env.PYTHON_PROJECT }}
-        run: uv run --no-sync ty check src tests
-
       - name: Run Test Suite
-        working-directory: ${{ env.PYTHON_PROJECT }}
         run: uv run --no-sync pytest -rs
         env:
           HYPOTHESIS_PROFILE: ci

@@ -36,61 +36,75 @@ unnameable_types = "deny"
 variant_size_differences = "deny"
 unknown_lints = "deny"
 warnings = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+let_underscore = { level = "deny", priority = -1 }
+unused_results = "deny"
+missing_copy_implementations = "deny"
+unused_crate_dependencies = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_unsafe_on_extern = "deny"
+unsafe_attr_outside_unsafe = "deny"
+deprecated_safe_2024 = "deny"
+keyword_idents = { level = "deny", priority = -1 }
+macro_use_extern_crate = "deny"
+missing_abi = "deny"
+unstable_features = "deny"
+ffi_unwind_calls = "deny"
+impl_trait_redundant_captures = "deny"
+redundant_imports = "deny"
+if_let_rescope = "deny"
+tail_expr_drop_order = "deny"
+unused_extern_crates = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+missing_crate_level_docs = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_html_tags = "deny"
+invalid_rust_codeblocks = "deny"
+bare_urls = "deny"
+unescaped_backticks = "deny"
+redundant_explicit_links = "deny"
+private_doc_tests = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
-
-allow_attributes = "deny"
-allow_attributes_without_reason = "deny"
-arithmetic_side_effects = "deny"
-as_conversions = "deny"
-clone_on_ref_ptr = "deny"
-dbg_macro = "deny"
-exit = "deny"
-expect_used = "deny"
-get_unwrap = "deny"
-if_then_some_else_none = "deny"
-indexing_slicing = "deny"
-infinite_loop = "deny"
-let_underscore_must_use = "deny"
-let_underscore_untyped = "deny"
-lossy_float_literal = "deny"
-map_err_ignore = "deny"
-mem_forget = "deny"
-missing_assert_message = "deny"
-mixed_read_write_in_expression = "deny"
-mod_module_files = "deny"
-multiple_inherent_impl = "deny"
-mutex_atomic = "deny"
-panic = "deny"
-panic_in_result_fn = "deny"
-partial_pub_fields = "deny"
-print_stderr = "deny"
-print_stdout = "deny"
-rc_buffer = "deny"
-redundant_type_annotations = "deny"
-renamed_function_params = "deny"
-rest_pat_in_fully_bound_structs = "deny"
-same_name_method = "deny"
-shadow_unrelated = "deny"
-string_add = "deny"
-string_slice = "deny"
-tests_outside_test_module = "deny"
-todo = "deny"
-try_err = "deny"
-undocumented_unsafe_blocks = "deny"
-unimplemented = "deny"
-unneeded_field_pattern = "deny"
-unreachable = "deny"
-unused_result_ok = "deny"
-unwrap_in_result = "deny"
-unwrap_used = "deny"
-use_debug = "deny"
-verbose_file_reads = "deny"
-wildcard_enum_match_arm = "deny"
+# The whole restriction group, the equivalent of ruff's ALL. Everything below set to "allow"
+# contradicts another restriction lint or a convention in .claude/rules/rust/, never "too noisy".
+restriction = { level = "deny", priority = -1 }
+# Contradicts clippy::needless_return (style); the codebase returns by tail expression.
+implicit_return = "allow"
+# Bans `?`, the propagation rust.md convention 1 prescribes.
+question_mark_used = "allow"
+# Bans single-use helpers, the extraction rust.md convention 8 prescribes.
+single_call_fn = "allow"
+# Pair with pub_without_shorthand: the codebase writes `pub(crate)`, so that one stays denied.
+pub_with_shorthand = "allow"
+# Pair with unseparated_literal_suffix: `1_u32` is the house style, so that one stays denied.
+separated_literal_suffix = "allow"
+# Pair with mod_module_files (denied): modules are `name.rs`, never `name/mod.rs`.
+self_named_module_files = "allow"
+# Pair with ref_patterns: matching through a reference needs either `ref` or match ergonomics.
+pattern_type_mismatch = "allow"
+# Pair with big_endian_bytes and host_endian_bytes: the index format is little-endian on purpose.
+little_endian_bytes = "allow"
+# Both crates link std; core and alloc paths buy nothing.
+std_instead_of_core = "allow"
+std_instead_of_alloc = "allow"
+# lto = "fat" with codegen-units = 1 already inlines across crates.
+missing_inline_in_public_items = "allow"
+# Forces re-implementing every provided trait method.
+missing_trait_methods = "allow"
+# lib.rs is the public facade and re-exports the API by design.
+pub_use = "allow"
+# Inline `#[cfg(test)] mod tests` is required by tests_outside_test_module and rust-tests.md.
+inline_modules = "allow"
+# The lint that warns about enabling this group.
+blanket_clippy_restriction_lints = "allow"
 
 [profile.release]
 lto = "fat"

@@ -1,0 +1,3 @@
+[default]
+# RFC 2047 encoded words in test mail (=?utf-8?q?caf=C3=A9?=) are not prose.
+extend-ignore-re = ['=\?[A-Za-z0-9_-]+\?[QqBb]\?[^?\s]*\?=']
