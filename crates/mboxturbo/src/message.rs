@@ -325,8 +325,10 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
         );
     }
 
+    // The failed-parse fallback is reachable only through a contained body-stage panic,
+    // for which no input is known, so this pins the successful-parse case alone.
     #[test]
-    fn header_fields_read_the_same_before_and_after_a_full_parse() {
+    fn a_successful_full_parse_leaves_the_subject_unchanged() {
         let (_directory, mailbox) = mailbox();
         let message = mailbox.message(0).expect("fixture has one message");
         let before = message.subject().map(str::to_owned);
@@ -334,7 +336,7 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
         assert_eq!(
             message.subject(),
             before.as_deref(),
-            "a full parse does not change what the header accessors return"
+            "a successful full parse does not change the subject"
         );
     }
 

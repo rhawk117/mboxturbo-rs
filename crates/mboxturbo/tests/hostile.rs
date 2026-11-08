@@ -133,11 +133,12 @@ mod hostile {
                 let message = mailbox.message(position).expect("indexed message");
                 exercise(&message);
                 let before = message.subject().map(str::to_owned);
-                let _parsed = message.parse();
+                let parsed = message.parse();
                 prop_assert_eq!(
                     message.subject(),
                     before.as_deref(),
-                    "a full parse, failed or not, does not change the subject"
+                    "a full parse (MIME part found: {}) leaves the subject unchanged",
+                    parsed
                 );
             }
             let batch = mailbox.parse_batch(0..mailbox.len());
