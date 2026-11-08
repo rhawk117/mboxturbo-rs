@@ -8,7 +8,7 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::error::{Corruption, MboxturboError};
+use crate::error::{Corruption, MboxTurboError};
 use crate::fingerprint::Fingerprint;
 use crate::scan;
 use crate::width::{narrow, widen};
@@ -50,14 +50,14 @@ impl From<Corruption> for Rejection {
 
 impl Rejection {
     /// The public error for this rejection of the index file at `path`.
-    fn at(self, path: &Path) -> MboxturboError {
+    fn at(self, path: &Path) -> MboxTurboError {
         let index_path = path.to_path_buf();
         match self {
-            Self::Corrupt(corruption) => MboxturboError::CorruptIndex {
+            Self::Corrupt(corruption) => MboxTurboError::CorruptIndex {
                 path: index_path,
                 corruption,
             },
-            Self::Stale => MboxturboError::StaleIndex { path: index_path },
+            Self::Stale => MboxTurboError::StaleIndex { path: index_path },
         }
     }
 }
@@ -93,9 +93,8 @@ impl Index {
         }
         let (count, offsets) = take_u64(after_fingerprint)?;
         let starts = decode_starts(offsets, count)?;
-        let end = narrow(stored.len()).ok_or(Corruption::Bounds {
-            position: None,
-            offset: stored.len(),
+        let end = narrow(stored.len()).ok_or(Corruption::MailboxTooLarge {
+            length: stored.len(),
         })?;
         validate_starts(&starts, end)?;
         Ok(Self {
@@ -149,11 +148,11 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Io`] when the file cannot be read, [`MboxturboError::CorruptIndex`] when
-    /// it fails validation, and [`MboxturboError::StaleIndex`] when it belongs to a different
+    /// [`MboxTurboError::Io`] when the file cannot be read, [`MboxTurboError::CorruptIndex`] when
+    /// it fails validation, and [`MboxTurboError::StaleIndex`] when it belongs to a different
     /// mailbox than `expected`.
-    pub fn load(path: &Path, expected: Fingerprint) -> Result<Self, MboxturboError> {
-        let bytes = fs::read(path).map_err(|source| MboxturboError::io(path, source))?;
+    pub fn load(path: &Path, expected: Fingerprint) -> Result<Self, MboxTurboError> {
+        let bytes = fs::read(path).map_err(|source| MboxTurboError::io(path, source))?;
         Self::decode(&bytes, expected).map_err(|rejection| rejection.at(path))
     }
 
@@ -162,25 +161,25 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Io`] when the temporary file cannot be created, written, synced, or
+    /// [`MboxTurboError::Io`] when the temporary file cannot be created, written, synced, or
     /// renamed into place.
-    pub fn save(&self, path: &Path) -> Result<(), MboxturboError> {
+    pub fn save(&self, path: &Path) -> Result<(), MboxTurboError> {
         let directory = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
         let mut staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))
-            .map_err(|source| MboxturboError::io(path, source))?;
+            .map_err(|source| MboxTurboError::io(path, source))?;
         staged
             .write_all(&self.encode())
-            .map_err(|source| MboxturboError::io(path, source))?;
+            .map_err(|source| MboxTurboError::io(path, source))?;
         staged
             .as_file()
             .sync_all()
-            .map_err(|source| MboxturboError::io(path, source))?;
+            .map_err(|source| MboxTurboError::io(path, source))?;
         staged
             .persist(path)
             .map(|_persisted| ())
-            .map_err(|failure| MboxturboError::io(path, failure.error))?;
+            .map_err(|failure| MboxTurboError::io(path, failure.error))?;
         Ok(())
     }
 
@@ -282,10 +281,7 @@ fn decode_starts(bytes: &[u8], count: u64) -> Result<Box<[usize]>, Corruption> {
         .enumerate()
         .map(|(position, &word)| {
             let offset = u64::from_le_bytes(word);
-            narrow(offset).ok_or(Corruption::Bounds {
-                position: Some(position),
-                offset,
-            })
+            narrow(offset).ok_or(Corruption::Bounds { position, offset })
         })
         .collect()
 }
@@ -308,7 +304,7 @@ fn validate_starts(starts: &[usize], end: usize) -> Result<(), Corruption> {
     }
     match starts.last() {
         Some(&last) if last >= end => Err(Corruption::Bounds {
-            position: Some(starts.len().saturating_sub(1)),
+            position: starts.len().saturating_sub(1),
             offset: widen(last),
         }),
         _ => Ok(()),
@@ -344,20 +340,41 @@ mod tests {
     #[test]
     fn spans_cover_each_message_and_the_last_runs_to_the_end() {
         let index = built();
-        assert_eq!(index.span(0), Some(0..27), "first message");
+        assert_eq!(
+            index.span(0),
+            Some(0..27),
+            "the first message spans from its start to the second's start"
+        );
         assert_eq!(
             index.span(1),
             Some(27..MAILBOX.len()),
-            "last message ends at EOF"
+            "the last message runs to the end of the mailbox"
         );
-        assert_eq!(index.span(2), None, "past the end");
-        assert_eq!(index.span_of(0..2), Some(0..MAILBOX.len()), "whole range");
+        assert_eq!(
+            index.span(2),
+            None,
+            "a position past the last message has no span"
+        );
+    }
+
+    #[test]
+    fn ranges_of_messages_span_from_the_first_start_to_the_last_end() {
+        let index = built();
+        assert_eq!(
+            index.span_of(0..2),
+            Some(0..MAILBOX.len()),
+            "a range over every message spans the whole mailbox"
+        );
         assert_eq!(
             index.span_of(1..9),
             Some(27..MAILBOX.len()),
-            "clamped range"
+            "a range running past the last message is clamped to the mailbox end"
         );
-        assert_eq!(index.span_of(1..1), None, "empty range");
+        assert_eq!(
+            index.span_of(1..1),
+            None,
+            "an empty range covers no bytes, so it has no span"
+        );
     }
 
     #[test]
@@ -376,7 +393,7 @@ mod tests {
         bytes[0] = b'X';
         assert!(
             matches!(rejection(&bytes), Rejection::Corrupt(Corruption::Signature)),
-            "magic"
+            "a corrupted first byte fails the signature check"
         );
     }
 
@@ -389,7 +406,7 @@ mod tests {
                 rejection(&bytes),
                 Rejection::Corrupt(Corruption::Version(2))
             ),
-            "version"
+            "a version newer than the format supports is rejected as corrupt"
         );
     }
 
@@ -452,7 +469,7 @@ mod tests {
             matches!(
                 rejection(&bytes),
                 Rejection::Corrupt(Corruption::Bounds {
-                    position: Some(1),
+                    position: 1,
                     offset
                 }) if offset == past
             ),

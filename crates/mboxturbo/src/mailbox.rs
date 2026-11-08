@@ -9,7 +9,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::error::MboxturboError;
+use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
 use crate::index::Index;
@@ -60,9 +60,9 @@ impl Mapped {
 
     /// Opens and maps `path`, fingerprinting what was mapped.
     ///
-    /// Fails with [`MboxturboError::Io`] when the file cannot be opened or mapped.
-    fn open(path: &Path) -> Result<Self, MboxturboError> {
-        let file = File::open(path).map_err(|source| MboxturboError::io(path, source))?;
+    /// Fails with [`MboxTurboError::Io`] when the file cannot be opened or mapped.
+    fn open(path: &Path) -> Result<Self, MboxTurboError> {
+        let file = File::open(path).map_err(|source| MboxTurboError::io(path, source))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "a missing modification time becomes mtime 0: the length and sample hash in \
@@ -73,7 +73,7 @@ impl Mapped {
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
-        let contents = map_read_only(&file).map_err(|source| MboxturboError::io(path, source))?;
+        let contents = map_read_only(&file).map_err(|source| MboxTurboError::io(path, source))?;
         let fingerprint = Fingerprint::new(&contents, modified);
         Ok(Self {
             contents,
@@ -128,8 +128,8 @@ impl Mailbox {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Io`] when the file cannot be opened or mapped.
-    pub fn open<P>(path: P) -> Result<Self, MboxturboError>
+    /// [`MboxTurboError::Io`] when the file cannot be opened or mapped.
+    pub fn open<P>(path: P) -> Result<Self, MboxTurboError>
     where
         P: AsRef<Path>,
     {
@@ -141,10 +141,10 @@ impl Mailbox {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Io`] when either file cannot be read or the new index cannot be written,
-    /// and [`MboxturboError::CorruptIndex`] when `index_path` exists but fails validation; a
+    /// [`MboxTurboError::Io`] when either file cannot be read or the new index cannot be written,
+    /// and [`MboxTurboError::CorruptIndex`] when `index_path` exists but fails validation; a
     /// corrupt file is left in place for inspection rather than overwritten.
-    pub fn open_cached<P, Q>(path: P, index_path: Q) -> Result<Self, MboxturboError>
+    pub fn open_cached<P, Q>(path: P, index_path: Q) -> Result<Self, MboxTurboError>
     where
         P: AsRef<Path>,
         Q: AsRef<Path>,

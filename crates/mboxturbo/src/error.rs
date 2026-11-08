@@ -10,14 +10,12 @@ use parquet::errors::ParquetError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Corruption {
-    /// A message offset points past the end of the mailbox, or the mailbox length does not fit
-    /// in memory.
-    #[error("{}", describe_bounds(*position, *offset))]
+    /// A message offset does not fit in memory or points past the end of the mailbox.
+    #[error("message {position} starts at offset {offset}, outside the mailbox")]
     Bounds {
-        /// Position of the message with the offending offset; `None` when the offender is the
-        /// mailbox length itself.
-        position: Option<usize>,
-        /// The offending byte offset, or the mailbox length when `position` is `None`.
+        /// Position of the message with the offending offset.
+        position: usize,
+        /// The offending byte offset.
         offset: u64,
     },
     /// The trailing checksum does not match the contents.
@@ -31,6 +29,12 @@ pub enum Corruption {
         declared: u64,
         /// Bytes actually present at that point.
         actual: u64,
+    },
+    /// The mailbox length does not fit in memory.
+    #[error("mailbox length {length} does not fit in memory")]
+    MailboxTooLarge {
+        /// The mailbox length in bytes.
+        length: u64,
     },
     /// Message offsets are not strictly increasing.
     #[error(
@@ -55,7 +59,7 @@ pub enum Corruption {
 /// Everything that can go wrong opening a mailbox or handling its index.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum MboxturboError {
+pub enum MboxTurboError {
     /// Extracted columns could not be assembled into an Arrow batch.
     #[error("cannot assemble an Arrow batch for messages {}..{}", positions.start, positions.end)]
     Arrow {
@@ -100,7 +104,7 @@ pub enum MboxturboError {
     },
 }
 
-impl MboxturboError {
+impl MboxTurboError {
     /// Whether the cached index should be rebuilt: it is stale or missing (`NotFound`), not
     /// otherwise broken.
     pub(crate) fn calls_for_rebuild(&self) -> bool {
@@ -108,21 +112,11 @@ impl MboxturboError {
             || matches!(self, Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
     }
 
-    /// Wraps `source` as [`MboxturboError::Io`], recording the `path` being accessed.
+    /// Wraps `source` as [`MboxTurboError::Io`], recording the `path` being accessed.
     pub(crate) fn io(path: &Path, source: io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
             source,
         }
     }
-}
-
-/// Renders the [`Corruption::Bounds`] message, naming the message position when there is one.
-fn describe_bounds(position: Option<usize>, offset: u64) -> String {
-    position.map_or_else(
-        || format!("mailbox length {offset} does not fit in memory"),
-        |message| {
-            format!("message {message} starts at offset {offset}, past the end of the mailbox")
-        },
-    )
 }

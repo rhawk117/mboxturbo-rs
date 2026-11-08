@@ -25,17 +25,17 @@ create_exception!(
 
 /// The Python exception for a core error: `OSError` (with `filename`) for I/O, the matching
 /// `MboxTurboError` subclass for a damaged or stale index, the base class otherwise.
-pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxturboError) -> PyErr {
+pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> PyErr {
     let message = error.to_string();
     match error {
-        mboxturbo::MboxturboError::Io { path, source } => {
+        mboxturbo::MboxTurboError::Io { path, source } => {
             let raised = PyErr::from(source);
             let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
             tagged.err().unwrap_or(raised)
         },
-        mboxturbo::MboxturboError::CorruptIndex { .. } => CorruptIndexError::new_err(message),
-        mboxturbo::MboxturboError::StaleIndex { .. } => StaleIndexError::new_err(message),
-        mboxturbo::MboxturboError::Arrow { .. } | mboxturbo::MboxturboError::Parquet { .. } => {
+        mboxturbo::MboxTurboError::CorruptIndex { .. } => CorruptIndexError::new_err(message),
+        mboxturbo::MboxTurboError::StaleIndex { .. } => StaleIndexError::new_err(message),
+        mboxturbo::MboxTurboError::Arrow { .. } | mboxturbo::MboxTurboError::Parquet { .. } => {
             MboxTurboError::new_err(message)
         },
         _ => MboxTurboError::new_err(message),

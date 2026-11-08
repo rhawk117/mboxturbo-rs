@@ -26,7 +26,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::columns::Column;
-use crate::error::MboxturboError;
+use crate::error::MboxTurboError;
 use crate::fields::{
     self, Mail, builtin_table_with_raw_received, contain_parser_panic, strip_separator,
 };
@@ -92,7 +92,7 @@ pub struct BatchReader {
     /// Plan that decides columns, schema and batch size.
     pipeline: Arc<Pipeline>,
     /// Extracted batches, in mailbox order, awaiting delivery.
-    ready: VecDeque<Result<RecordBatch, MboxturboError>>,
+    ready: VecDeque<Result<RecordBatch, MboxTurboError>>,
 }
 
 impl Pipeline {
@@ -101,8 +101,8 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Parquet`] if writing or closing fails, or the first batch error
-    /// ([`MboxturboError::Arrow`]) the reader yields; extraction stops at that error.
+    /// [`MboxTurboError::Parquet`] if writing or closing fails, or the first batch error
+    /// ([`MboxTurboError::Arrow`]) the reader yields; extraction stops at that error.
     ///
     /// # Panics
     ///
@@ -112,7 +112,7 @@ impl Pipeline {
         mailbox: &Arc<Mailbox>,
         mut writer: ArrowWriter<File>,
         path: &Path,
-    ) -> Result<u64, MboxturboError> {
+    ) -> Result<u64, MboxTurboError> {
         let parquet_error = |source| parquet_failure(path, source);
         let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
         let mut batches = self.reader(mailbox);
@@ -122,7 +122,7 @@ impl Pipeline {
             let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
                 let batch = received?;
                 writer.write(&batch).map_err(parquet_error)?;
-                Ok::<u64, MboxturboError>(rows.saturating_add(widen(batch.num_rows())))
+                Ok::<u64, MboxTurboError>(rows.saturating_add(widen(batch.num_rows())))
             });
             if let Err(payload) = reader_thread.join() {
                 resume_unwind(payload);
@@ -137,13 +137,13 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Arrow`], naming the clamped positions, if the columns cannot be
+    /// [`MboxTurboError::Arrow`], naming the clamped positions, if the columns cannot be
     /// assembled into a batch.
     pub fn extract(
         &self,
         mailbox: &Mailbox,
         positions: Range<usize>,
-    ) -> Result<RecordBatch, MboxturboError> {
+    ) -> Result<RecordBatch, MboxTurboError> {
         let clamped = clamp_positions(positions, mailbox.len());
         let mut slots: Vec<Slot> = self
             .columns
@@ -162,7 +162,7 @@ impl Pipeline {
             }
         }
         let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
-        RecordBatch::try_new(self.schema(), arrays).map_err(|source| MboxturboError::Arrow {
+        RecordBatch::try_new(self.schema(), arrays).map_err(|source| MboxTurboError::Arrow {
             positions: clamped,
             source,
         })
@@ -228,23 +228,23 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Io`] when the file cannot be created or renamed into place,
-    /// [`MboxturboError::Parquet`] when encoding fails, and [`MboxturboError::Arrow`] if a
+    /// [`MboxTurboError::Io`] when the file cannot be created or renamed into place,
+    /// [`MboxTurboError::Parquet`] when encoding fails, and [`MboxTurboError::Arrow`] if a
     /// batch cannot be assembled.
     pub fn write_parquet(
         self: &Arc<Self>,
         mailbox: &Arc<Mailbox>,
         path: &Path,
         compression: Compression,
-    ) -> Result<u64, MboxturboError> {
+    ) -> Result<u64, MboxTurboError> {
         let directory = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
         let staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))
-            .map_err(|source| MboxturboError::io(path, source))?;
+            .map_err(|source| MboxTurboError::io(path, source))?;
         let file = staged
             .reopen()
-            .map_err(|source| MboxturboError::io(path, source))?;
+            .map_err(|source| MboxTurboError::io(path, source))?;
         let properties = WriterProperties::builder()
             .set_compression(parquet_compression(compression))
             .set_max_row_group_row_count(Some(self.batch_size.saturating_mul(16)))
@@ -257,14 +257,14 @@ impl Pipeline {
         staged
             .persist(path)
             .map(|_persisted| ())
-            .map_err(|failure| MboxturboError::io(path, failure.error))?;
+            .map_err(|failure| MboxTurboError::io(path, failure.error))?;
         Ok(rows)
     }
 }
 
 impl BatchReader {
     /// The next batch, keeping the typed error so callers can read the positions it covers.
-    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxturboError>> {
+    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
         if self.ready.is_empty() {
             let window = self.pipeline.window(self.next, &self.mailbox);
             self.next = window.last().map_or(self.next, |last| last.end);
@@ -512,8 +512,8 @@ fn clamp_positions(positions: Range<usize>, len: usize) -> Range<usize> {
 
 /// Sends `batches` to `sender` in order until they run out or the receiver is gone.
 fn forward_batches(
-    batches: impl Iterator<Item = Result<RecordBatch, MboxturboError>>,
-    sender: &SyncSender<Result<RecordBatch, MboxturboError>>,
+    batches: impl Iterator<Item = Result<RecordBatch, MboxTurboError>>,
+    sender: &SyncSender<Result<RecordBatch, MboxTurboError>>,
 ) {
     for batch in batches {
         // A send fails only once the receiver is dropped, and the consumer drops it only after
@@ -525,8 +525,8 @@ fn forward_batches(
 }
 
 /// Wraps a Parquet encoding failure with the output `path` it concerns.
-fn parquet_failure(path: &Path, source: ParquetError) -> MboxturboError {
-    MboxturboError::Parquet {
+fn parquet_failure(path: &Path, source: ParquetError) -> MboxTurboError {
+    MboxTurboError::Parquet {
         path: path.to_path_buf(),
         source,
     }
@@ -693,7 +693,7 @@ mod tests {
         forward_batches, header_form, html_body, joined, text_body, utc_timestamps,
     };
     use crate::columns::Column;
-    use crate::error::MboxturboError;
+    use crate::error::MboxTurboError;
     use crate::fields::Mail;
 
     const MULTIPART: &[u8] = b"From: a@example.org\r\nTo: b@example.org, c@example.org\r\n\
@@ -764,7 +764,7 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         let mut pulled = 0_usize;
         let batches = iter::repeat_with(|| {
             pulled += 1;
-            Ok::<_, MboxturboError>(batch_of(1))
+            Ok::<_, MboxTurboError>(batch_of(1))
         });
         forward_batches(batches.take(10), &sender);
         assert_eq!(pulled, 1, "the failed first send ends extraction");

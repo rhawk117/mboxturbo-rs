@@ -6,7 +6,7 @@ mod mailbox {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
 
-    use mboxturbo::{Corruption, Mailbox, MboxturboError, Message};
+    use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
     use rayon::prelude::*;
     use tempfile::TempDir;
 
@@ -381,7 +381,7 @@ AAEC\n\
         assert!(
             matches!(
                 error,
-                MboxturboError::CorruptIndex {
+                MboxTurboError::CorruptIndex {
                     corruption: Corruption::Checksum,
                     ..
                 }
@@ -400,7 +400,7 @@ AAEC\n\
         let error = Mailbox::open_cached(&fixture.mbox, &fixture.index)
             .expect_err("a damaged cache is rejected");
         assert!(
-            matches!(error, MboxturboError::CorruptIndex { .. }),
+            matches!(error, MboxTurboError::CorruptIndex { .. }),
             "the damaged cache is reported, not repaired"
         );
         assert_eq!(
@@ -416,7 +416,7 @@ AAEC\n\
         let missing = fixture.mbox.with_extension("absent");
         let error = Mailbox::open(&missing).expect_err("a missing mbox is rejected");
         assert!(
-            matches!(&error, MboxturboError::Io { path, .. } if *path == missing),
+            matches!(&error, MboxTurboError::Io { path, .. } if *path == missing),
             "the error carries the missing path"
         );
     }

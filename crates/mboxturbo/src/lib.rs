@@ -30,7 +30,7 @@ mod scan;
 mod width;
 
 pub use columns::Column;
-pub use error::{Corruption, MboxturboError};
+pub use error::{Corruption, MboxTurboError};
 pub use fingerprint::Fingerprint;
 pub use index::Index;
 pub use mailbox::{Mailbox, ParsedBatch};
