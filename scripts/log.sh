@@ -27,13 +27,13 @@ log::_emit() {
   local level=$1 suffix=''
   shift
 
-  [[ $level == step_end && $_LOG_CI == false ]] && return 0
-  [[ $level == step && $_LOG_CI == false ]] && suffix=$'\033[0m'
+  [[ ${level} == step_end && ${_LOG_CI} == false ]] && return 0
+  [[ ${level} == step && ${_LOG_CI} == false ]] && suffix=$'\033[0m'
 
-  if [[ $_LOG_CI == false && ($level == warn || $level == error) ]]; then
-    printf '%s%s%s\n' "${_LOG_PREFIX[$level]}" "$*" "$suffix" >&2
+  if [[ ${_LOG_CI} == false && (${level} == warn || ${level} == error) ]]; then
+    printf '%s%s%s\n' "${_LOG_PREFIX[${level}]}" "$*" "${suffix}" >&2
   else
-    printf '%s%s%s\n' "${_LOG_PREFIX[$level]}" "$*" "$suffix"
+    printf '%s%s%s\n' "${_LOG_PREFIX[${level}]}" "$*" "${suffix}"
   fi
 }
 
