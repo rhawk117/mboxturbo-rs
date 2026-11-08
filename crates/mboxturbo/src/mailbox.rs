@@ -147,6 +147,44 @@ impl Mailbox {
         self.contents.get(self.index.span(position)?)
     }
 
+    /// The span and raw bytes of every message in `positions`, clamped to the messages that
+    /// exist, as `(position, span, raw)`.
+    ///
+    /// Yields one item for every clamped position and never skips one. This rests on one
+    /// invariant: every loaded index is validated against the mapping it describes. A freshly
+    /// built index takes `end` from `contents.len()` in `Index::build`; a cached one is accepted
+    /// by `Index::decode` only when its stored length equals the mapping's, and
+    /// `validate_starts` has checked its offsets are ascending and below that length.
+    pub(crate) fn rows(
+        &self,
+        positions: Range<usize>,
+    ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
+        let end = positions.end.min(self.len());
+        let start = positions.start.min(end);
+        (start..end).map(|position| {
+            let (span, raw) = self.row(position);
+            (position, span, raw)
+        })
+    }
+
+    /// The span and raw bytes of the message at `position`, which must be below `len()`.
+    #[expect(
+        clippy::expect_used,
+        reason = "`position` is below `len()`, so the index has a span for it, and a validated \
+                  index keeps every span inside the mapping, which is `contents.len()` long"
+    )]
+    fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
+        let span = self
+            .index
+            .span(position)
+            .expect("a position below len() has a span");
+        let raw = self
+            .contents
+            .get(span.clone())
+            .expect("a validated index spans bytes inside the mapping");
+        (span, raw)
+    }
+
     /// Raw bytes of every message, in file order.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {

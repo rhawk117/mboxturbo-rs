@@ -103,13 +103,7 @@ impl Pipeline {
             .iter()
             .map(|column| Slot::new(column, positions.len()))
             .collect();
-        for position in positions.clone() {
-            let Some(span) = mailbox.index().span(position) else {
-                continue;
-            };
-            let Some(raw) = mailbox.raw(position) else {
-                continue;
-            };
+        for (position, span, raw) in mailbox.rows(positions.clone()) {
             let parsed = self.parse(raw);
             let record = Record {
                 position,
