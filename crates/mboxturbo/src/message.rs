@@ -385,7 +385,7 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
     fn unfolding_borrows_when_nothing_needs_joining() {
         assert!(
             matches!(unfold(Cow::Borrowed(" value ")), Cow::Borrowed("value")),
-            "no copy"
+            "a value with no folded lines is trimmed without allocating a copy"
         );
     }
 }
