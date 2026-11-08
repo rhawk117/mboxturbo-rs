@@ -107,7 +107,9 @@ impl Pipeline {
             let Some(span) = mailbox.index().span(position) else {
                 continue;
             };
-            let raw = mailbox.raw(position).unwrap_or_default();
+            let Some(raw) = mailbox.raw(position) else {
+                continue;
+            };
             let parsed = self.parse(raw);
             let record = Record {
                 position,
@@ -185,19 +187,26 @@ impl Pipeline {
             ArrowWriter::try_new(file, self.schema(), Some(properties)).map_err(parquet_error)?;
         let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
         let mut batches = self.reader(mailbox);
-        let mut reader = iter::from_fn(move || batches.next_batch());
+        let reader = iter::from_fn(move || batches.next_batch());
         let produced = thread::scope(|scope| {
-            let reader_thread =
-                scope.spawn(move || reader.try_for_each(|batch| sender.send(batch).map_err(drop)));
+            let reader_thread = scope.spawn(move || {
+                for batch in reader {
+                    // A send fails only once the receiver is dropped, and the consumer below
+                    // drops it only after `try_fold` stopped on an `Err`, which `rows` returns.
+                    if sender.send(batch).is_err() {
+                        break;
+                    }
+                }
+            });
             let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
                 let batch = received?;
                 writer.write(&batch).map_err(parquet_error)?;
                 Ok::<u64, MboxturboError>(rows.saturating_add(widen(batch.num_rows())))
             });
-            match reader_thread.join() {
-                Ok(_) => rows,
-                Err(payload) => resume_unwind(payload),
+            if let Err(payload) = reader_thread.join() {
+                resume_unwind(payload);
             }
+            rows
         })?;
         writer.close().map(|_metadata| ()).map_err(parquet_error)?;
         Ok(produced)
