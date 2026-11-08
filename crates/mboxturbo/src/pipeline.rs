@@ -39,31 +39,45 @@ pub enum Compression {
     /// Zstandard at level 1: a good ratio at close to Snappy speed.
     #[default]
     Zstd,
-    /// Snappy.
+    /// Snappy: cheaper to decode than Zstd, at the cost of larger files.
     Snappy,
     /// No compression.
     Uncompressed,
 }
 
+/// How much of each message must be parsed to fill the selected columns; the cheapest depth that
+/// covers them is chosen so unused parsing work is skipped.
 #[derive(Debug)]
 enum Depth {
+    /// Columns need only raw bytes and offsets, so no message is parsed.
     Nothing,
+    /// Only the headers the selected columns read are parsed; the rest of the message is skipped.
     Headers(MessageParser),
+    /// The body is parsed too, because a body or attachment column is selected.
     Whole(MessageParser),
 }
 
 /// A reusable extraction plan: which columns, how deep to parse, and how many rows per batch.
 #[derive(Debug)]
 pub struct Pipeline {
+    /// Selected columns, in output order.
     columns: Box<[Column]>,
+    /// Arrow schema derived from `columns`, shared by every batch.
     schema: SchemaRef,
+    /// Parse depth required by `columns`.
     depth: Depth,
+    /// Rows per batch; never zero.
     batch_size: usize,
 }
 
+/// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
 struct Record<'a> {
+    /// Zero-based index of the message in the mailbox.
     position: usize,
+    /// Byte range of the message in the mailbox file.
     span: Range<usize>,
+    /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
+    /// on it.
     mail: Option<&'a Mail<'a>>,
 }
 
@@ -169,6 +183,17 @@ impl Pipeline {
         Ok(rows)
     }
 
+    /// Drains a batch reader on a producer thread into `writer` and closes it, returning the
+    /// number of rows written.
+    ///
+    /// # Errors
+    ///
+    /// [`MboxturboError::Parquet`] if writing or closing fails, or the first batch error
+    /// ([`MboxturboError::Arrow`]) the reader yields; extraction stops at that error.
+    ///
+    /// # Panics
+    ///
+    /// Re-raises a panic from the producer thread on the calling thread.
     fn encode_parquet(
         self: &Arc<Self>,
         mailbox: &Arc<Mailbox>,
@@ -203,6 +228,9 @@ impl Pipeline {
         Ok(produced)
     }
 
+    /// Parses `raw` just deeply enough for the selected columns, after stripping the mbox separator
+    /// line. Returns `None` when no column needs parsing, or when the parser fails or panics on
+    /// this message.
     fn parse<'a>(&self, raw: &'a [u8]) -> Option<Mail<'a>> {
         let message = strip_separator(raw);
         match &self.depth {
@@ -212,6 +240,9 @@ impl Pipeline {
         }
     }
 
+    /// Splits the span of messages from `from` onward that all threads can work on at once (two
+    /// batches per thread) into batch-sized position ranges. Empty when `from` is at or past
+    /// the end of `mailbox`; the last range may be shorter than the batch size.
     fn window(&self, from: usize, mailbox: &Mailbox) -> Vec<Range<usize>> {
         let span = self
             .batch_size
@@ -224,6 +255,7 @@ impl Pipeline {
     }
 }
 
+/// Wraps a Parquet encoding failure with the output `path` it concerns.
 fn parquet_failure(path: &Path, source: ParquetError) -> MboxturboError {
     MboxturboError::Parquet {
         path: path.to_path_buf(),
@@ -231,6 +263,8 @@ fn parquet_failure(path: &Path, source: ParquetError) -> MboxturboError {
     }
 }
 
+/// Picks the shallowest parse that serves `columns`: whole message if any needs the body, none if
+/// no column needs parsing, otherwise headers only, with just the needed ones decoded.
 fn depth_for(columns: &[Column]) -> Depth {
     if columns.iter().any(Column::needs_body) {
         return Depth::Whole(builtin_table_with_raw_received(MessageParser::new()));
@@ -271,6 +305,8 @@ fn depth_for(columns: &[Column]) -> Depth {
     )
 }
 
+/// Maps the public [`Compression`] choice to the Parquet writer's codec (Zstd at its default
+/// level).
 fn parquet_compression(compression: Compression) -> ParquetCompression {
     match compression {
         Compression::Zstd => ParquetCompression::ZSTD(ZstdLevel::default()),
@@ -282,9 +318,13 @@ fn parquet_compression(compression: Compression) -> ParquetCompression {
 /// Batches over a whole mailbox, produced a window at a time on all rayon threads.
 #[derive(Debug)]
 pub struct BatchReader {
+    /// Plan that decides columns, schema and batch size.
     pipeline: Arc<Pipeline>,
+    /// Mailbox being read.
     mailbox: Arc<Mailbox>,
+    /// Position of the first message not yet scheduled for extraction.
     next: usize,
+    /// Extracted batches, in mailbox order, awaiting delivery.
     ready: VecDeque<Result<RecordBatch, MboxturboError>>,
 }
 
@@ -322,31 +362,52 @@ impl RecordBatchReader for BatchReader {
 }
 
 #[derive(Debug)]
+/// Typed column builder for one selected column; each message appends exactly one entry per slot.
 enum Slot {
+    /// Message index.
     Position(UInt64Builder),
+    /// Byte offset of the message start.
     Offset(UInt64Builder),
+    /// Message length in bytes.
     Size(UInt64Builder),
+    /// Email addresses of one address header; an absent header gives an empty list.
     Addresses(AddressHeader, ListBuilder<StringBuilder>),
+    /// Decoded subject, null when absent.
     Subject(StringBuilder),
+    /// Date as UTC microseconds, null when absent or invalid.
     Date(TimestampMicrosecondBuilder),
+    /// Minutes east of UTC from the Date header, null when absent or invalid.
     DateOffset(Int32Builder),
+    /// First Message-ID, null when absent.
     MessageId(StringBuilder),
+    /// Every value of the named header (lowercase name); empty list when absent.
     HeaderValues(String, ListBuilder<StringBuilder>),
+    /// First value of the named header (lowercase name), null when absent.
     FirstHeaderValue(String, StringBuilder),
+    /// Plain-text bodies joined by newlines, null when the message is unparsed.
     Text(StringBuilder),
+    /// HTML bodies joined by newlines, null when the message is unparsed.
     Html(StringBuilder),
+    /// One of the attachment list columns.
     Attachments(AttachmentSlot),
 }
 
 #[derive(Debug)]
+/// Builder for one per-attachment list column; each message contributes one list, which is
+/// empty when it has no attachments.
 enum AttachmentSlot {
+    /// Attachment file names; a nameless attachment is null.
     Names(ListBuilder<StringBuilder>),
+    /// Attachment content types.
     Types(ListBuilder<StringBuilder>),
+    /// Decoded attachment sizes in bytes.
     Sizes(ListBuilder<UInt64Builder>),
+    /// Lowercase hex SHA-256 of each decoded attachment.
     Sha256(ListBuilder<StringBuilder>),
 }
 
 impl AttachmentSlot {
+    /// Appends this message's attachment list; an unparsed message (`None`) appends an empty list.
     fn append(&mut self, mail: Option<&Mail<'_>>) {
         let attachments = mail.into_iter().flat_map(fields::attachments);
         match self {
@@ -375,6 +436,7 @@ impl AttachmentSlot {
         }
     }
 
+    /// Finishes the builder into an Arrow list array and resets it for reuse.
     fn finish(&mut self) -> ArrayRef {
         match self {
             Self::Names(builder) | Self::Types(builder) | Self::Sha256(builder) => {
@@ -386,14 +448,20 @@ impl AttachmentSlot {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Which address header an address column reads.
 enum AddressHeader {
+    /// The From header.
     From,
+    /// The To header.
     To,
+    /// The Cc header.
     Cc,
+    /// The Reply-To header.
     ReplyTo,
 }
 
 impl AddressHeader {
+    /// Reads this header from `mail`, or `None` when the message lacks it.
     fn of<'a>(self, mail: &'a Mail<'a>) -> Option<AddressList<'a>> {
         match self {
             Self::From => mail.from(),
@@ -404,11 +472,14 @@ impl AddressHeader {
     }
 }
 
+/// Empty builder for a list of nullable strings.
 fn text_list() -> ListBuilder<StringBuilder> {
     ListBuilder::new(StringBuilder::new())
 }
 
 impl Slot {
+    /// Builds the slot matching `column`, preallocating `rows` entries where the builder
+    /// supports it.
     fn new(column: &Column, rows: usize) -> Self {
         let addresses = |header| Self::Addresses(header, text_list());
         match column {
@@ -446,6 +517,8 @@ impl Slot {
         }
     }
 
+    /// Appends this slot's value for `record`; absent or unparsed data becomes null or an empty
+    /// list, never an error.
     fn append(&mut self, record: &Record<'_>) {
         let mail = record.mail;
         match self {
@@ -491,6 +564,7 @@ impl Slot {
         }
     }
 
+    /// Finishes the builder into an Arrow array and resets it for reuse.
     fn finish(&mut self) -> ArrayRef {
         match self {
             Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
@@ -513,14 +587,17 @@ impl Slot {
 
 // `fields::date` only yields years 1900..=3000 (`DateTime::is_valid`), so `unix_seconds` stays
 // below 4e10 and the product below 4e16: the saturation is unreachable.
+/// Converts Unix seconds to microseconds, saturating at the `i64` bounds.
 const fn micros(unix_seconds: i64) -> i64 {
     unix_seconds.saturating_mul(1_000_000)
 }
 
+/// Joins body parts with `\n`; no parts give an empty string.
 fn joined<'a>(bodies: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> String {
     bodies.collect::<Vec<_>>().join("\n")
 }
 
+/// Lowercase hexadecimal SHA-256 digest of `data` (64 characters).
 fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data)
         .iter()
