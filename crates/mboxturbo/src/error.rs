@@ -4,6 +4,8 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use parquet::errors::ParquetError;
+
 /// Why an index file was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -104,11 +106,12 @@ pub enum MboxturboError {
         path: PathBuf,
         /// The Parquet failure.
         #[source]
-        source: parquet::errors::ParquetError,
+        source: ParquetError,
     },
 }
 
 impl MboxturboError {
+    /// Wraps `source` as [`MboxturboError::Io`], recording the `path` being accessed.
     pub(crate) fn io(path: &Path, source: io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
@@ -116,6 +119,8 @@ impl MboxturboError {
         }
     }
 
+    /// Whether the cached index should be rebuilt: it is stale or missing (`NotFound`), not
+    /// otherwise broken.
     pub(crate) fn calls_for_rebuild(&self) -> bool {
         matches!(self, Self::StaleIndex { .. })
             || matches!(self, Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
