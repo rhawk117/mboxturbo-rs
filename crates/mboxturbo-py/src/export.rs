@@ -24,20 +24,14 @@ use crate::errors::into_py_err;
 pub(crate) struct Selection {
     /// The mapping the columns are extracted from.
     mailbox: Arc<mboxturbo::Mailbox>,
-    /// The extraction plan shared by every read.
-    pipeline: Arc<Pipeline>,
     /// The column names, in selection order.
     names: Vec<String>,
+    /// The extraction plan shared by every read.
+    pipeline: Arc<Pipeline>,
 }
 
 #[pymethods]
 impl Selection {
-    /// Names of the selected columns, in order.
-    #[getter]
-    fn columns(&self) -> Vec<String> {
-        self.names.clone()
-    }
-
     #[pyo3(signature = (requested_schema = None))]
     /// Arrow C stream capsule over the selection; ``requested_schema`` is accepted and ignored.
     fn __arrow_c_stream__<'py>(
@@ -49,6 +43,21 @@ impl Selection {
         let reader = self.pipeline.reader(&self.mailbox);
         let stream = FFI_ArrowArrayStream::new(Box::new(reader));
         PyCapsule::new_with_value(py, stream, c"arrow_array_stream")
+    }
+
+    /// ``Selection(columns=N, messages=M)``.
+    fn __repr__(&self) -> String {
+        format!(
+            "Selection(columns={}, messages={})",
+            self.names.len(),
+            self.mailbox.len()
+        )
+    }
+
+    /// Names of the selected columns, in order.
+    #[getter]
+    fn columns(&self) -> Vec<String> {
+        self.names.clone()
     }
 
     /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
@@ -63,15 +72,6 @@ impl Selection {
                 .map_err(Box::new)
         })
         .map_err(|error| into_py_err(py, *error))
-    }
-
-    /// ``Selection(columns=N, messages=M)``.
-    fn __repr__(&self) -> String {
-        format!(
-            "Selection(columns={}, messages={})",
-            self.names.len(),
-            self.mailbox.len()
-        )
     }
 }
 
@@ -94,8 +94,8 @@ pub(crate) fn select_columns(
     let pipeline = Arc::new(Pipeline::new(columns, batch_size));
     Ok(Selection {
         mailbox,
-        pipeline,
         names,
+        pipeline,
     })
 }
 

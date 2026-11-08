@@ -28,6 +28,11 @@ type Shared = Arc<mboxturbo::Mailbox>;
 struct Slot(RwLock<Option<Shared>>);
 
 impl Slot {
+    /// Drops this handle's reference; clearing twice is harmless.
+    fn clear(&self) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
     /// A new reference to the mapping, or `ValueError` once the handle is closed.
     fn get(&self) -> PyResult<Shared> {
         self.0
@@ -37,11 +42,6 @@ impl Slot {
             .map(Arc::clone)
             .ok_or_else(closed)
     }
-
-    /// Drops this handle's reference; clearing twice is harmless.
-    fn clear(&self) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = None;
-    }
 }
 
 /// A position that threads advance atomically, so each claims a distinct range of messages.
@@ -49,11 +49,6 @@ impl Slot {
 struct Cursor(AtomicUsize);
 
 impl Cursor {
-    /// A cursor at the first message.
-    const fn new() -> Self {
-        Self(AtomicUsize::new(0))
-    }
-
     /// Claims `step` positions and returns the first; the position saturates at `usize::MAX`.
     #[expect(
         clippy::disallowed_methods,
@@ -66,6 +61,11 @@ impl Cursor {
                 Some(at.saturating_add(step))
             })
             .unwrap_or_else(identity)
+    }
+
+    /// A cursor at the first message.
+    const fn new() -> Self {
+        Self(AtomicUsize::new(0))
     }
 
     /// The position the next claim starts at.
@@ -89,25 +89,15 @@ pub(crate) struct Mailbox {
 
 #[pymethods]
 impl Mailbox {
-    #[new]
-    #[pyo3(signature = (path, *, index = None))]
-    /// Opens ``path``, reusing or rewriting the cache at ``index`` when one is given.
-    fn new(py: Python<'_>, path: PathBuf, index: Option<PathBuf>) -> PyResult<Self> {
-        let opened = py.detach(move || {
-            index.as_deref().map_or_else(
-                || mboxturbo::Mailbox::open(&path).map_err(Box::new),
-                |cache| mboxturbo::Mailbox::open_cached(&path, cache).map_err(Box::new),
-            )
-        });
-        let mailbox = opened.map_err(|error| into_py_err(py, *error))?;
-        Ok(Self {
-            slot: Slot(RwLock::new(Some(Arc::new(mailbox)))),
-        })
+    /// Returns the mailbox itself so ``with`` closes it on exit.
+    const fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        slf
     }
 
-    /// The number of messages; ``ValueError`` once closed.
-    fn __len__(&self) -> PyResult<usize> {
-        Ok(self.slot.get()?.len())
+    #[pyo3(signature = (*_exc_info))]
+    /// Closes the mailbox; never suppresses the exception in flight.
+    fn __exit__(&self, _exc_info: &Bound<'_, PyTuple>) {
+        self.slot.clear();
     }
 
     /// The message at an integer position (negative counts from the end) or a list for a slice;
@@ -134,6 +124,19 @@ impl Mailbox {
         })
     }
 
+    /// The number of messages; ``ValueError`` once closed.
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.slot.get()?.len())
+    }
+
+    /// ``Mailbox(messages=N)``, or ``Mailbox(closed)`` once closed.
+    fn __repr__(&self) -> String {
+        self.slot.get().map_or_else(
+            |_| "Mailbox(closed)".to_owned(),
+            |mailbox| format!("Mailbox(messages={})", mailbox.len()),
+        )
+    }
+
     /// Yields lists of up to ``size`` messages whose bodies and attachments are already decoded,
     /// in parallel in Rust, while the next batch is read ahead. For passes that read only
     /// header fields, plain iteration is faster: it never decodes bodies.
@@ -148,12 +151,25 @@ impl Mailbox {
         })
     }
 
-    /// Selects columns for export; ``None`` selects every column that needs only headers.
-    /// Name columns from the catalogue (``subject``, ``received``, ``attachment_sha256``…) or
-    /// as ``header:<Name>`` for any header's raw values.
-    #[pyo3(signature = (columns = None, *, batch_size = 8192))]
-    fn select(&self, columns: Option<Vec<String>>, batch_size: usize) -> PyResult<Selection> {
-        select_columns(self.slot.get()?, columns, batch_size)
+    /// Releases this handle's mapping. Messages and iterators already taken keep it alive.
+    fn close(&self) {
+        self.slot.clear();
+    }
+
+    #[new]
+    #[pyo3(signature = (path, *, index = None))]
+    /// Opens ``path``, reusing or rewriting the cache at ``index`` when one is given.
+    fn new(py: Python<'_>, path: PathBuf, index: Option<PathBuf>) -> PyResult<Self> {
+        let opened = py.detach(move || {
+            index.as_deref().map_or_else(
+                || mboxturbo::Mailbox::open(&path).map_err(Box::new),
+                |cache| mboxturbo::Mailbox::open_cached(&path, cache).map_err(Box::new),
+            )
+        });
+        let mailbox = opened.map_err(|error| into_py_err(py, *error))?;
+        Ok(Self {
+            slot: Slot(RwLock::new(Some(Arc::new(mailbox)))),
+        })
     }
 
     /// Writes the message index to ``path`` atomically.
@@ -163,28 +179,12 @@ impl Mailbox {
             .map_err(|error| into_py_err(py, *error))
     }
 
-    /// Releases this handle's mapping. Messages and iterators already taken keep it alive.
-    fn close(&self) {
-        self.slot.clear();
-    }
-
-    /// Returns the mailbox itself so ``with`` closes it on exit.
-    const fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
-        slf
-    }
-
-    #[pyo3(signature = (*_exc_info))]
-    /// Closes the mailbox; never suppresses the exception in flight.
-    fn __exit__(&self, _exc_info: &Bound<'_, PyTuple>) {
-        self.slot.clear();
-    }
-
-    /// ``Mailbox(messages=N)``, or ``Mailbox(closed)`` once closed.
-    fn __repr__(&self) -> String {
-        self.slot.get().map_or_else(
-            |_| "Mailbox(closed)".to_owned(),
-            |mailbox| format!("Mailbox(messages={})", mailbox.len()),
-        )
+    /// Selects columns for export; ``None`` selects every column that needs only headers.
+    /// Name columns from the catalogue (``subject``, ``received``, ``attachment_sha256``…) or
+    /// as ``header:<Name>`` for any header's raw values.
+    #[pyo3(signature = (columns = None, *, batch_size = 8192))]
+    fn select(&self, columns: Option<Vec<String>>, batch_size: usize) -> PyResult<Selection> {
+        select_columns(self.slot.get()?, columns, batch_size)
     }
 }
 
@@ -193,10 +193,10 @@ impl Mailbox {
 #[pyclass(frozen, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct MessageIterator {
-    /// The mapping the messages are read from.
-    mailbox: Shared,
     /// The next message to hand out.
     cursor: Cursor,
+    /// The mapping the messages are read from.
+    mailbox: Shared,
 }
 
 #[pymethods]
@@ -206,16 +206,16 @@ impl MessageIterator {
         slf
     }
 
+    /// The messages not yet claimed; a hint only, since other threads may claim concurrently.
+    fn __length_hint__(&self) -> usize {
+        self.mailbox.len().saturating_sub(self.cursor.position())
+    }
+
     /// The next unclaimed message, or ``None`` (ending iteration) after the last.
     fn __next__(&self) -> Option<Message> {
         self.mailbox
             .message(self.cursor.advance(1))
             .map(Message::from)
-    }
-
-    /// The messages not yet claimed; a hint only, since other threads may claim concurrently.
-    fn __length_hint__(&self) -> usize {
-        self.mailbox.len().saturating_sub(self.cursor.position())
     }
 }
 
@@ -224,12 +224,12 @@ impl MessageIterator {
 #[pyclass(frozen, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct BatchIterator {
+    /// The first message of the next batch.
+    cursor: Cursor,
     /// The mapping the batches are parsed from.
     mailbox: Shared,
     /// Messages per batch; always positive.
     size: usize,
-    /// The first message of the next batch.
-    cursor: Cursor,
 }
 
 #[pymethods]

@@ -32,22 +32,22 @@ impl From<mboxturbo::Message> for Message {
 #[pyclass(frozen, get_all, eq, module = "mboxturbo")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Address {
-    /// The display name, when the header has one.
-    name: Option<String>,
     /// The ``local@domain`` part, when the header has one.
     email: Option<String>,
+    /// The display name, when the header has one.
+    name: Option<String>,
 }
 
 /// A decoded attachment.
 #[pyclass(frozen, get_all, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct Attachment {
-    /// The attachment's file name, when it declares one.
-    filename: Option<String>,
     /// The media type, when it declares one.
     content_type: Option<String>,
     /// The decoded content.
     data: Py<PyBytes>,
+    /// The attachment's file name, when it declares one.
+    filename: Option<String>,
 }
 
 #[pymethods]
@@ -84,28 +84,26 @@ impl Attachment {
 
 #[pymethods]
 impl Message {
-    /// Raw bytes exactly as stored, including the mbox ``From `` separator line.
-    #[getter]
-    fn raw<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, self.inner.raw())
+    /// ``Message(subject=..., size=N)`` with ``size`` the raw length in bytes.
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "Message(subject={}, size={})",
+            python_repr(py, self.inner.subject())?,
+            self.inner.raw().len()
+        ))
     }
 
-    /// Decoded ``Subject:``.
+    /// Every attachment, decoded.
     #[getter]
-    fn subject(&self) -> Option<&str> {
-        self.inner.subject()
-    }
-
-    /// Every address in ``From:``.
-    #[getter]
-    fn from_(&self) -> Vec<Address> {
-        self.inner.from().map(Address::from).collect()
-    }
-
-    /// Every address in ``To:``.
-    #[getter]
-    fn to(&self) -> Vec<Address> {
-        self.inner.to().map(Address::from).collect()
+    fn attachments(&self, py: Python<'_>) -> Vec<Attachment> {
+        self.inner
+            .attachments()
+            .map(|attachment| Attachment {
+                filename: attachment.filename.map(str::to_owned),
+                content_type: attachment.content_type(),
+                data: PyBytes::new(py, &attachment.data).unbind(),
+            })
+            .collect()
     }
 
     /// Every address in ``Cc:``.
@@ -123,35 +121,10 @@ impl Message {
             .transpose()
     }
 
-    /// ``Message-ID:`` without angle brackets.
+    /// Every address in ``From:``.
     #[getter]
-    fn message_id(&self) -> Option<&str> {
-        self.inner.message_id()
-    }
-
-    /// Plain-text bodies; an HTML-only message yields its HTML converted to text.
-    #[getter]
-    fn text(&self) -> Vec<Cow<'_, str>> {
-        self.inner.text_bodies().collect()
-    }
-
-    /// HTML bodies; a text-only message yields its text converted to HTML.
-    #[getter]
-    fn html(&self) -> Vec<Cow<'_, str>> {
-        self.inner.html_bodies().collect()
-    }
-
-    /// Every attachment, decoded.
-    #[getter]
-    fn attachments(&self, py: Python<'_>) -> Vec<Attachment> {
-        self.inner
-            .attachments()
-            .map(|attachment| Attachment {
-                filename: attachment.filename.map(str::to_owned),
-                content_type: attachment.content_type(),
-                data: PyBytes::new(py, &attachment.data).unbind(),
-            })
-            .collect()
+    fn from_(&self) -> Vec<Address> {
+        self.inner.from().map(Address::from).collect()
     }
 
     /// First value of the header called ``name`` (any case), unfolded; encoded words are
@@ -165,6 +138,42 @@ impl Message {
         self.inner.header_values(name).collect()
     }
 
+    /// HTML bodies; a text-only message yields its text converted to HTML.
+    #[getter]
+    fn html(&self) -> Vec<Cow<'_, str>> {
+        self.inner.html_bodies().collect()
+    }
+
+    /// ``Message-ID:`` without angle brackets.
+    #[getter]
+    fn message_id(&self) -> Option<&str> {
+        self.inner.message_id()
+    }
+
+    /// Raw bytes exactly as stored, including the mbox ``From `` separator line.
+    #[getter]
+    fn raw<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, self.inner.raw())
+    }
+
+    /// Decoded ``Subject:``.
+    #[getter]
+    fn subject(&self) -> Option<&str> {
+        self.inner.subject()
+    }
+
+    /// Plain-text bodies; an HTML-only message yields its HTML converted to text.
+    #[getter]
+    fn text(&self) -> Vec<Cow<'_, str>> {
+        self.inner.text_bodies().collect()
+    }
+
+    /// Every address in ``To:``.
+    #[getter]
+    fn to(&self) -> Vec<Address> {
+        self.inner.to().map(Address::from).collect()
+    }
+
     /// The same message parsed by the standard library, for code that needs ``EmailMessage``.
     fn to_email_message<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let policy = py
@@ -176,23 +185,6 @@ impl Message {
             .getattr(intern!(py, "message_from_bytes"))?
             .call((self.raw(py),), Some(&options))
     }
-
-    /// ``Message(subject=..., size=N)`` with ``size`` the raw length in bytes.
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        Ok(format!(
-            "Message(subject={}, size={})",
-            python_repr(py, self.inner.subject())?,
-            self.inner.raw().len()
-        ))
-    }
-}
-
-/// Python's ``repr`` of the text, or ``None`` for a missing value.
-fn python_repr(py: Python<'_>, value: Option<&str>) -> PyResult<String> {
-    value.map_or_else(
-        || Ok("None".to_owned()),
-        |text| Ok(PyString::new(py, text).repr()?.to_string()),
-    )
 }
 
 impl From<mboxturbo::Address<'_>> for Address {
@@ -203,6 +195,14 @@ impl From<mboxturbo::Address<'_>> for Address {
             email: address.email.map(str::to_owned),
         }
     }
+}
+
+/// Python's ``repr`` of the text, or ``None`` for a missing value.
+fn python_repr(py: Python<'_>, value: Option<&str>) -> PyResult<String> {
+    value.map_or_else(
+        || Ok("None".to_owned()),
+        |text| Ok(PyString::new(py, text).repr()?.to_string()),
+    )
 }
 
 /// The timestamp as a datetime aware of the header's own UTC offset.
