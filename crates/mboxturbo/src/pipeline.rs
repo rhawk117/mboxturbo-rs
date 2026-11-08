@@ -1,13 +1,14 @@
 //! Columnar extraction: parse only what the selected columns need, in parallel, into Arrow
 //! record batches, and stream them to a consumer or a Parquet file.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::ops::Range;
 use std::panic::resume_unwind;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::{iter, thread};
 
 use arrow_array::builder::{
@@ -71,14 +72,14 @@ pub struct Pipeline {
 }
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
-struct Record<'a> {
+struct Record<'mail> {
     /// Zero-based index of the message in the mailbox.
     position: usize,
     /// Byte range of the message in the mailbox file.
     span: Range<usize>,
     /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
     /// on it.
-    mail: Option<&'a Mail<'a>>,
+    mail: Option<&'mail Mail<'mail>>,
 }
 
 impl Pipeline {
@@ -111,14 +112,13 @@ impl Pipeline {
         mailbox: &Mailbox,
         positions: Range<usize>,
     ) -> Result<RecordBatch, MboxturboError> {
-        let end = positions.end.min(mailbox.len());
-        let positions = positions.start.min(end)..end;
+        let clamped = clamp_positions(positions, mailbox.len());
         let mut slots: Vec<Slot> = self
             .columns
             .iter()
-            .map(|column| Slot::new(column, positions.len()))
+            .map(|column| Slot::new(column, clamped.len()))
             .collect();
-        for (position, span, raw) in mailbox.rows(positions.clone()) {
+        for (position, span, raw) in mailbox.rows(clamped.clone()) {
             let parsed = self.parse(raw);
             let record = Record {
                 position,
@@ -130,8 +130,10 @@ impl Pipeline {
             }
         }
         let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
-        RecordBatch::try_new(self.schema(), arrays)
-            .map_err(|source| MboxturboError::Arrow { positions, source })
+        RecordBatch::try_new(self.schema(), arrays).map_err(|source| MboxturboError::Arrow {
+            positions: clamped,
+            source,
+        })
     }
 
     /// Streams batches over the whole mailbox, extracting several batches in parallel at a time.
@@ -205,15 +207,7 @@ impl Pipeline {
         let mut batches = self.reader(mailbox);
         let reader = iter::from_fn(move || batches.next_batch());
         let produced = thread::scope(|scope| {
-            let reader_thread = scope.spawn(move || {
-                for batch in reader {
-                    // A send fails only once the receiver is dropped, and the consumer below
-                    // drops it only after `try_fold` stopped on an `Err`, which `rows` returns.
-                    if sender.send(batch).is_err() {
-                        break;
-                    }
-                }
-            });
+            let reader_thread = scope.spawn(move || forward_batches(reader, &sender));
             let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
                 let batch = received?;
                 writer.write(&batch).map_err(parquet_error)?;
@@ -231,7 +225,7 @@ impl Pipeline {
     /// Parses `raw` just deeply enough for the selected columns, after stripping the mbox separator
     /// line. Returns `None` when no column needs parsing, or when the parser fails or panics on
     /// this message.
-    fn parse<'a>(&self, raw: &'a [u8]) -> Option<Mail<'a>> {
+    fn parse<'raw>(&self, raw: &'raw [u8]) -> Option<Mail<'raw>> {
         let message = strip_separator(raw);
         match &self.depth {
             Depth::Nothing => None,
@@ -255,6 +249,27 @@ impl Pipeline {
     }
 }
 
+/// Narrows `positions` to the messages that exist in a mailbox of `len` messages. A range that
+/// starts past the end becomes empty and sits at the end, never inverted.
+fn clamp_positions(positions: Range<usize>, len: usize) -> Range<usize> {
+    let end = positions.end.min(len);
+    positions.start.min(end)..end
+}
+
+/// Sends `batches` to `sender` in order until they run out or the receiver is gone.
+fn forward_batches(
+    batches: impl Iterator<Item = Result<RecordBatch, MboxturboError>>,
+    sender: &SyncSender<Result<RecordBatch, MboxturboError>>,
+) {
+    for batch in batches {
+        // A send fails only once the receiver is dropped, and the consumer drops it only after
+        // `try_fold` stopped on an `Err`, which `rows` returns.
+        if sender.send(batch).is_err() {
+            break;
+        }
+    }
+}
+
 /// Wraps a Parquet encoding failure with the output `path` it concerns.
 fn parquet_failure(path: &Path, source: ParquetError) -> MboxturboError {
     MboxturboError::Parquet {
@@ -273,36 +288,41 @@ fn depth_for(columns: &[Column]) -> Depth {
         return Depth::Nothing;
     }
     let ignoring_the_rest = MessageParser::new().unknown_headers(HeaderForm::Ignore);
-    Depth::Headers(
-        columns
-            .iter()
-            .fold(ignoring_the_rest, |parser, column| match column {
-                Column::From => parser.header(HeaderName::From, HeaderForm::Addresses),
-                Column::To => parser.header(HeaderName::To, HeaderForm::Addresses),
-                Column::Cc => parser.header(HeaderName::Cc, HeaderForm::Addresses),
-                Column::ReplyTo => parser.header(HeaderName::ReplyTo, HeaderForm::Addresses),
-                Column::Subject => parser.header(HeaderName::Subject, HeaderForm::Text),
-                Column::Date | Column::DateOffsetMinutes => {
-                    parser.header(HeaderName::Date, HeaderForm::Date)
-                },
-                Column::MessageId => parser.header(HeaderName::MessageId, HeaderForm::MessageIds),
-                Column::Position
-                | Column::Offset
-                | Column::Size
-                | Column::Received
-                | Column::AuthenticationResults
-                | Column::ReceivedSpf
-                | Column::DkimSignature
-                | Column::ReturnPath
-                | Column::Text
-                | Column::Html
-                | Column::AttachmentNames
-                | Column::AttachmentTypes
-                | Column::AttachmentSizes
-                | Column::AttachmentSha256
-                | Column::Header(_) => parser,
-            }),
-    )
+    Depth::Headers(columns.iter().fold(ignoring_the_rest, |parser, column| {
+        match header_form(column) {
+            Some((name, form)) => parser.header(name, form),
+            None => parser,
+        }
+    }))
+}
+
+/// The header `column` reads and how to decode it, or `None` when the column needs no header
+/// decoded: it reads the raw bytes, offsets, the body, or a header kept as raw text.
+const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm)> {
+    match column {
+        Column::From => Some((HeaderName::From, HeaderForm::Addresses)),
+        Column::To => Some((HeaderName::To, HeaderForm::Addresses)),
+        Column::Cc => Some((HeaderName::Cc, HeaderForm::Addresses)),
+        Column::ReplyTo => Some((HeaderName::ReplyTo, HeaderForm::Addresses)),
+        Column::Subject => Some((HeaderName::Subject, HeaderForm::Text)),
+        Column::Date | Column::DateOffsetMinutes => Some((HeaderName::Date, HeaderForm::Date)),
+        Column::MessageId => Some((HeaderName::MessageId, HeaderForm::MessageIds)),
+        Column::Position
+        | Column::Offset
+        | Column::Size
+        | Column::Received
+        | Column::AuthenticationResults
+        | Column::ReceivedSpf
+        | Column::DkimSignature
+        | Column::ReturnPath
+        | Column::Text
+        | Column::Html
+        | Column::AttachmentNames
+        | Column::AttachmentTypes
+        | Column::AttachmentSizes
+        | Column::AttachmentSha256
+        | Column::Header(_) => None,
+    }
 }
 
 /// Maps the public [`Compression`] choice to the Parquet writer's codec (Zstd at its default
@@ -407,6 +427,11 @@ enum AttachmentSlot {
 }
 
 impl AttachmentSlot {
+    /// Empty builder for the per-message list of attachment sizes.
+    fn sizes() -> Self {
+        Self::Sizes(ListBuilder::new(UInt64Builder::new()))
+    }
+
     /// Appends this message's attachment list; an unparsed message (`None`) appends an empty list.
     fn append(&mut self, mail: Option<&Mail<'_>>) {
         let attachments = mail.into_iter().flat_map(fields::attachments);
@@ -462,7 +487,7 @@ enum AddressHeader {
 
 impl AddressHeader {
     /// Reads this header from `mail`, or `None` when the message lacks it.
-    fn of<'a>(self, mail: &'a Mail<'a>) -> Option<AddressList<'a>> {
+    fn of<'mail>(self, mail: &'mail Mail<'mail>) -> Option<AddressList<'mail>> {
         match self {
             Self::From => mail.from(),
             Self::To => mail.to(),
@@ -482,6 +507,7 @@ impl Slot {
     /// supports it.
     fn new(column: &Column, rows: usize) -> Self {
         let addresses = |header| Self::Addresses(header, text_list());
+        let attachments = |slot| Self::Attachments(slot);
         match column {
             Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
             Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
@@ -491,30 +517,32 @@ impl Slot {
             Column::Cc => addresses(AddressHeader::Cc),
             Column::ReplyTo => addresses(AddressHeader::ReplyTo),
             Column::Subject => Self::Subject(StringBuilder::new()),
-            Column::Date => {
-                Self::Date(TimestampMicrosecondBuilder::with_capacity(rows).with_timezone("UTC"))
-            },
+            Column::Date => Self::Date(utc_timestamps(rows)),
             Column::DateOffsetMinutes => Self::DateOffset(Int32Builder::with_capacity(rows)),
             Column::MessageId => Self::MessageId(StringBuilder::new()),
-            Column::Received => Self::HeaderValues("received".to_owned(), text_list()),
-            Column::AuthenticationResults => {
-                Self::HeaderValues("authentication-results".to_owned(), text_list())
-            },
-            Column::ReceivedSpf => Self::HeaderValues("received-spf".to_owned(), text_list()),
-            Column::DkimSignature => Self::HeaderValues("dkim-signature".to_owned(), text_list()),
-            Column::ReturnPath => {
-                Self::FirstHeaderValue("return-path".to_owned(), StringBuilder::new())
-            },
+            Column::Received => Self::header_values("received"),
+            Column::AuthenticationResults => Self::header_values("authentication-results"),
+            Column::ReceivedSpf => Self::header_values("received-spf"),
+            Column::DkimSignature => Self::header_values("dkim-signature"),
+            Column::ReturnPath => Self::first_header_value("return-path"),
             Column::Text => Self::Text(StringBuilder::new()),
             Column::Html => Self::Html(StringBuilder::new()),
-            Column::AttachmentNames => Self::Attachments(AttachmentSlot::Names(text_list())),
-            Column::AttachmentTypes => Self::Attachments(AttachmentSlot::Types(text_list())),
-            Column::AttachmentSizes => Self::Attachments(AttachmentSlot::Sizes(ListBuilder::new(
-                UInt64Builder::new(),
-            ))),
-            Column::AttachmentSha256 => Self::Attachments(AttachmentSlot::Sha256(text_list())),
-            Column::Header(name) => Self::HeaderValues(name.clone(), text_list()),
+            Column::AttachmentNames => attachments(AttachmentSlot::Names(text_list())),
+            Column::AttachmentTypes => attachments(AttachmentSlot::Types(text_list())),
+            Column::AttachmentSizes => attachments(AttachmentSlot::sizes()),
+            Column::AttachmentSha256 => attachments(AttachmentSlot::Sha256(text_list())),
+            Column::Header(name) => Self::header_values(name),
         }
+    }
+
+    /// A slot collecting every value of the header `name` (lowercase) as a list per message.
+    fn header_values(name: &str) -> Self {
+        Self::HeaderValues(name.to_owned(), text_list())
+    }
+
+    /// A slot collecting only the first value of the header `name` (lowercase) per message.
+    fn first_header_value(name: &str) -> Self {
+        Self::FirstHeaderValue(name.to_owned(), StringBuilder::new())
     }
 
     /// Appends this slot's value for `record`; absent or unparsed data becomes null or an empty
@@ -525,41 +553,17 @@ impl Slot {
             Self::Position(builder) => builder.append_value(widen(record.position)),
             Self::Offset(builder) => builder.append_value(widen(record.span.start)),
             Self::Size(builder) => builder.append_value(widen(record.span.len())),
-            Self::Addresses(header, builder) => {
-                let addresses = fields::addresses(mail.and_then(|mail| header.of(mail)));
-                builder
-                    .values()
-                    .extend(addresses.map(|address| address.email));
-                builder.append(true);
-            },
+            Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
             Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
-            Self::Date(builder) => {
-                builder.append_option(
-                    mail.and_then(fields::date)
-                        .map(|date| micros(date.unix_seconds)),
-                );
-            },
-            Self::DateOffset(builder) => {
-                builder.append_option(mail.and_then(fields::date).map(|date| date.offset_minutes));
-            },
+            Self::Date(builder) => builder.append_option(date_micros(mail)),
+            Self::DateOffset(builder) => builder.append_option(date_offset_minutes(mail)),
             Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
-            Self::HeaderValues(name, builder) => {
-                builder.values().extend(
-                    mail.into_iter()
-                        .flat_map(|mail| fields::header_values(mail, name.as_str()))
-                        .map(Some),
-                );
-                builder.append(true);
+            Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
+            Self::FirstHeaderValue(name, builder) => {
+                builder.append_option(first_header_value(name, mail));
             },
-            Self::FirstHeaderValue(name, builder) => builder.append_option(
-                mail.and_then(|mail| fields::header_values(mail, name.as_str()).next()),
-            ),
-            Self::Text(builder) => {
-                builder.append_option(mail.map(|mail| joined(fields::text_bodies(mail))));
-            },
-            Self::Html(builder) => {
-                builder.append_option(mail.map(|mail| joined(fields::html_bodies(mail))));
-            },
+            Self::Text(builder) => builder.append_option(mail.map(text_body)),
+            Self::Html(builder) => builder.append_option(mail.map(html_body)),
             Self::Attachments(slot) => slot.append(mail),
         }
     }
@@ -585,6 +589,70 @@ impl Slot {
     }
 }
 
+/// Empty UTC timestamp builder with room for `rows` entries.
+fn utc_timestamps(rows: usize) -> TimestampMicrosecondBuilder {
+    TimestampMicrosecondBuilder::with_capacity(rows).with_timezone("UTC")
+}
+
+/// Appends one list holding the email addresses of `header` in `mail`; an unparsed message or an
+/// absent header appends an empty list.
+fn append_addresses(
+    builder: &mut ListBuilder<StringBuilder>,
+    header: AddressHeader,
+    mail: Option<&Mail<'_>>,
+) {
+    let addresses = fields::addresses(mail.and_then(|parsed| header.of(parsed)));
+    builder
+        .values()
+        .extend(addresses.map(|address| address.email));
+    builder.append(true);
+}
+
+/// Appends one list holding every value of the header `name` in `mail`, in order; an unparsed
+/// message or an absent header appends an empty list.
+fn append_header_values(
+    builder: &mut ListBuilder<StringBuilder>,
+    name: &str,
+    mail: Option<&Mail<'_>>,
+) {
+    let values = mail
+        .into_iter()
+        .flat_map(|parsed| fields::header_values(parsed, name))
+        .map(Some);
+    builder.values().extend(values);
+    builder.append(true);
+}
+
+/// The first value of the header `name` in `mail`, or `None` when unparsed or absent.
+fn first_header_value<'mail>(
+    name: &str,
+    mail: Option<&'mail Mail<'mail>>,
+) -> Option<Cow<'mail, str>> {
+    let parsed = mail?;
+    fields::header_values(parsed, name).next()
+}
+
+/// The Date header of `mail` as UTC microseconds, or `None` when unparsed, absent or invalid.
+fn date_micros(mail: Option<&Mail<'_>>) -> Option<i64> {
+    mail.and_then(fields::date)
+        .map(|date| micros(date.unix_seconds))
+}
+
+/// Minutes east of UTC in the Date header of `mail`, or `None` when unparsed, absent or invalid.
+fn date_offset_minutes(mail: Option<&Mail<'_>>) -> Option<i32> {
+    mail.and_then(fields::date).map(|date| date.offset_minutes)
+}
+
+/// The plain-text bodies of `mail` joined by newlines.
+fn text_body(mail: &Mail<'_>) -> String {
+    joined(fields::text_bodies(mail))
+}
+
+/// The HTML bodies of `mail` joined by newlines.
+fn html_body(mail: &Mail<'_>) -> String {
+    joined(fields::html_bodies(mail))
+}
+
 // `fields::date` only yields years 1900..=3000 (`DateTime::is_valid`), so `unix_seconds` stays
 // below 4e10 and the product below 4e16: the saturation is unreachable.
 /// Converts Unix seconds to microseconds, saturating at the `i64` bounds.
@@ -593,7 +661,7 @@ const fn micros(unix_seconds: i64) -> i64 {
 }
 
 /// Joins body parts with `\n`; no parts give an empty string.
-fn joined<'a>(bodies: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> String {
+fn joined<'mail>(bodies: impl Iterator<Item = Cow<'mail, str>>) -> String {
     bodies.collect::<Vec<_>>().join("\n")
 }
 
@@ -604,4 +672,324 @@ fn sha256_hex(data: &[u8]) -> String {
         .flat_map(|byte| [byte >> 4_u8, byte & 0x0F])
         .filter_map(|nibble| char::from_digit(u32::from(nibble), 16_u32))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::iter;
+    use std::sync::Arc;
+    use std::sync::mpsc::sync_channel;
+
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::cast::AsArray as _;
+    use arrow_array::{Array as _, Int32Array, ListArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use mail_parser::{HeaderForm, HeaderName, MessageParser};
+
+    use super::{
+        AddressHeader, AttachmentSlot, Depth, Slot, append_addresses, append_header_values,
+        clamp_positions, date_micros, date_offset_minutes, depth_for, first_header_value,
+        forward_batches, header_form, html_body, joined, text_body, utc_timestamps,
+    };
+    use crate::columns::Column;
+    use crate::error::MboxturboError;
+    use crate::fields::Mail;
+
+    const MULTIPART: &[u8] = b"From: a@example.org\r\nTo: b@example.org, c@example.org\r\n\
+Cc: d@example.org\r\nReply-To: e@example.org\r\nReceived: first\r\nReceived: second\r\n\
+Date: Thu, 01 Jan 1970 00:00:10 +0130\r\n\
+Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nplain part\r\n--b\r\nContent-Type: text/html\r\n\r\n\
+<p>html part</p>\r\n--b--\r\n";
+
+    fn parse(raw: &[u8]) -> Mail<'_> {
+        MessageParser::new()
+            .parse(raw)
+            .expect("fixture message parses")
+    }
+
+    fn list_cells(array: &ListArray, row: usize) -> Vec<String> {
+        array
+            .value(row)
+            .as_string::<i32>()
+            .iter()
+            .map(|cell| cell.expect("fixture cells are non-null").to_owned())
+            .collect()
+    }
+
+    fn address_cells(header: AddressHeader, mail: Option<&Mail<'_>>) -> Vec<String> {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        append_addresses(&mut builder, header, mail);
+        list_cells(&builder.finish(), 0)
+    }
+
+    fn batch_of(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![0; rows]))])
+            .expect("fixture batch matches its schema")
+    }
+
+    #[test]
+    fn positions_past_the_end_are_clamped_to_the_messages_that_exist() {
+        assert_eq!(clamp_positions(2..99, 5), 2..5, "end is cut to the length");
+    }
+
+    #[test]
+    fn a_range_starting_past_the_end_becomes_empty_at_the_end() {
+        assert_eq!(clamp_positions(9..12, 5), 5..5, "start must not exceed end");
+    }
+
+    #[test]
+    fn positions_inside_the_mailbox_are_unchanged() {
+        assert_eq!(clamp_positions(1..3, 5), 1..3, "in-range input is kept");
+    }
+
+    #[test]
+    fn forwarding_delivers_every_batch_in_order() {
+        let (sender, receiver) = sync_channel(8);
+        forward_batches((1..=3).map(|rows| Ok(batch_of(rows))), &sender);
+        drop(sender);
+        let sizes: Vec<_> = receiver
+            .into_iter()
+            .map(|batch| batch.expect("fixture batches are Ok").num_rows())
+            .collect();
+        assert_eq!(sizes, [1, 2, 3], "batches arrive in production order");
+    }
+
+    #[test]
+    fn forwarding_stops_pulling_once_the_receiver_is_gone() {
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        let mut pulled = 0_usize;
+        let batches = iter::repeat_with(|| {
+            pulled += 1;
+            Ok::<_, MboxturboError>(batch_of(1))
+        });
+        forward_batches(batches.take(10), &sender);
+        assert_eq!(pulled, 1, "the failed first send ends extraction");
+    }
+
+    #[test]
+    fn a_header_column_maps_to_its_header_and_decoding() {
+        assert!(
+            matches!(
+                header_form(&Column::Subject),
+                Some((HeaderName::Subject, HeaderForm::Text))
+            ),
+            "Subject is decoded as text"
+        );
+        assert!(
+            matches!(
+                header_form(&Column::DateOffsetMinutes),
+                Some((HeaderName::Date, HeaderForm::Date))
+            ),
+            "the offset column reads the Date header"
+        );
+    }
+
+    #[test]
+    fn columns_that_read_no_decoded_header_map_to_none() {
+        assert!(header_form(&Column::Position).is_none(), "position is raw");
+        assert!(
+            header_form(&Column::Received).is_none(),
+            "received stays raw"
+        );
+    }
+
+    #[test]
+    fn raw_columns_need_no_parsing() {
+        assert!(
+            matches!(depth_for(&[Column::Position, Column::Size]), Depth::Nothing),
+            "no message is parsed"
+        );
+    }
+
+    #[test]
+    fn header_columns_parse_headers_only() {
+        assert!(
+            matches!(
+                depth_for(&[Column::Position, Column::Subject]),
+                Depth::Headers(_)
+            ),
+            "a header column parses headers"
+        );
+    }
+
+    #[test]
+    fn a_body_column_forces_a_whole_message_parse() {
+        assert!(
+            matches!(depth_for(&[Column::Subject, Column::Text]), Depth::Whole(_)),
+            "a body column parses the body"
+        );
+    }
+
+    #[test]
+    fn each_address_header_reads_its_own_header() {
+        let mail = parse(MULTIPART);
+        let read = |header| address_cells(header, Some(&mail));
+        assert_eq!(read(AddressHeader::From), ["a@example.org"], "From");
+        assert_eq!(
+            read(AddressHeader::To),
+            ["b@example.org", "c@example.org"],
+            "To keeps every address"
+        );
+        assert_eq!(read(AddressHeader::Cc), ["d@example.org"], "Cc");
+        assert_eq!(read(AddressHeader::ReplyTo), ["e@example.org"], "Reply-To");
+    }
+
+    #[test]
+    fn an_unparsed_message_appends_an_empty_address_list() {
+        assert!(
+            address_cells(AddressHeader::From, None).is_empty(),
+            "no mail gives an empty list"
+        );
+    }
+
+    #[test]
+    fn repeated_headers_append_all_values_in_order() {
+        let mail = parse(MULTIPART);
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        append_header_values(&mut builder, "received", Some(&mail));
+        append_header_values(&mut builder, "x-missing", Some(&mail));
+        let array = builder.finish();
+        assert_eq!(
+            list_cells(&array, 0),
+            ["first", "second"],
+            "both values, in order"
+        );
+        assert_eq!(array.len(), 2, "each call appends exactly one list");
+        assert!(
+            list_cells(&array, 1).is_empty(),
+            "an absent header gives an empty list"
+        );
+    }
+
+    #[test]
+    fn the_first_header_value_wins_and_absence_is_none() {
+        let mail = parse(MULTIPART);
+        assert_eq!(
+            first_header_value("received", Some(&mail)).as_deref(),
+            Some("first"),
+            "first of the repeated values"
+        );
+        assert_eq!(
+            first_header_value("x-missing", Some(&mail)),
+            None,
+            "absent header"
+        );
+        assert_eq!(
+            first_header_value("received", None),
+            None,
+            "unparsed message"
+        );
+    }
+
+    #[test]
+    fn the_date_header_gives_utc_microseconds_and_a_minute_offset() {
+        let mail = parse(MULTIPART);
+        assert_eq!(
+            date_micros(Some(&mail)),
+            Some(-5_390_000_000),
+            "00:00:10 at +01:30 is 5390 seconds before the epoch"
+        );
+        assert_eq!(
+            date_offset_minutes(Some(&mail)),
+            Some(90_i32),
+            "+0130 is 90 minutes east"
+        );
+    }
+
+    #[test]
+    fn an_unparsed_message_has_no_date() {
+        assert_eq!(date_micros(None), None, "no micros without a message");
+        assert_eq!(
+            date_offset_minutes(None),
+            None,
+            "no offset without a message"
+        );
+    }
+
+    #[test]
+    fn text_and_html_bodies_are_not_swapped() {
+        let mail = parse(MULTIPART);
+        assert_eq!(text_body(&mail), "plain part", "text/plain part");
+        assert_eq!(html_body(&mail), "<p>html part</p>", "text/html part");
+    }
+
+    #[test]
+    fn body_parts_are_joined_by_newlines_and_none_gives_empty() {
+        let parts = [Cow::Borrowed("a"), Cow::Borrowed("b")];
+        assert_eq!(
+            joined(parts.into_iter()),
+            "a\nb",
+            "newline between parts only"
+        );
+        assert_eq!(joined(iter::empty()), "", "no parts give an empty string");
+    }
+
+    #[test]
+    fn date_slots_are_built_in_utc() {
+        let array = utc_timestamps(1).finish();
+        assert_eq!(
+            array.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            "timestamps carry the UTC zone"
+        );
+    }
+
+    fn header_slot_name(column: &Column) -> Option<String> {
+        if let Slot::HeaderValues(name, _) | Slot::FirstHeaderValue(name, _) = Slot::new(column, 0)
+        {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn header_columns_get_slots_named_by_their_lowercase_header() {
+        let named = |column| header_slot_name(&column);
+        assert_eq!(
+            named(Column::DkimSignature).as_deref(),
+            Some("dkim-signature"),
+            "list slot"
+        );
+        assert_eq!(
+            named(Column::ReturnPath).as_deref(),
+            Some("return-path"),
+            "single slot"
+        );
+        assert_eq!(
+            named(Column::Header("x-a".to_owned())).as_deref(),
+            Some("x-a"),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn return_path_keeps_only_the_first_value_while_received_keeps_all() {
+        assert!(
+            matches!(
+                Slot::new(&Column::ReturnPath, 0),
+                Slot::FirstHeaderValue(..)
+            ),
+            "return-path is a single-value slot"
+        );
+        assert!(
+            matches!(Slot::new(&Column::Received, 0), Slot::HeaderValues(..)),
+            "received is a list slot"
+        );
+    }
+
+    #[test]
+    fn the_attachment_sizes_column_gets_a_size_list_slot() {
+        assert!(
+            matches!(
+                Slot::new(&Column::AttachmentSizes, 0),
+                Slot::Attachments(AttachmentSlot::Sizes(_))
+            ),
+            "sizes are numeric lists"
+        );
+    }
 }
