@@ -133,7 +133,24 @@ mod hostile {
                 exercise(&message);
                 prop_assert!(message.parse() || message.subject().is_none());
             }
-            prop_assert_eq!(mailbox.parse_batch(0..mailbox.len()).len(), mailbox.len());
+            let batch = mailbox.parse_batch(0..mailbox.len());
+            prop_assert_eq!(
+                batch.messages.len(),
+                mailbox.len(),
+                "a batch over the whole mailbox keeps every message"
+            );
+            let failed: Vec<usize> = (0..mailbox.len())
+                .filter(|&position| {
+                    !mailbox.message(position)
+                        .expect("position below len() is indexed")
+                        .parse()
+                })
+                .collect();
+            prop_assert_eq!(
+                batch.unparsed,
+                failed,
+                "unparsed lists exactly the positions whose parse is false"
+            );
         }
     }
 }

@@ -211,7 +211,7 @@ impl BatchIterator {
         let end = start.saturating_add(self.size);
         let parsed = py.detach(|| {
             self.mailbox.prefetch(end..end.saturating_add(self.size));
-            self.mailbox.parse_batch(start..end)
+            self.mailbox.parse_batch(start..end).messages
         });
         Some(parsed.into_iter().map(Message::from).collect())
     }

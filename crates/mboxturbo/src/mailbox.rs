@@ -25,6 +25,18 @@ pub struct Mailbox {
     index: Index,
 }
 
+/// The result of [`Mailbox::parse_batch`]: the parsed messages and the positions that failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ParsedBatch {
+    /// Every existing message in the requested range, in position order, failed parses included.
+    pub messages: Vec<Message>,
+    /// Mailbox positions, ascending, whose full parse produced nothing. This includes a message
+    /// whose parser panicked, which is contained and reported the same way as a message with no
+    /// MIME part.
+    pub unparsed: Vec<usize>,
+}
+
 #[derive(Debug)]
 struct Mapped {
     contents: Mmap,
@@ -159,21 +171,31 @@ impl Mailbox {
     }
 
     /// The messages at `positions` (clamped to those that exist), all parsed in parallel.
+    ///
+    /// `messages` holds every message in the clamped range in position order, including those
+    /// that failed to parse; `unparsed` lists the positions among them whose full parse
+    /// produced nothing.
     #[must_use]
-    pub fn parse_batch(&self, positions: Range<usize>) -> Vec<Message> {
+    pub fn parse_batch(&self, positions: Range<usize>) -> ParsedBatch {
         let end = positions.end.min(self.len());
-        (positions.start.min(end)..end)
+        let parsed: Vec<(usize, bool, Message)> = (positions.start.min(end)..end)
             .into_par_iter()
-            .filter_map(|position| self.message(position))
-            .inspect(|message| {
-                // This only warms the parse cache. A message without a MIME part, or whose parser
-                // panicked (contained as `None` in `whole()`), stays in the batch and reports
-                // `None` from its accessors, exactly as with lazy parsing, so no failure is lost.
-                if !message.parse() {
-                    // Nothing to do: the unparsed message is kept as it is.
-                }
+            .filter_map(|position| {
+                let message = self.message(position)?;
+                Some((position, message.parse(), message))
             })
-            .collect()
+            .collect();
+        let mut batch = ParsedBatch {
+            messages: Vec::with_capacity(parsed.len()),
+            unparsed: Vec::new(),
+        };
+        for (position, complete, message) in parsed {
+            if !complete {
+                batch.unparsed.push(position);
+            }
+            batch.messages.push(message);
+        }
+        batch
     }
 
     /// Asks the kernel to start reading the messages at `positions` in the background.

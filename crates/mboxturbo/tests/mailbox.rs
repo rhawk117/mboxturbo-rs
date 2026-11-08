@@ -212,7 +212,11 @@ AAEC\n\
         let fixture = Fixture::new();
         let mailbox = Mailbox::open(&fixture.mbox).expect("open");
         let batch = mailbox.parse_batch(1..99);
-        let subjects: Vec<_> = batch.par_iter().map(|message| message.subject()).collect();
+        let subjects: Vec<_> = batch
+            .messages
+            .par_iter()
+            .map(|message| message.subject())
+            .collect();
         assert_eq!(
             subjects,
             vec![Some("report"), Some("third")],

@@ -33,6 +33,6 @@ pub use columns::Column;
 pub use error::{Corruption, Error};
 pub use fingerprint::Fingerprint;
 pub use index::Index;
-pub use mailbox::Mailbox;
+pub use mailbox::{Mailbox, ParsedBatch};
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use pipeline::{BatchReader, Compression, Pipeline};
