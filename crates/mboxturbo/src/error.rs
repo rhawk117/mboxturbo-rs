@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// Why an index file was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Corruption {
     /// The file does not start with the mboxturbo index signature.
     #[error("missing the mboxturbo index signature")]
@@ -28,7 +29,8 @@ pub enum Corruption {
 
 /// Everything that can go wrong opening a mailbox or handling its index.
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+#[non_exhaustive]
+pub enum MboxturboError {
     /// Reading, mapping or writing a file failed.
     #[error("I/O error on {}", path.display())]
     Io {
@@ -71,7 +73,7 @@ pub enum Error {
     },
 }
 
-impl Error {
+impl MboxturboError {
     pub(crate) fn io(path: &Path, source: io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),

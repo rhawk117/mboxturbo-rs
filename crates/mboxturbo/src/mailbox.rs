@@ -9,7 +9,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::error::Error;
+use crate::error::MboxturboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
 use crate::index::Index;
@@ -44,13 +44,13 @@ struct Mapped {
 }
 
 impl Mapped {
-    fn open(path: &Path) -> Result<Self, Error> {
-        let file = File::open(path).map_err(|source| Error::io(path, source))?;
+    fn open(path: &Path) -> Result<Self, MboxturboError> {
+        let file = File::open(path).map_err(|source| MboxturboError::io(path, source))?;
         let modified = file
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
-        let contents = map_read_only(&file).map_err(|source| Error::io(path, source))?;
+        let contents = map_read_only(&file).map_err(|source| MboxturboError::io(path, source))?;
         let fingerprint = Fingerprint::new(&contents, modified);
         Ok(Self {
             contents,
@@ -93,8 +93,8 @@ impl Mailbox {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the file cannot be opened or mapped.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+    /// [`MboxturboError::Io`] when the file cannot be opened or mapped.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MboxturboError> {
         Ok(Mapped::open(path.as_ref())?.into_indexed())
     }
 
@@ -103,13 +103,13 @@ impl Mailbox {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when either file cannot be read or the new index cannot be written, and
-    /// [`Error::CorruptIndex`] when `index_path` exists but fails validation; a corrupt file is
-    /// left in place for inspection rather than overwritten.
+    /// [`MboxturboError::Io`] when either file cannot be read or the new index cannot be written,
+    /// and [`MboxturboError::CorruptIndex`] when `index_path` exists but fails validation; a
+    /// corrupt file is left in place for inspection rather than overwritten.
     pub fn open_cached(
         path: impl AsRef<Path>,
         index_path: impl AsRef<Path>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, MboxturboError> {
         let index_path = index_path.as_ref();
         let mapped = Mapped::open(path.as_ref())?;
         match Index::load(index_path, mapped.fingerprint) {

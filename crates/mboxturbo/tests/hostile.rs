@@ -5,7 +5,7 @@ mod hostile {
     use std::fs;
     use std::hint::black_box;
 
-    use mboxturbo::{Mailbox, Message, Timestamp};
+    use mboxturbo::{Mailbox, Message};
     use proptest::prelude::*;
     use tempfile::TempDir;
 
@@ -81,11 +81,10 @@ mod hostile {
             b"From a\nDate: Mon, 01 Jan 2024 12:00:00 +1300 (NZDT)\nSubject: s\n\nbody\n",
         );
         assert_eq!(
-            message.date(),
-            Some(Timestamp {
-                unix_seconds: 1_704_063_600,
-                offset_minutes: 780
-            }),
+            message
+                .date()
+                .map(|stamp| (stamp.unix_seconds, stamp.offset_minutes)),
+            Some((1_704_063_600, 780)),
             "12:00 at +1300 is 23:00 UTC the day before"
         );
     }

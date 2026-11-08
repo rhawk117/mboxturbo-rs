@@ -8,7 +8,7 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::error::{Corruption, Error};
+use crate::error::{Corruption, MboxturboError};
 use crate::fingerprint::Fingerprint;
 use crate::scan;
 use crate::width::{narrow, widen};
@@ -39,11 +39,11 @@ impl From<Corruption> for Rejection {
 }
 
 impl Rejection {
-    fn at(self, path: &Path) -> Error {
+    fn at(self, path: &Path) -> MboxturboError {
         let path = path.to_path_buf();
         match self {
-            Self::Corrupt(corruption) => Error::CorruptIndex { path, corruption },
-            Self::Stale => Error::StaleIndex { path },
+            Self::Corrupt(corruption) => MboxturboError::CorruptIndex { path, corruption },
+            Self::Stale => MboxturboError::StaleIndex { path },
         }
     }
 }
@@ -109,24 +109,25 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the temporary file cannot be created, written, synced or renamed.
-    pub fn save(&self, path: &Path) -> Result<(), Error> {
+    /// [`MboxturboError::Io`] when the temporary file cannot be created, written, synced, or
+    /// renamed into place.
+    pub fn save(&self, path: &Path) -> Result<(), MboxturboError> {
         let directory = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
         let mut staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))
-            .map_err(|source| Error::io(path, source))?;
+            .map_err(|source| MboxturboError::io(path, source))?;
         staged
             .write_all(&self.encode())
-            .map_err(|source| Error::io(path, source))?;
+            .map_err(|source| MboxturboError::io(path, source))?;
         staged
             .as_file()
             .sync_all()
-            .map_err(|source| Error::io(path, source))?;
+            .map_err(|source| MboxturboError::io(path, source))?;
         staged
             .persist(path)
             .map(|_persisted| ())
-            .map_err(|failure| Error::io(path, failure.error))?;
+            .map_err(|failure| MboxturboError::io(path, failure.error))?;
         Ok(())
     }
 
@@ -134,10 +135,11 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the file cannot be read, [`Error::CorruptIndex`] when it fails
-    /// validation, and [`Error::StaleIndex`] when it belongs to a different mailbox.
-    pub fn load(path: &Path, expected: Fingerprint) -> Result<Self, Error> {
-        let bytes = fs::read(path).map_err(|source| Error::io(path, source))?;
+    /// [`MboxturboError::Io`] when the file cannot be read, [`MboxturboError::CorruptIndex`] when
+    /// it fails validation, and [`MboxturboError::StaleIndex`] when it belongs to a different
+    /// mailbox than `expected`.
+    pub fn load(path: &Path, expected: Fingerprint) -> Result<Self, MboxturboError> {
+        let bytes = fs::read(path).map_err(|source| MboxturboError::io(path, source))?;
         Self::decode(&bytes, expected).map_err(|rejection| rejection.at(path))
     }
 

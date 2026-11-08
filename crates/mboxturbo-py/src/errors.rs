@@ -23,19 +23,20 @@ create_exception!(
     "An index file was built for a different version of the mailbox."
 );
 
-pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::Error) -> PyErr {
+pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxturboError) -> PyErr {
     let message = error.to_string();
     match error {
-        mboxturbo::Error::Io { path, source } => {
+        mboxturbo::MboxturboError::Io { path, source } => {
             let raised = PyErr::from(source);
             let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
             tagged.err().unwrap_or(raised)
         },
-        mboxturbo::Error::CorruptIndex { .. } => CorruptIndexError::new_err(message),
-        mboxturbo::Error::StaleIndex { .. } => StaleIndexError::new_err(message),
-        mboxturbo::Error::Arrow { .. } | mboxturbo::Error::Parquet { .. } => {
+        mboxturbo::MboxturboError::CorruptIndex { .. } => CorruptIndexError::new_err(message),
+        mboxturbo::MboxturboError::StaleIndex { .. } => StaleIndexError::new_err(message),
+        mboxturbo::MboxturboError::Arrow { .. } | mboxturbo::MboxturboError::Parquet { .. } => {
             MboxTurboError::new_err(message)
         },
+        _ => MboxTurboError::new_err(message),
     }
 }
 

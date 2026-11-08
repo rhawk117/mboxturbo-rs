@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::columns::Column;
-use crate::error::Error;
+use crate::error::MboxturboError;
 use crate::fields::{
     self, Mail, builtin_table_with_raw_received, contain_parser_panic, strip_separator,
 };
@@ -33,6 +33,7 @@ use crate::width::widen;
 
 /// Parquet page compression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Compression {
     /// Zstandard at level 1: a good ratio at close to Snappy speed.
     #[default]
@@ -88,12 +89,12 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// [`Error::Arrow`] if the columns cannot be assembled into a batch.
+    /// [`MboxturboError::Arrow`] if the columns cannot be assembled into a batch.
     pub fn extract(
         &self,
         mailbox: &Mailbox,
         positions: Range<usize>,
-    ) -> Result<RecordBatch, Error> {
+    ) -> Result<RecordBatch, MboxturboError> {
         let end = positions.end.min(mailbox.len());
         let positions = positions.start.min(end)..end;
         let mut slots: Vec<Slot> = self
@@ -117,7 +118,8 @@ impl Pipeline {
             }
         }
         let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
-        RecordBatch::try_new(self.schema(), arrays).map_err(|source| Error::Arrow { source })
+        RecordBatch::try_new(self.schema(), arrays)
+            .map_err(|source| MboxturboError::Arrow { source })
     }
 
     /// Streams batches over the whole mailbox, extracting several batches in parallel at a time.
@@ -136,25 +138,28 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the file cannot be created or renamed into place, [`Error::Parquet`]
-    /// when encoding fails, and [`Error::Arrow`] if a batch cannot be assembled.
+    /// [`MboxturboError::Io`] when the file cannot be created or renamed into place,
+    /// [`MboxturboError::Parquet`] when encoding fails, and [`MboxturboError::Arrow`] if a
+    /// batch cannot be assembled.
     pub fn write_parquet(
         self: &Arc<Self>,
         mailbox: &Arc<Mailbox>,
         path: &Path,
         compression: Compression,
-    ) -> Result<u64, Error> {
+    ) -> Result<u64, MboxturboError> {
         let directory = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
         let staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))
-            .map_err(|source| Error::io(path, source))?;
-        let file = staged.reopen().map_err(|source| Error::io(path, source))?;
+            .map_err(|source| MboxturboError::io(path, source))?;
+        let file = staged
+            .reopen()
+            .map_err(|source| MboxturboError::io(path, source))?;
         let rows = self.encode_parquet(mailbox, file, compression, path)?;
         staged
             .persist(path)
             .map(|_persisted| ())
-            .map_err(|failure| Error::io(path, failure.error))?;
+            .map_err(|failure| MboxturboError::io(path, failure.error))?;
         Ok(rows)
     }
 
@@ -164,8 +169,8 @@ impl Pipeline {
         file: File,
         compression: Compression,
         path: &Path,
-    ) -> Result<u64, Error> {
-        let parquet_error = |source| Error::Parquet {
+    ) -> Result<u64, MboxturboError> {
+        let parquet_error = |source| MboxturboError::Parquet {
             path: path.to_path_buf(),
             source,
         };
@@ -183,9 +188,9 @@ impl Pipeline {
             let reader_thread =
                 scope.spawn(move || reader.try_for_each(|batch| sender.send(batch).map_err(drop)));
             let rows = receiver.into_iter().try_fold(0_u64, |rows, batch| {
-                let batch = batch.map_err(|source| Error::Arrow { source })?;
+                let batch = batch.map_err(|source| MboxturboError::Arrow { source })?;
                 writer.write(&batch).map_err(parquet_error)?;
-                Ok::<u64, Error>(rows.saturating_add(widen(batch.num_rows())))
+                Ok::<u64, MboxturboError>(rows.saturating_add(widen(batch.num_rows())))
             });
             match reader_thread.join() {
                 Ok(_) => rows,

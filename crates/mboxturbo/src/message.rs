@@ -51,6 +51,7 @@ mod cell {
 
 /// A mailbox address as written in a header: either part may be missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Address<'a> {
     /// Display name, such as `Jane Doe`.
     pub name: Option<&'a str>,
@@ -60,6 +61,7 @@ pub struct Address<'a> {
 
 /// A `Date:` header resolved to an instant plus the offset it was written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Timestamp {
     /// Seconds since the Unix epoch, in UTC.
     pub unix_seconds: i64,
@@ -69,6 +71,7 @@ pub struct Timestamp {
 
 /// A decoded attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Attachment<'a> {
     /// File name from `Content-Disposition` or `Content-Type`.
     pub filename: Option<&'a str>,

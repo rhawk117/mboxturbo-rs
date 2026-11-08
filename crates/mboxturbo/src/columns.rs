@@ -6,6 +6,7 @@ use arrow_schema::{DataType, Field, TimeUnit};
 
 /// One per-message column the pipeline can extract.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Column {
     /// Zero-based position of the message in the mailbox.
     Position,

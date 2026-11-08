@@ -5,7 +5,7 @@ mod mailbox {
     use std::fs;
     use std::path::PathBuf;
 
-    use mboxturbo::{Corruption, Error, Mailbox, Timestamp};
+    use mboxturbo::{Corruption, Mailbox, MboxturboError};
     use rayon::prelude::*;
     use tempfile::TempDir;
 
@@ -164,11 +164,10 @@ AAEC\n\
             .message(0)
             .expect("first");
         assert_eq!(
-            message.date(),
-            Some(Timestamp {
-                unix_seconds: 1_704_085_200,
-                offset_minutes: -300
-            }),
+            message
+                .date()
+                .map(|stamp| (stamp.unix_seconds, stamp.offset_minutes)),
+            Some((1_704_085_200, -300)),
             "midnight at -0500 is 05:00 UTC"
         );
     }
@@ -271,7 +270,7 @@ AAEC\n\
         assert!(
             matches!(
                 error,
-                Error::CorruptIndex {
+                MboxturboError::CorruptIndex {
                     corruption: Corruption::Checksum,
                     ..
                 }
@@ -291,7 +290,7 @@ AAEC\n\
         let missing = fixture.mbox.with_extension("absent");
         let error = Mailbox::open(&missing).expect_err("missing");
         assert!(
-            matches!(&error, Error::Io { path, .. } if *path == missing),
+            matches!(&error, MboxturboError::Io { path, .. } if *path == missing),
             "path kept"
         );
     }
