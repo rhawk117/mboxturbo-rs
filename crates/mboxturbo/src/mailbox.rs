@@ -151,10 +151,12 @@ impl Mailbox {
     /// exist, as `(position, span, raw)`.
     ///
     /// Yields one item for every clamped position and never skips one. This rests on one
-    /// invariant: every loaded index is validated against the mapping it describes. A freshly
-    /// built index takes `end` from `contents.len()` in `Index::build`; a cached one is accepted
-    /// by `Index::decode` only when its stored length equals the mapping's, and
-    /// `validate_starts` has checked its offsets are ascending and below that length.
+    /// invariant: every index in use has starts that ascend, each below its end. A freshly
+    /// built index takes `end` from `contents.len()` in `Index::build`, and its starts come
+    /// from the scanner, which emits them ascending and each below that length. A cached index
+    /// is accepted by `Index::decode` only when its fingerprint, which includes the length,
+    /// matches the mapping's, and `validate_starts` has checked that its starts ascend with the
+    /// last one below `end`.
     pub(crate) fn rows(
         &self,
         positions: Range<usize>,
