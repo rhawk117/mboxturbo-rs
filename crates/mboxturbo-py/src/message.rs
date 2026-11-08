@@ -1,6 +1,12 @@
 //! `Message`, `Address` and `Attachment`: Python views over a lazily parsed core message.
+#![expect(
+    clippy::too_many_arguments,
+    reason = "pyo3's generated wrapper for #[pymethods] takes the interpreter, the receiver and \
+              the raw argument arrays as parameters; no signature in this module has that many"
+)]
 
 use std::borrow::Cow;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -11,20 +17,24 @@ use pyo3::types::{PyBytes, PyDateTime, PyDelta, PyDict, PyString, PyTzInfo};
 #[pyclass(frozen, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct Message {
+    /// The core message every property reads from.
     inner: mboxturbo::Message,
 }
 
 impl From<mboxturbo::Message> for Message {
+    /// Wraps a core message without copying it.
     fn from(inner: mboxturbo::Message) -> Self {
         Self { inner }
     }
 }
 
 /// A mailbox address from a header; either part may be missing.
-#[pyclass(frozen, get_all, eq, hash, module = "mboxturbo")]
+#[pyclass(frozen, get_all, eq, module = "mboxturbo")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Address {
+    /// The display name, when the header has one.
     name: Option<String>,
+    /// The ``local@domain`` part, when the header has one.
     email: Option<String>,
 }
 
@@ -32,13 +42,24 @@ pub(crate) struct Address {
 #[pyclass(frozen, get_all, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct Attachment {
+    /// The attachment's file name, when it declares one.
     filename: Option<String>,
+    /// The media type, when it declares one.
     content_type: Option<String>,
+    /// The decoded content.
     data: Py<PyBytes>,
 }
 
 #[pymethods]
 impl Address {
+    /// Hash consistent with equality: equal addresses hash equal.
+    fn __hash__(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// ``Address(name=..., email=...)`` with each part as a Python ``repr``.
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
             "Address(name={}, email={})",
@@ -50,6 +71,7 @@ impl Address {
 
 #[pymethods]
 impl Attachment {
+    /// ``Attachment(filename=..., content_type=..., size=N)`` with ``size`` in bytes.
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
             "Attachment(filename={}, content_type={}, size={})",
@@ -155,6 +177,7 @@ impl Message {
             .call((self.raw(py),), Some(&options))
     }
 
+    /// ``Message(subject=..., size=N)`` with ``size`` the raw length in bytes.
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
             "Message(subject={}, size={})",
@@ -164,6 +187,7 @@ impl Message {
     }
 }
 
+/// Python's ``repr`` of the text, or ``None`` for a missing value.
 fn python_repr(py: Python<'_>, value: Option<&str>) -> PyResult<String> {
     value.map_or_else(
         || Ok("None".to_owned()),
@@ -172,6 +196,7 @@ fn python_repr(py: Python<'_>, value: Option<&str>) -> PyResult<String> {
 }
 
 impl From<mboxturbo::Address<'_>> for Address {
+    /// Copies the borrowed parts so the address outlives the message.
     fn from(address: mboxturbo::Address<'_>) -> Self {
         Self {
             name: address.name.map(str::to_owned),
@@ -180,11 +205,14 @@ impl From<mboxturbo::Address<'_>> for Address {
     }
 }
 
+/// The timestamp as a datetime aware of the header's own UTC offset.
 #[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
+    clippy::disallowed_methods,
     reason = "unix seconds below 2^53 convert to f64 exactly, which covers every date until \
-              the year 285 million"
+              the year 285 million; the core parser caps |offset_minutes| below 24 * 60, so \
+              * 60 fits in i32"
 )]
 fn aware_datetime(
     py: Python<'_>,
