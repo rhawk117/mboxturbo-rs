@@ -47,11 +47,31 @@ AAEC\n\
 
     struct Fixture {
         _directory: TempDir,
-        mbox: PathBuf,
         index: PathBuf,
+        mbox: PathBuf,
     }
 
     impl Fixture {
+        fn append(&self, message: &str) {
+            let mut contents = fs::read(&self.mbox).expect("fixture mbox is readable");
+            contents.extend_from_slice(message.as_bytes());
+            fs::write(&self.mbox, contents).expect("fixture mbox is rewritten with the append");
+        }
+
+        fn cached(&self) -> Mailbox {
+            Mailbox::open_cached(&self.mbox, &self.index).expect("fixture mbox opens with a cache")
+        }
+
+        fn mailbox(&self) -> Mailbox {
+            Mailbox::open(&self.mbox).expect("fixture mbox opens")
+        }
+
+        fn message(&self, position: usize) -> Message {
+            self.mailbox()
+                .message(position)
+                .expect("fixture message exists at that position")
+        }
+
         fn new() -> Self {
             let directory = tempfile::tempdir().expect("temporary directory is created");
             let mbox = directory.path().join("inbox.mbox");
@@ -62,26 +82,6 @@ AAEC\n\
                 mbox,
                 index,
             }
-        }
-
-        fn append(&self, message: &str) {
-            let mut contents = fs::read(&self.mbox).expect("fixture mbox is readable");
-            contents.extend_from_slice(message.as_bytes());
-            fs::write(&self.mbox, contents).expect("fixture mbox is rewritten with the append");
-        }
-
-        fn mailbox(&self) -> Mailbox {
-            Mailbox::open(&self.mbox).expect("fixture mbox opens")
-        }
-
-        fn cached(&self) -> Mailbox {
-            Mailbox::open_cached(&self.mbox, &self.index).expect("fixture mbox opens with a cache")
-        }
-
-        fn message(&self, position: usize) -> Message {
-            self.mailbox()
-                .message(position)
-                .expect("fixture message exists at that position")
         }
     }
 

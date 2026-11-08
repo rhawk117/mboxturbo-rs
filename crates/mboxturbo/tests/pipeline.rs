@@ -47,24 +47,24 @@ AAEC\n\
     }
 
     impl Fixture {
-        fn with(contents: &str) -> Self {
-            let directory = tempfile::tempdir().expect("temporary directory is created");
-            let path = directory.path().join("inbox.mbox");
-            fs::write(&path, contents).expect("fixture mbox is written");
-            let mailbox = Arc::new(Mailbox::open(&path).expect("fixture mbox opens"));
-            Self { directory, mailbox }
-        }
-
-        fn parquet_path(&self) -> PathBuf {
-            self.directory.path().join("out.parquet")
-        }
-
         fn batches(&self, columns: &[Column], batch_size: usize) -> Vec<RecordBatch> {
             let pipeline = Arc::new(Pipeline::new(columns.to_vec(), batch_size));
             pipeline
                 .reader(&self.mailbox)
                 .collect::<Result<_, _>>()
                 .expect("every batch is assembled")
+        }
+
+        fn parquet_path(&self) -> PathBuf {
+            self.directory.path().join("out.parquet")
+        }
+
+        fn with(contents: &str) -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory is created");
+            let path = directory.path().join("inbox.mbox");
+            fs::write(&path, contents).expect("fixture mbox is written");
+            let mailbox = Arc::new(Mailbox::open(&path).expect("fixture mbox opens"));
+            Self { directory, mailbox }
         }
 
         fn written_batches(&self) -> Vec<RecordBatch> {
