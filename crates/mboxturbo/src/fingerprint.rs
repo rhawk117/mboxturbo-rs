@@ -6,15 +6,22 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::width::widen;
 
+/// Bytes sampled from each end of the mailbox when hashing its contents.
 const SAMPLE_LEN: usize = 4096;
+
+/// Nanoseconds in one second, to widen a [`Duration`] into a single nanosecond count.
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
 /// Identity of a mailbox: its length, modification time, and a hash of its first and last
 /// 4 KiB. Two fingerprints are equal only when all three match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint {
-    pub(crate) len: u64,
-    pub(crate) modified_nanos: i128,
-    pub(crate) sample_hash: u64,
+    /// Mailbox length in bytes.
+    len: u64,
+    /// Nanoseconds from the Unix epoch to the last modification, negative before it, 0 if unknown.
+    modified_nanos: i128,
+    /// Hash of the length and the first and last [`SAMPLE_LEN`] bytes.
+    sample_hash: u64,
 }
 
 impl Fingerprint {
@@ -26,6 +33,26 @@ impl Fingerprint {
             modified_nanos: modified.map_or(0, nanos_since_epoch),
             sample_hash: sample_hash(contents),
         }
+    }
+
+    /// Rebuilds a fingerprint from the three values an index file stores for it.
+    pub(crate) const fn from_parts(len: u64, modified_nanos: i128, sample_hash: u64) -> Self {
+        Self {
+            len,
+            modified_nanos,
+            sample_hash,
+        }
+    }
+
+    /// Nanoseconds from the Unix epoch to the mailbox's modification time, negative before it
+    /// and 0 when the time was unknown.
+    pub(crate) const fn modified_nanos(&self) -> i128 {
+        self.modified_nanos
+    }
+
+    /// Hash of the mailbox length and its first and last 4 KiB.
+    pub(crate) const fn sample_hash(&self) -> u64 {
+        self.sample_hash
     }
 
     /// Length in bytes of the fingerprinted mailbox.
@@ -41,6 +68,8 @@ impl Fingerprint {
     }
 }
 
+/// Hashes the length of `contents` with its first and last [`SAMPLE_LEN`] bytes; shorter input is
+/// hashed whole.
 fn sample_hash(contents: &[u8]) -> u64 {
     let head = contents.get(..SAMPLE_LEN).unwrap_or(contents);
     let tail = contents
@@ -53,6 +82,7 @@ fn sample_hash(contents: &[u8]) -> u64 {
     hasher.digest()
 }
 
+/// Signed nanoseconds from the Unix epoch to `time`, negative for earlier times.
 fn nanos_since_epoch(time: SystemTime) -> i128 {
     time.duration_since(UNIX_EPOCH).map_or_else(
         |before| signed_nanos(before.duration()).saturating_neg(),
@@ -60,8 +90,11 @@ fn nanos_since_epoch(time: SystemTime) -> i128 {
     )
 }
 
+/// `span` in nanoseconds; the widest `Duration` is below 2^94 ns, so nothing saturates.
 fn signed_nanos(span: Duration) -> i128 {
-    i128::try_from(span.as_nanos()).unwrap_or(i128::MAX)
+    i128::from(span.as_secs())
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(i128::from(span.subsec_nanos()))
 }
 
 #[cfg(test)]

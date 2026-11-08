@@ -13,22 +13,32 @@ use crate::fingerprint::Fingerprint;
 use crate::scan;
 use crate::width::{narrow, widen};
 
+/// First eight bytes of every index file.
 const MAGIC: [u8; 8] = *b"MBOXTIDX";
+/// Format version this build writes and reads; older files count as stale, newer as corrupt.
 const VERSION: u32 = 1;
+/// Bytes before the first offset: magic, version, reserved word, fingerprint, offset count.
 const HEADER_LEN: usize = 56;
+/// Size in bytes of one stored offset, count or checksum.
 const WORD: usize = 8;
 
 /// Byte offset of every message in one mailbox, tied to that mailbox by its [`Fingerprint`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
+    /// Offset where each message starts, strictly increasing and all below `end`.
     starts: Box<[usize]>,
+    /// Mailbox length in bytes, where the last message stops.
     end: usize,
+    /// Identity of the mailbox the offsets were computed from.
     fingerprint: Fingerprint,
 }
 
+/// Why a stored index was not accepted; [`Rejection::at`] attaches the file path.
 #[derive(Debug)]
 enum Rejection {
+    /// The bytes are not a valid index.
     Corrupt(Corruption),
+    /// The index is well formed but built by an older format or for a different mailbox.
     Stale,
 }
 
@@ -39,11 +49,15 @@ impl From<Corruption> for Rejection {
 }
 
 impl Rejection {
+    /// The public error for this rejection of the index file at `path`.
     fn at(self, path: &Path) -> MboxturboError {
-        let path = path.to_path_buf();
+        let index_path = path.to_path_buf();
         match self {
-            Self::Corrupt(corruption) => MboxturboError::CorruptIndex { path, corruption },
-            Self::Stale => MboxturboError::StaleIndex { path },
+            Self::Corrupt(corruption) => MboxturboError::CorruptIndex {
+                path: index_path,
+                corruption,
+            },
+            Self::Stale => MboxturboError::StaleIndex { path: index_path },
         }
     }
 }
@@ -143,6 +157,7 @@ impl Index {
         Self::decode(&bytes, expected).map_err(|rejection| rejection.at(path))
     }
 
+    /// The on-disk form: header, little-endian offsets, then an xxh3 checksum of all before it.
     fn encode(&self) -> Vec<u8> {
         let offsets_len = self.starts.len().saturating_mul(WORD);
         let mut out =
@@ -150,9 +165,9 @@ impl Index {
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.len.to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.modified_nanos.to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.sample_hash.to_le_bytes());
+        out.extend_from_slice(&self.fingerprint.len().to_le_bytes());
+        out.extend_from_slice(&self.fingerprint.modified_nanos().to_le_bytes());
+        out.extend_from_slice(&self.fingerprint.sample_hash().to_le_bytes());
         out.extend_from_slice(&widen(self.starts.len()).to_le_bytes());
         out.extend(
             self.starts
@@ -164,43 +179,27 @@ impl Index {
         out
     }
 
+    /// Parses and validates `bytes`, accepting it only for the mailbox `expected` identifies.
+    ///
+    /// Every length and offset comes from the file, so each is checked before use; nothing here
+    /// panics on malformed input.
     fn decode(bytes: &[u8], expected: Fingerprint) -> Result<Self, Rejection> {
         let (body, checksum) = bytes
             .split_last_chunk::<WORD>()
             .ok_or_else(|| truncated(WORD, bytes.len()))?;
-        let (magic, rest) = body.split_first_chunk::<8>().ok_or(Corruption::Signature)?;
-        if *magic != MAGIC {
-            return Err(Corruption::Signature.into());
-        }
-        let (version, rest) = take_u32(rest)?;
-        if version < VERSION {
-            return Err(Rejection::Stale);
-        }
-        if version != VERSION {
-            return Err(Corruption::Version(version).into());
-        }
+        let after_version = check_signature_and_version(body)?;
         if xxh3_64(body) != u64::from_le_bytes(*checksum) {
             return Err(Corruption::Checksum.into());
         }
-        let (_reserved, rest) = take_u32(rest)?;
-        let (len, rest) = take_u64(rest)?;
-        let (modified, rest) = rest
-            .split_first_chunk::<16>()
-            .ok_or_else(|| truncated(16, rest.len()))?;
-        let (sample_hash, rest) = take_u64(rest)?;
-        let stored = Fingerprint {
-            len,
-            modified_nanos: i128::from_le_bytes(*modified),
-            sample_hash,
-        };
+        let (stored, after_fingerprint) = take_fingerprint(after_version)?;
         if stored != expected {
             return Err(Rejection::Stale);
         }
-        let (count, rest) = take_u64(rest)?;
-        let starts = decode_starts(rest, count)?;
-        let end = narrow(len).ok_or(Corruption::Bounds {
+        let (count, offsets) = take_u64(after_fingerprint)?;
+        let starts = decode_starts(offsets, count)?;
+        let end = narrow(stored.len()).ok_or(Corruption::Bounds {
             position: None,
-            offset: len,
+            offset: stored.len(),
         })?;
         validate_starts(&starts, end)?;
         Ok(Self {
@@ -211,6 +210,39 @@ impl Index {
     }
 }
 
+/// Bytes read from the front of a slice, and the slice that remains after them.
+type Taken<'bytes, T> = Result<(T, &'bytes [u8]), Corruption>;
+
+/// Checks the magic and version at the start of `body` and returns what follows them.
+///
+/// An older version is [`Rejection::Stale`] so caches rebuild; a newer one is corrupt.
+fn check_signature_and_version(body: &[u8]) -> Result<&[u8], Rejection> {
+    let (magic, after_magic) = body.split_first_chunk::<8>().ok_or(Corruption::Signature)?;
+    if *magic != MAGIC {
+        return Err(Corruption::Signature.into());
+    }
+    let (version, after_version) = take_u32(after_magic)?;
+    if version < VERSION {
+        return Err(Rejection::Stale);
+    }
+    if version != VERSION {
+        return Err(Corruption::Version(version).into());
+    }
+    Ok(after_version)
+}
+
+/// Reads the reserved word and the stored [`Fingerprint`] fields from the front of `bytes`.
+fn take_fingerprint(bytes: &[u8]) -> Taken<'_, Fingerprint> {
+    let (_reserved, after_reserved) = take_u32(bytes)?;
+    let (len, after_len) = take_u64(after_reserved)?;
+    let (modified, after_modified) = after_len
+        .split_first_chunk::<16>()
+        .ok_or_else(|| truncated(16, after_len.len()))?;
+    let (sample_hash, after_hash) = take_u64(after_modified)?;
+    let fingerprint = Fingerprint::from_parts(len, i128::from_le_bytes(*modified), sample_hash);
+    Ok((fingerprint, after_hash))
+}
+
 /// A [`Corruption::Length`] for a read of `declared` bytes with only `actual` left.
 fn truncated(declared: usize, actual: usize) -> Corruption {
     Corruption::Length {
@@ -219,20 +251,24 @@ fn truncated(declared: usize, actual: usize) -> Corruption {
     }
 }
 
-fn take_u32(bytes: &[u8]) -> Result<(u32, &[u8]), Corruption> {
+/// Reads a little-endian `u32` from the front of `bytes`, or reports how many bytes were left.
+fn take_u32(bytes: &[u8]) -> Taken<'_, u32> {
     let (word, rest) = bytes
         .split_first_chunk::<4>()
         .ok_or_else(|| truncated(4, bytes.len()))?;
     Ok((u32::from_le_bytes(*word), rest))
 }
 
-fn take_u64(bytes: &[u8]) -> Result<(u64, &[u8]), Corruption> {
+/// Reads a little-endian `u64` from the front of `bytes`, or reports how many bytes were left.
+fn take_u64(bytes: &[u8]) -> Taken<'_, u64> {
     let (word, rest) = bytes
         .split_first_chunk::<WORD>()
         .ok_or_else(|| truncated(WORD, bytes.len()))?;
     Ok((u64::from_le_bytes(*word), rest))
 }
 
+/// Reads the offset table, which must hold exactly `count` words, rejecting any that exceed
+/// `usize`.
 fn decode_starts(bytes: &[u8], count: u64) -> Result<Box<[usize]>, Corruption> {
     let (words, remainder) = bytes.as_chunks::<WORD>();
     if !remainder.is_empty() || widen(words.len()) != count {
@@ -254,6 +290,7 @@ fn decode_starts(bytes: &[u8], count: u64) -> Result<Box<[usize]>, Corruption> {
         .collect()
 }
 
+/// Requires `starts` to be strictly increasing and every offset to lie below `end`.
 fn validate_starts(starts: &[usize], end: usize) -> Result<(), Corruption> {
     let disordered = starts
         .windows(2)
@@ -299,7 +336,8 @@ mod tests {
     #[test]
     fn round_trips_through_its_encoding() {
         let index = built();
-        let decoded = Index::decode(&index.encode(), index.fingerprint()).expect("valid encoding");
+        let decoded = Index::decode(&index.encode(), index.fingerprint())
+            .expect("an index decodes its own encoding");
         assert_eq!(decoded, index, "decode(encode(x)) == x");
     }
 
@@ -449,16 +487,22 @@ mod tests {
         #[test]
         fn rejects_any_single_flipped_bit(byte in 0_usize..96, bit in 0_u8..8) {
             let mut bytes = built().encode();
-            let position = byte.strict_rem(bytes.len());
+            let position = byte.checked_rem(bytes.len()).expect("the encoding is never empty");
             bytes[position] ^= 1 << bit;
-            prop_assert!(Index::decode(&bytes, built().fingerprint()).is_err());
+            prop_assert!(
+                Index::decode(&bytes, built().fingerprint()).is_err(),
+                "a flipped bit breaks the checksum or a header field"
+            );
         }
 
         #[test]
         fn rejects_any_truncation(cut in 0_usize..96) {
             let bytes = built().encode();
-            let kept = cut.strict_rem(bytes.len());
-            prop_assert!(Index::decode(&bytes[..kept], built().fingerprint()).is_err());
+            let kept = cut.checked_rem(bytes.len()).expect("the encoding is never empty");
+            prop_assert!(
+                Index::decode(&bytes[..kept], built().fingerprint()).is_err(),
+                "a truncated file never decodes"
+            );
         }
     }
 }
