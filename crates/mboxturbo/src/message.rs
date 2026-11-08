@@ -141,7 +141,8 @@ impl Message {
     }
 
     /// Parses the whole message now, bodies and attachments included, rather than on first
-    /// access; returns whether any MIME part was found.
+    /// access; returns whether any MIME part was found. `false` also covers a parser panic that
+    /// was contained.
     pub fn parse(&self) -> bool {
         self.whole().is_some()
     }
@@ -213,14 +214,18 @@ impl Message {
         self.whole().into_iter().flat_map(fields::attachments)
     }
 
-    /// The parsed message to read header fields from: the full parse when it already exists,
-    /// else the header-only parse, made on first use. `None` when nothing parsed.
+    /// The parsed message to read header fields from: the full parse when it already produced a
+    /// message, else the header-only parse, made on first use. `None` when neither parsed.
     fn head(&self) -> Option<&mail_parser::Message<'_>> {
-        let parsed = self
-            .whole
+        self.whole
             .get()
-            .unwrap_or_else(|| self.head.get_or_init(|| self.parse_head()));
-        parsed.borrow_dependent().as_ref()
+            .and_then(|parsed| parsed.borrow_dependent().as_ref())
+            .or_else(|| {
+                self.head
+                    .get_or_init(|| self.parse_head())
+                    .borrow_dependent()
+                    .as_ref()
+            })
     }
 
     /// Parses the header block alone.
@@ -317,6 +322,19 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
                 .header_values("from")
                 .eq(parsed_fully.header_values("from")),
             "raw header values"
+        );
+    }
+
+    #[test]
+    fn header_fields_read_the_same_before_and_after_a_full_parse() {
+        let (_directory, mailbox) = mailbox();
+        let message = mailbox.message(0).expect("fixture has one message");
+        let before = message.subject().map(str::to_owned);
+        assert!(message.parse(), "the fixture has MIME parts");
+        assert_eq!(
+            message.subject(),
+            before.as_deref(),
+            "a full parse does not change what the header accessors return"
         );
     }
 

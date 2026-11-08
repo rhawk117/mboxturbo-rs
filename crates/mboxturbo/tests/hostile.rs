@@ -132,7 +132,13 @@ mod hostile {
             for position in 0..mailbox.len() {
                 let message = mailbox.message(position).expect("indexed message");
                 exercise(&message);
-                prop_assert!(message.parse() || message.subject().is_none());
+                let before = message.subject().map(str::to_owned);
+                let _parsed = message.parse();
+                prop_assert_eq!(
+                    message.subject(),
+                    before.as_deref(),
+                    "a full parse, failed or not, does not change the subject"
+                );
             }
             let batch = mailbox.parse_batch(0..mailbox.len());
             prop_assert_eq!(

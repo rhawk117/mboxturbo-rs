@@ -29,7 +29,7 @@ with Mailbox('inbox.mbox', index='inbox.mbxidx') as mailbox:
 - Iterators are safe to share between threads; each `next` claims a distinct message or batch.
 - `get` and `get_all` return raw, unfolded values; encoded words stay as written. `subject` and the address fields are decoded.
 - `to_email_message()` hands the same bytes to `email.message_from_bytes` for code that needs `EmailMessage`.
-- A message the parser cannot handle, including input that makes the parser panic, reads as empty fields instead of raising; the rest of the mailbox is unaffected. `Received` headers are kept raw, and numeric `Date` zones past twelve hours (`+1300`, `+1400`) are read from the header itself rather than from the parsed zone.
+- A message the parser cannot handle, including input that makes the parser panic, never raises: bodies and attachments read as empty, and header fields keep whatever the header-only parse recovers; the rest of the mailbox is unaffected. `Received` headers are kept raw, and numeric `Date` zones past twelve hours (`+1300`, `+1400`) are read from the header itself rather than from the parsed zone.
 - Parallel work uses a thread pool that does not survive `os.fork()`; use the `forkserver` (the 3.14 default) or `spawn` start method.
 
 ## Pipeline: Arrow and Parquet
