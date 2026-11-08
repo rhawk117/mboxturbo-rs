@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod mailbox {
     use std::fs;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
 
     use mboxturbo::{Corruption, Mailbox, MboxturboError, Message};
@@ -274,11 +275,15 @@ AAEC\n\
     #[test]
     fn an_html_part_is_listed_as_an_html_body() {
         let message = Fixture::new().message(1);
+        let html: Vec<_> = message.html_bodies().collect();
+        assert_eq!(
+            html.len(),
+            1,
+            "the multipart message has one text/html part"
+        );
         assert!(
-            message
-                .html_bodies()
-                .any(|html| html.contains("<p>hello</p>")),
-            "the text/html part is an html body"
+            html[0].contains("<p>hello</p>"),
+            "the html body holds the part's markup"
         );
     }
 
@@ -330,14 +335,18 @@ AAEC\n\
     fn a_valid_cache_is_reused_without_being_rewritten() {
         let fixture = Fixture::new();
         let first = fixture.cached();
-        let written = fs::read(&fixture.index).expect("cache file is written");
+        let inode = fs::metadata(&fixture.index)
+            .expect("cache file is written")
+            .ino();
         let second = fixture.cached();
         assert_eq!(first.len(), 3, "the cache build indexes every message");
         assert_eq!(first.index(), second.index(), "same index");
         assert_eq!(
-            fs::read(&fixture.index).expect("cache file is still readable"),
-            written,
-            "cache not rewritten"
+            fs::metadata(&fixture.index)
+                .expect("cache file is still present")
+                .ino(),
+            inode,
+            "a save renames a new temp file over the cache, so an unchanged inode means no rewrite"
         );
     }
 
@@ -346,9 +355,15 @@ AAEC\n\
         let fixture = Fixture::new();
         let built = fixture.cached();
         assert_eq!(built.len(), 3, "initial cache indexes the fixture messages");
+        let before = fs::read(&fixture.index).expect("cache file is written");
         fixture.append(BARE);
         let mailbox = fixture.cached();
         assert_eq!(mailbox.len(), 4, "new message indexed");
+        assert_ne!(
+            fs::read(&fixture.index).expect("cache file is still readable"),
+            before,
+            "the stale cache file was rewritten"
+        );
         let reloaded = fixture.cached();
         assert_eq!(reloaded.index(), mailbox.index(), "rewritten cache matches");
     }
