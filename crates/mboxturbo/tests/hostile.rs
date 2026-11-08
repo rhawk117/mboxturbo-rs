@@ -66,15 +66,20 @@ mod hostile {
     }
 
     #[test]
-    fn a_nested_message_without_headers_has_readable_attachment_bytes() {
+    fn a_nested_message_without_headers_is_one_attachment_holding_its_body() {
         let (_directory, message) =
             only_message(b"From a\nContent-Type: message/rfc822\n\nno headers here\n");
         exercise(&message);
-        assert!(
-            message
-                .attachments()
-                .all(|attachment| attachment.data.len() <= message.raw().len()),
-            "attachment bytes come from inside the message"
+        let attachments: Vec<Vec<u8>> = message
+            .attachments()
+            .map(|attachment| attachment.data.to_vec())
+            .collect();
+        assert_eq!(
+            attachments,
+            [b"no headers here
+"
+            .to_vec()],
+            "the header-less nested message is one attachment holding its body bytes"
         );
     }
 
@@ -140,7 +145,8 @@ mod hostile {
                 prop_assert_eq!(
                     message.subject(),
                     before.as_deref(),
-                    "a full parse (parse() returned {}) leaves the subject unchanged",
+                    "a full parse leaves the subject unchanged (parse() is true if a MIME part was \
+                     found, false if none was found or a parser panic was contained: {})",
                     parsed
                 );
             }
