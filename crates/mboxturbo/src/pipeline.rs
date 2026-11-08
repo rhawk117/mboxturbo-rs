@@ -18,6 +18,7 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
+use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use rayon::prelude::*;
 use sha2::{Digest as _, Sha256};
@@ -152,7 +153,15 @@ impl Pipeline {
         let file = staged
             .reopen()
             .map_err(|source| MboxturboError::io(path, source))?;
-        let rows = self.encode_parquet(mailbox, file, compression, path)?;
+        let properties = WriterProperties::builder()
+            .set_compression(parquet_compression(compression))
+            .set_max_row_group_row_count(Some(self.batch_size.saturating_mul(16)))
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let writer = ArrowWriter::try_new(file, self.schema(), Some(properties))
+            .map_err(|source| parquet_failure(path, source))?;
+        let rows = self.encode_parquet(mailbox, writer, path)?;
         staged
             .persist(path)
             .map(|_persisted| ())
@@ -163,22 +172,10 @@ impl Pipeline {
     fn encode_parquet(
         self: &Arc<Self>,
         mailbox: &Arc<Mailbox>,
-        file: File,
-        compression: Compression,
+        mut writer: ArrowWriter<File>,
         path: &Path,
     ) -> Result<u64, MboxturboError> {
-        let parquet_error = |source| MboxturboError::Parquet {
-            path: path.to_path_buf(),
-            source,
-        };
-        let properties = WriterProperties::builder()
-            .set_compression(parquet_compression(compression))
-            .set_max_row_group_row_count(Some(self.batch_size.saturating_mul(16)))
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::Chunk)
-            .build();
-        let mut writer =
-            ArrowWriter::try_new(file, self.schema(), Some(properties)).map_err(parquet_error)?;
+        let parquet_error = |source| parquet_failure(path, source);
         let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
         let mut batches = self.reader(mailbox);
         let reader = iter::from_fn(move || batches.next_batch());
@@ -224,6 +221,13 @@ impl Pipeline {
             .step_by(self.batch_size)
             .map(|start| start..start.saturating_add(self.batch_size).min(end))
             .collect()
+    }
+}
+
+fn parquet_failure(path: &Path, source: ParquetError) -> MboxturboError {
+    MboxturboError::Parquet {
+        path: path.to_path_buf(),
+        source,
     }
 }
 
@@ -507,6 +511,8 @@ impl Slot {
     }
 }
 
+// `fields::date` only yields years 1900..=3000 (`DateTime::is_valid`), so `unix_seconds` stays
+// below 4e10 and the product below 4e16: the saturation is unreachable.
 const fn micros(unix_seconds: i64) -> i64 {
     unix_seconds.saturating_mul(1_000_000)
 }
@@ -518,7 +524,7 @@ fn joined<'a>(bodies: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> String
 fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data)
         .iter()
-        .flat_map(|byte| [byte >> 4, byte & 0x0F])
-        .filter_map(|nibble| char::from_digit(u32::from(nibble), 16))
+        .flat_map(|byte| [byte >> 4_u8, byte & 0x0F])
+        .filter_map(|nibble| char::from_digit(u32::from(nibble), 16_u32))
         .collect()
 }
