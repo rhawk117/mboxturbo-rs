@@ -2,7 +2,9 @@
 #![expect(
     clippy::too_many_arguments,
     reason = "pyo3's generated wrapper for #[pymethods] takes the interpreter, the receiver and \
-              the raw argument arrays as parameters; no signature in this module has that many"
+              the raw argument arrays as parameters; the lint fires at the macro call site, so an \
+              expectation on the impl block is unfulfilled and it must stay at module scope; no \
+              signature in this module has that many"
 )]
 
 use std::convert::identity;
@@ -94,8 +96,8 @@ impl Mailbox {
         slf
     }
 
-    #[pyo3(signature = (*_exc_info))]
     /// Closes the mailbox; never suppresses the exception in flight.
+    #[pyo3(signature = (*_exc_info))]
     fn __exit__(&self, _exc_info: &Bound<'_, PyTuple>) {
         self.slot.clear();
     }
@@ -156,9 +158,9 @@ impl Mailbox {
         self.slot.clear();
     }
 
+    /// Opens ``path``, reusing or rewriting the cache at ``index`` when one is given.
     #[new]
     #[pyo3(signature = (path, *, index = None))]
-    /// Opens ``path``, reusing or rewriting the cache at ``index`` when one is given.
     fn new(py: Python<'_>, path: PathBuf, index: Option<PathBuf>) -> PyResult<Self> {
         let opened = py.detach(move || {
             index.as_deref().map_or_else(

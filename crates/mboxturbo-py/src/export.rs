@@ -2,7 +2,9 @@
 #![expect(
     clippy::too_many_arguments,
     reason = "pyo3's generated wrapper for #[pymethods] takes the interpreter, the receiver and \
-              the raw argument arrays as parameters; no signature in this module has that many"
+              the raw argument arrays as parameters; the lint fires at the macro call site, so an \
+              expectation on the impl block is unfulfilled and it must stay at module scope; no \
+              signature in this module has that many"
 )]
 
 use std::path::PathBuf;
@@ -32,8 +34,8 @@ pub(crate) struct Selection {
 
 #[pymethods]
 impl Selection {
-    #[pyo3(signature = (requested_schema = None))]
     /// Arrow C stream capsule over the selection; ``requested_schema`` is accepted and ignored.
+    #[pyo3(signature = (requested_schema = None))]
     fn __arrow_c_stream__<'py>(
         &self,
         py: Python<'py>,
