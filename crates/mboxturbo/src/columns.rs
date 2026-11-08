@@ -56,8 +56,10 @@ pub enum Column {
     Header(String),
 }
 
+/// Prefix that selects an arbitrary header column; the rest of the name is the header name.
 const HEADER_PREFIX: &str = "header:";
 
+/// Public name and variant of every named column; the order is what [`Column::names`] yields.
 const NAMED: [(&str, Column); 22] = [
     ("position", Column::Position),
     ("offset", Column::Offset),
@@ -137,14 +139,18 @@ impl Column {
         )
     }
 
+    /// Whether extracting this column requires parsing the message at all; position, offset and
+    /// size come from the index alone.
     pub(crate) const fn needs_parsing(&self) -> bool {
         !matches!(self, Self::Position | Self::Offset | Self::Size)
     }
 
+    /// The Arrow field for this column: named by [`Column::name`], always nullable.
     pub(crate) fn field(&self) -> Field {
         Field::new(self.name(), self.data_type(), true)
     }
 
+    /// The Arrow type of the values this column extracts; list-typed for multi-valued headers.
     fn data_type(&self) -> DataType {
         let text_list = DataType::new_list(DataType::Utf8, true);
         match self {
@@ -178,15 +184,24 @@ mod tests {
     #[test]
     fn every_name_round_trips() {
         for name in Column::names().chain(["header:X-Mailer"]) {
-            let column = Column::from_name(name).expect("known name");
+            let column = Column::from_name(name)
+                .expect("every catalogued name and a header name parse back to a column");
             assert_eq!(column.name(), name, "name of {column:?}");
         }
     }
 
     #[test]
     fn unknown_and_empty_header_names_are_rejected() {
-        assert_eq!(Column::from_name("subjekt"), None, "typo");
-        assert_eq!(Column::from_name("header:"), None, "header without a name");
+        assert_eq!(
+            Column::from_name("subjekt"),
+            None,
+            "a misspelled column name is rejected, not dropped"
+        );
+        assert_eq!(
+            Column::from_name("header:"),
+            None,
+            "a header: prefix with no header name is rejected"
+        );
     }
 
     #[test]
