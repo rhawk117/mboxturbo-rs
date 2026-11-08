@@ -295,8 +295,8 @@ impl RecordBatchReader for BatchReader {
     }
 }
 
-#[derive(Debug)]
 /// Typed column builder for one selected column; each message appends exactly one entry per slot.
+#[derive(Debug)]
 enum Slot {
     /// Email addresses of one address header; an absent header gives an empty list.
     Addresses(AddressHeader, ListBuilder<StringBuilder>),
@@ -306,9 +306,9 @@ enum Slot {
     Date(TimestampMicrosecondBuilder),
     /// Minutes east of UTC from the Date header, null when absent or invalid.
     DateOffset(Int32Builder),
-    /// First value of the named header (lowercase name), null when absent.
+    /// First value of the named header (matched in any case), null when absent.
     FirstHeaderValue(String, StringBuilder),
-    /// Every value of the named header (lowercase name); empty list when absent.
+    /// Every value of the named header (matched in any case); empty list when absent.
     HeaderValues(String, ListBuilder<StringBuilder>),
     /// HTML bodies joined by newlines, null when the message is unparsed.
     Html(StringBuilder),
@@ -326,9 +326,9 @@ enum Slot {
     Text(StringBuilder),
 }
 
-#[derive(Debug)]
 /// Builder for one per-attachment list column; each message contributes one list, which is
 /// empty when it has no attachments.
+#[derive(Debug)]
 enum AttachmentSlot {
     /// Attachment file names; a nameless attachment is null.
     Names(ListBuilder<StringBuilder>),
@@ -386,8 +386,8 @@ impl AttachmentSlot {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
 /// Which address header an address column reads.
+#[derive(Debug, Clone, Copy)]
 enum AddressHeader {
     /// The Cc header.
     Cc,
@@ -455,12 +455,12 @@ impl Slot {
         }
     }
 
-    /// A slot collecting only the first value of the header `name` (lowercase) per message.
+    /// A slot keeping only the first value of the header `name` (matched in any case).
     fn first_header_value(name: &str) -> Self {
         Self::FirstHeaderValue(name.to_owned(), StringBuilder::new())
     }
 
-    /// A slot collecting every value of the header `name` (lowercase) as a list per message.
+    /// A slot keeping every value of the header `name` (matched in any case) as a list.
     fn header_values(name: &str) -> Self {
         Self::HeaderValues(name.to_owned(), text_list())
     }
@@ -677,6 +677,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::io::Write as _;
     use std::iter;
     use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
@@ -686,15 +687,18 @@ mod tests {
     use arrow_array::{Array as _, Int32Array, ListArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use mail_parser::{HeaderForm, HeaderName, MessageParser};
+    use tempfile::NamedTempFile;
 
     use super::{
-        AddressHeader, AttachmentSlot, Depth, Slot, append_addresses, append_header_values,
-        clamp_positions, date_micros, date_offset_minutes, depth_for, first_header_value,
-        forward_batches, header_form, html_body, joined, text_body, utc_timestamps,
+        AddressHeader, AttachmentSlot, Depth, Pipeline, Slot, append_addresses,
+        append_header_values, clamp_positions, date_micros, date_offset_minutes, depth_for,
+        first_header_value, forward_batches, header_form, html_body, joined, text_body,
+        utc_timestamps,
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
     use crate::fields::Mail;
+    use crate::mailbox::Mailbox;
 
     const MULTIPART: &[u8] = b"From: a@example.org\r\nTo: b@example.org, c@example.org\r\n\
 Cc: d@example.org\r\nReply-To: e@example.org\r\nReceived: first\r\nReceived: second\r\n\
@@ -771,21 +775,32 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
     }
 
     #[test]
-    fn a_header_column_maps_to_its_header_and_decoding() {
-        assert!(
-            matches!(
-                header_form(&Column::Subject),
-                Some((HeaderName::Subject, HeaderForm::Text))
+    fn every_decoded_header_column_maps_to_its_header_and_decoding() {
+        let table = [
+            (Column::From, HeaderName::From, HeaderForm::Addresses),
+            (Column::To, HeaderName::To, HeaderForm::Addresses),
+            (Column::Cc, HeaderName::Cc, HeaderForm::Addresses),
+            (Column::ReplyTo, HeaderName::ReplyTo, HeaderForm::Addresses),
+            (Column::Subject, HeaderName::Subject, HeaderForm::Text),
+            (Column::Date, HeaderName::Date, HeaderForm::Date),
+            (
+                Column::DateOffsetMinutes,
+                HeaderName::Date,
+                HeaderForm::Date,
             ),
-            "Subject is decoded as text"
-        );
-        assert!(
-            matches!(
-                header_form(&Column::DateOffsetMinutes),
-                Some((HeaderName::Date, HeaderForm::Date))
+            (
+                Column::MessageId,
+                HeaderName::MessageId,
+                HeaderForm::MessageIds,
             ),
-            "the offset column reads the Date header"
-        );
+        ];
+        for (column, name, form) in table {
+            assert_eq!(
+                header_form(&column),
+                Some((name, form)),
+                "{column:?} must read its own header with its own decoding"
+            );
+        }
     }
 
     #[test]
@@ -828,14 +843,26 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
     fn each_address_header_reads_its_own_header() {
         let mail = parse(MULTIPART);
         let read = |header| address_cells(header, Some(&mail));
-        assert_eq!(read(AddressHeader::From), ["a@example.org"], "From");
+        assert_eq!(
+            read(AddressHeader::From),
+            ["a@example.org"],
+            "From reads only the From header's address"
+        );
         assert_eq!(
             read(AddressHeader::To),
             ["b@example.org", "c@example.org"],
             "To keeps every address"
         );
-        assert_eq!(read(AddressHeader::Cc), ["d@example.org"], "Cc");
-        assert_eq!(read(AddressHeader::ReplyTo), ["e@example.org"], "Reply-To");
+        assert_eq!(
+            read(AddressHeader::Cc),
+            ["d@example.org"],
+            "Cc reads the Cc header, not Reply-To"
+        );
+        assert_eq!(
+            read(AddressHeader::ReplyTo),
+            ["e@example.org"],
+            "Reply-To reads the Reply-To header, not Cc"
+        );
     }
 
     #[test]
@@ -876,7 +903,7 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert_eq!(
             first_header_value("x-missing", Some(&mail)),
             None,
-            "absent header"
+            "an absent header has no first value"
         );
         assert_eq!(
             first_header_value("received", None),
@@ -953,17 +980,17 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert_eq!(
             named(Column::DkimSignature).as_deref(),
             Some("dkim-signature"),
-            "list slot"
+            "DKIM-Signature becomes a lowercase list slot"
         );
         assert_eq!(
             named(Column::ReturnPath).as_deref(),
             Some("return-path"),
-            "single slot"
+            "Return-Path becomes a lowercase single-value slot"
         );
         assert_eq!(
             named(Column::Header("x-a".to_owned())).as_deref(),
             Some("x-a"),
-            "custom"
+            "a custom header keeps the name the caller gave"
         );
     }
 
@@ -990,6 +1017,23 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
                 Slot::Attachments(AttachmentSlot::Sizes(_))
             ),
             "sizes are numeric lists"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_cannot_be_assembled_reports_the_clamped_positions() {
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        file.write_all(b"From a@x Mon Jan  1 00:00:00 2024\nSubject: one\n\nfirst\n")
+            .expect("fixture mbox is written");
+        let mailbox = Mailbox::open(file.path()).expect("fixture mbox opens");
+        let mut pipeline = Pipeline::new(vec![Column::Position], 1);
+        pipeline.schema = Arc::new(Schema::new(Vec::<Field>::new()));
+        let error = pipeline
+            .extract(&mailbox, 0..99)
+            .expect_err("one array cannot fill a zero-field schema");
+        assert!(
+            matches!(&error, MboxTurboError::Arrow { positions, .. } if *positions == (0..1)),
+            "the error names the positions clamped to the one message that exists"
         );
     }
 }
