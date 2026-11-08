@@ -160,15 +160,19 @@ fn parsed_zone_minutes(date: &DateTime) -> i32 {
         .strict_mul(60)
         .strict_add(i32::from(date.tz_minute));
     if date.tz_before_gmt {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "minutes is at most 1439, so negating it cannot overflow i32"
-        )]
-        let negated = minutes.strict_neg();
-        negated
+        negate_zone(minutes)
     } else {
         minutes
     }
+}
+
+/// `minutes` with its sign flipped, for a zone west of UTC.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "minutes is at most 1439, so negating it cannot overflow i32"
+)]
+const fn negate_zone(minutes: i32) -> i32 {
+    minutes.strict_neg()
 }
 
 /// A two-digit decimal number from `text`, or `None` when `text` is not one.
