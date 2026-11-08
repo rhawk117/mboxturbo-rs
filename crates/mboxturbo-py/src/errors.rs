@@ -23,6 +23,8 @@ create_exception!(
     "An index file was built for a different version of the mailbox."
 );
 
+/// The Python exception for a core error: `OSError` (with `filename`) for I/O, the matching
+/// `MboxTurboError` subclass for a damaged or stale index, the base class otherwise.
 pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxturboError) -> PyErr {
     let message = error.to_string();
     match error {
@@ -40,6 +42,7 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxturboError) -> P
     }
 }
 
+/// The `ValueError` raised when a closed mailbox is used.
 pub(crate) fn closed() -> PyErr {
     PyValueError::new_err("I/O operation on a closed mailbox")
 }
