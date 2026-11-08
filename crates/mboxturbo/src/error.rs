@@ -10,12 +10,16 @@ use parquet::errors::ParquetError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Corruption {
-    /// The file does not start with the mboxturbo index signature.
-    #[error("missing the mboxturbo index signature")]
-    Signature,
-    /// The file was written by an unsupported format version.
-    #[error("format version {0} is not supported")]
-    Version(u32),
+    /// A message offset points past the end of the mailbox, or the mailbox length does not fit
+    /// in memory.
+    #[error("{}", describe_bounds(*position, *offset))]
+    Bounds {
+        /// Position of the message with the offending offset; `None` when the offender is the
+        /// mailbox length itself.
+        position: Option<usize>,
+        /// The offending byte offset, or the mailbox length when `position` is `None`.
+        offset: u64,
+    },
     /// The trailing checksum does not match the contents.
     #[error("checksum mismatch")]
     Checksum,
@@ -40,40 +44,26 @@ pub enum Corruption {
         /// The start offset of the message before it.
         previous: usize,
     },
-    /// A message offset points past the end of the mailbox, or the mailbox length does not fit
-    /// in memory.
-    #[error("{}", describe_bounds(*position, *offset))]
-    Bounds {
-        /// Position of the message with the offending offset; `None` when the offender is the
-        /// mailbox length itself.
-        position: Option<usize>,
-        /// The offending byte offset, or the mailbox length when `position` is `None`.
-        offset: u64,
-    },
-}
-
-/// Renders the [`Corruption::Bounds`] message, naming the message position when there is one.
-fn describe_bounds(position: Option<usize>, offset: u64) -> String {
-    position.map_or_else(
-        || format!("mailbox length {offset} does not fit in memory"),
-        |message| {
-            format!("message {message} starts at offset {offset}, past the end of the mailbox")
-        },
-    )
+    /// The file does not start with the mboxturbo index signature.
+    #[error("missing the mboxturbo index signature")]
+    Signature,
+    /// The file was written by an unsupported format version.
+    #[error("format version {0} is not supported")]
+    Version(u32),
 }
 
 /// Everything that can go wrong opening a mailbox or handling its index.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MboxturboError {
-    /// Reading, mapping or writing a file failed.
-    #[error("I/O error on {}", path.display())]
-    Io {
-        /// The file being accessed.
-        path: PathBuf,
-        /// The underlying operating system error.
+    /// Extracted columns could not be assembled into an Arrow batch.
+    #[error("cannot assemble an Arrow batch for messages {}..{}", positions.start, positions.end)]
+    Arrow {
+        /// The message positions the failed batch covered, clamped to those that exist.
+        positions: Range<usize>,
+        /// The Arrow failure.
         #[source]
-        source: io::Error,
+        source: arrow_schema::ArrowError,
     },
     /// The index file is damaged or is not an mboxturbo index.
     #[error("index file {} is corrupt: {corruption}", path.display())]
@@ -83,21 +73,14 @@ pub enum MboxturboError {
         /// What failed validation.
         corruption: Corruption,
     },
-    /// The index file was built for a different version of the mailbox, or by an older
-    /// index format.
-    #[error("index file {} no longer matches the mailbox", path.display())]
-    StaleIndex {
-        /// The rejected index file.
+    /// Reading, mapping or writing a file failed.
+    #[error("I/O error on {}", path.display())]
+    Io {
+        /// The file being accessed.
         path: PathBuf,
-    },
-    /// Extracted columns could not be assembled into an Arrow batch.
-    #[error("cannot assemble an Arrow batch for messages {}..{}", positions.start, positions.end)]
-    Arrow {
-        /// The message positions the failed batch covered, clamped to those that exist.
-        positions: Range<usize>,
-        /// The Arrow failure.
+        /// The underlying operating system error.
         #[source]
-        source: arrow_schema::ArrowError,
+        source: io::Error,
     },
     /// Writing a Parquet file failed.
     #[error("cannot write Parquet file {}", path.display())]
@@ -108,9 +91,23 @@ pub enum MboxturboError {
         #[source]
         source: ParquetError,
     },
+    /// The index file was built for a different version of the mailbox, or by an older
+    /// index format.
+    #[error("index file {} no longer matches the mailbox", path.display())]
+    StaleIndex {
+        /// The rejected index file.
+        path: PathBuf,
+    },
 }
 
 impl MboxturboError {
+    /// Whether the cached index should be rebuilt: it is stale or missing (`NotFound`), not
+    /// otherwise broken.
+    pub(crate) fn calls_for_rebuild(&self) -> bool {
+        matches!(self, Self::StaleIndex { .. })
+            || matches!(self, Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
+    }
+
     /// Wraps `source` as [`MboxturboError::Io`], recording the `path` being accessed.
     pub(crate) fn io(path: &Path, source: io::Error) -> Self {
         Self::Io {
@@ -118,11 +115,14 @@ impl MboxturboError {
             source,
         }
     }
+}
 
-    /// Whether the cached index should be rebuilt: it is stale or missing (`NotFound`), not
-    /// otherwise broken.
-    pub(crate) fn calls_for_rebuild(&self) -> bool {
-        matches!(self, Self::StaleIndex { .. })
-            || matches!(self, Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
-    }
+/// Renders the [`Corruption::Bounds`] message, naming the message position when there is one.
+fn describe_bounds(position: Option<usize>, offset: u64) -> String {
+    position.map_or_else(
+        || format!("mailbox length {offset} does not fit in memory"),
+        |message| {
+            format!("message {message} starts at offset {offset}, past the end of the mailbox")
+        },
+    )
 }
