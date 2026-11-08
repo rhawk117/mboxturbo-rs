@@ -91,7 +91,7 @@ pub(crate) struct Mailbox {
 impl Mailbox {
     #[new]
     #[pyo3(signature = (path, *, index = None))]
-    /// Opens `path`, reusing or rewriting the cache at `index` when one is given.
+    /// Opens ``path``, reusing or rewriting the cache at ``index`` when one is given.
     fn new(py: Python<'_>, path: PathBuf, index: Option<PathBuf>) -> PyResult<Self> {
         let opened = py.detach(move || {
             index.as_deref().map_or_else(
@@ -105,13 +105,13 @@ impl Mailbox {
         })
     }
 
-    /// The number of messages; `ValueError` once closed.
+    /// The number of messages; ``ValueError`` once closed.
     fn __len__(&self) -> PyResult<usize> {
         Ok(self.slot.get()?.len())
     }
 
     /// The message at an integer position (negative counts from the end) or a list for a slice;
-    /// `IndexError` when the position is out of range, `ValueError` once closed.
+    /// ``IndexError`` when the position is out of range, ``ValueError`` once closed.
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let mailbox = self.slot.get()?;
         if let Ok(slice) = key.cast::<PySlice>() {
@@ -126,7 +126,7 @@ impl Mailbox {
         Message::from(message).into_py_any(py)
     }
 
-    /// A fresh iterator over every message; `ValueError` once closed.
+    /// A fresh iterator over every message; ``ValueError`` once closed.
     fn __iter__(&self) -> PyResult<MessageIterator> {
         Ok(MessageIterator {
             mailbox: self.slot.get()?,
@@ -168,7 +168,7 @@ impl Mailbox {
         self.slot.clear();
     }
 
-    /// Returns the mailbox itself so `with` closes it on exit.
+    /// Returns the mailbox itself so ``with`` closes it on exit.
     const fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
         slf
     }
@@ -179,7 +179,7 @@ impl Mailbox {
         self.slot.clear();
     }
 
-    /// `Mailbox(messages=N)`, or `Mailbox(closed)` once closed.
+    /// ``Mailbox(messages=N)``, or ``Mailbox(closed)`` once closed.
     fn __repr__(&self) -> String {
         self.slot.get().map_or_else(
             |_| "Mailbox(closed)".to_owned(),
@@ -206,7 +206,7 @@ impl MessageIterator {
         slf
     }
 
-    /// The next unclaimed message, or `None` (ending iteration) after the last.
+    /// The next unclaimed message, or ``None`` (ending iteration) after the last.
     fn __next__(&self) -> Option<Message> {
         self.mailbox
             .message(self.cursor.advance(1))
@@ -239,7 +239,7 @@ impl BatchIterator {
         slf
     }
 
-    /// The next unclaimed batch, shorter at the end of the file, or `None` (ending iteration)
+    /// The next unclaimed batch, shorter at the end of the file, or ``None`` (ending iteration)
     /// once all are claimed. The interpreter is released while the batch is parsed.
     fn __next__(&self, py: Python<'_>) -> Option<Vec<Message>> {
         let start = self.cursor.advance(self.size);
