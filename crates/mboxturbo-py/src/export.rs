@@ -1,4 +1,11 @@
 //! Column selections: streamed through the Arrow C stream interface or written to Parquet.
+#![expect(
+    clippy::too_many_arguments,
+    reason = "pyo3's generated wrapper for #[pymethods] takes the interpreter, the receiver and \
+              the raw argument arrays as parameters; the lint fires at the macro call site, so an \
+              expectation on the impl block is unfulfilled and it must stay at module scope; no \
+              signature in this module has that many"
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,19 +24,17 @@ use crate::errors::into_py_err;
 #[pyclass(frozen, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct Selection {
+    /// The mapping the columns are extracted from.
     mailbox: Arc<mboxturbo::Mailbox>,
-    pipeline: Arc<Pipeline>,
+    /// The column names, in selection order.
     names: Vec<String>,
+    /// The extraction plan shared by every read.
+    pipeline: Arc<Pipeline>,
 }
 
 #[pymethods]
 impl Selection {
-    /// Names of the selected columns, in order.
-    #[getter]
-    fn columns(&self) -> Vec<String> {
-        self.names.clone()
-    }
-
+    /// Arrow C stream capsule over the selection; ``requested_schema`` is accepted and ignored.
     #[pyo3(signature = (requested_schema = None))]
     fn __arrow_c_stream__<'py>(
         &self,
@@ -42,16 +47,7 @@ impl Selection {
         PyCapsule::new_with_value(py, stream, c"arrow_array_stream")
     }
 
-    /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
-    #[pyo3(signature = (path, *, compression = "zstd"))]
-    fn to_parquet(&self, py: Python<'_>, path: PathBuf, compression: &str) -> PyResult<u64> {
-        let compression = parse_compression(compression)?;
-        let mailbox = Arc::clone(&self.mailbox);
-        let pipeline = Arc::clone(&self.pipeline);
-        py.detach(move || pipeline.write_parquet(&mailbox, &path, compression))
-            .map_err(|error| into_py_err(py, error))
-    }
-
+    /// ``Selection(columns=N, messages=M)``.
     fn __repr__(&self) -> String {
         format!(
             "Selection(columns={}, messages={})",
@@ -59,8 +55,30 @@ impl Selection {
             self.mailbox.len()
         )
     }
+
+    /// Names of the selected columns, in order.
+    #[getter]
+    fn columns(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
+    #[pyo3(signature = (path, *, compression = "zstd"))]
+    fn to_parquet(&self, py: Python<'_>, path: PathBuf, compression: &str) -> PyResult<u64> {
+        let codec = parse_compression(compression)?;
+        let mailbox = Arc::clone(&self.mailbox);
+        let pipeline = Arc::clone(&self.pipeline);
+        py.detach(move || {
+            pipeline
+                .write_parquet(&mailbox, &path, codec)
+                .map_err(Box::new)
+        })
+        .map_err(|error| into_py_err(py, *error))
+    }
 }
 
+/// A selection over `mailbox`; `ValueError` for a zero `batch_size` or an unknown column, with
+/// every column in `Column::defaults` when `requested` is `None`.
 pub(crate) fn select_columns(
     mailbox: Arc<mboxturbo::Mailbox>,
     requested: Option<Vec<String>>,
@@ -78,11 +96,12 @@ pub(crate) fn select_columns(
     let pipeline = Arc::new(Pipeline::new(columns, batch_size));
     Ok(Selection {
         mailbox,
-        pipeline,
         names,
+        pipeline,
     })
 }
 
+/// The columns `names` name, or `ValueError` listing the known names for the first unknown one.
 fn parse_columns(names: &[String]) -> PyResult<Vec<Column>> {
     names
         .iter()
@@ -97,6 +116,7 @@ fn parse_columns(names: &[String]) -> PyResult<Vec<Column>> {
         .collect()
 }
 
+/// The codec `name` names (`zstd`, `snappy` or `none`), or `ValueError` for anything else.
 fn parse_compression(name: &str) -> PyResult<Compression> {
     match name {
         "zstd" => Ok(Compression::Zstd),

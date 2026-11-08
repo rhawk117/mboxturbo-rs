@@ -13,7 +13,9 @@ main() {
   setup_environment
   find_existing_issue
 
-  if [[ "$AUDIT_RESULT" == success ]]; then
+  : "${AUDIT_RESULT:?AUDIT_RESULT is required}"
+
+  if [[ "${AUDIT_RESULT}" == success ]]; then
     resolve_security_issue
     return
   fi
@@ -26,10 +28,10 @@ main() {
 setup_environment() {
   local repository_root
   repository_root=$(git rev-parse --show-toplevel)
-  cd "$repository_root"
+  cd "${repository_root}"
 
   # shellcheck disable=SC1090
-  source "$LOGGING_UTILS"
+  source "${LOGGING_UTILS}"
 }
 
 find_existing_issue() {
@@ -48,9 +50,9 @@ find_existing_issue() {
 download_audit_report() {
   log::step "Download Security Findings"
 
-  if ! gh run download "$GITHUB_RUN_ID" \
+  if ! gh run download "${GITHUB_RUN_ID}" \
     --name pysentry-weekly \
-    --dir "$RUNNER_TEMP"; then
+    --dir "${RUNNER_TEMP}"; then
     log::warn "No SARIF artifact found; linking workflow logs instead."
   fi
 
@@ -58,7 +60,7 @@ download_audit_report() {
 }
 
 format_findings() {
-  if [[ ! -s "$SARIF_FILE" ]] || ! jq -e '.runs | type == "array"' "$SARIF_FILE" >/dev/null; then
+  if [[ ! -s "${SARIF_FILE}" ]] || ! jq -e '.runs | type == "array"' "${SARIF_FILE}" >/dev/null; then
     printf '%s\n' 'No valid SARIF was generated. Check the workflow logs for scanner errors.'
     return
   fi
@@ -78,32 +80,35 @@ format_findings() {
         empty
       end
     )
-  ' "$SARIF_FILE"
+  ' "${SARIF_FILE}"
 }
 
 write_failure_report() {
   log::step "Generate Security Report"
 
+  : "${GITHUB_SHA:?GITHUB_SHA is required}"
+  : "${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
+
   {
     printf '%s\n' '## Weekly Supply Chain Audit Failed' ''
-    printf -- "- **Result:** %s\n" "$AUDIT_RESULT"
-    printf -- '- **Commit:** %s\n' "$GITHUB_SHA"
-    printf -- '- **Run:** [View logs and artifacts](%s)\n' "$WORKFLOW_URL"
+    printf -- "- **Result:** %s\n" "${AUDIT_RESULT}"
+    printf -- '- **Commit:** %s\n' "${GITHUB_SHA}"
+    printf -- '- **Run:** [View logs and artifacts](%s)\n' "${WORKFLOW_URL}"
     printf '\n%s\n\n' '### Findings'
     format_findings
-  } >"$REPORT_FILE"
+  } >"${REPORT_FILE}"
 
-  cat "$REPORT_FILE" >>"$GITHUB_STEP_SUMMARY"
+  cat "${REPORT_FILE}" >>"${GITHUB_STEP_SUMMARY}"
   log::step_end
 }
 
 publish_security_issue() {
   log::step "Publish Security Issue"
 
-  if [[ -z "$existing_issue" ]]; then
-    gh issue create --title "$ISSUE_TITLE" --body-file "$REPORT_FILE"
+  if [[ -z "${existing_issue}" ]]; then
+    gh issue create --title "${ISSUE_TITLE}" --body-file "${REPORT_FILE}"
   else
-    gh issue edit "$existing_issue" --body-file "$REPORT_FILE"
+    gh issue edit "${existing_issue}" --body-file "${REPORT_FILE}"
   fi
 
   log::step_end
@@ -112,13 +117,14 @@ publish_security_issue() {
 resolve_security_issue() {
   log::step "Resolve Security Issue"
 
-  if [[ -n "$existing_issue" ]]; then
-    gh issue close "$existing_issue" \
+  if [[ -n "${existing_issue}" ]]; then
+    gh issue close "${existing_issue}" \
       --reason completed \
-      --comment "Weekly audit passed: $WORKFLOW_URL"
+      --comment "Weekly audit passed: ${WORKFLOW_URL}"
   fi
 
-  printf 'Weekly security audit passed: %s\n' "$WORKFLOW_URL" >>"$GITHUB_STEP_SUMMARY"
+  : "${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
+  printf 'Weekly security audit passed: %s\n' "${WORKFLOW_URL}" >>"${GITHUB_STEP_SUMMARY}"
   log::step_end
 }
 

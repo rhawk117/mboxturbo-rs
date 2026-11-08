@@ -2,7 +2,7 @@
 name = "mboxturbo"
 version = "0.1.0"
 description = "Offset-indexed random access, parallel indexing and Rust-parsed messages for large mbox files"
-readme = "README.md"
+readme = "crates/mboxturbo-py/README.md"
 license = "Apache-2.0"
 authors = [{ name = "rhawk117", email = "noplaceLike127dot0dot0dot1@proton.me" }]
 requires-python = ">=3.14"
@@ -10,30 +10,32 @@ dependencies = []
 
 [dependency-groups]
 dev = [
+    "actionlint-py>=1.7.12.25",
     "hypothesis>=6",
     "maturin>=1.16.0",
+    "prek>=0.5.10",
     "pyarrow>=26.0.1",
     "pytest>=9",
     "ruff>=0.16.10",
+    "taplo>=0.9.3",
     "ty>=0.0.99",
+    "typos>=1.52.0",
+    "zizmor>=1.32.0",
 ]
-polars = [
-    "polars>=2.1.0",
-]
-security = [
-    "pysentry-rs>=0.5.0",
-]
+polars = ["polars>=2.1.0"]
+security = ["pysentry-rs>=0.5.0"]
 
 [tool.maturin]
+manifest-path = "crates/mboxturbo-py/Cargo.toml"
 module-name = "mboxturbo._core"
 python-packages = ["mboxturbo"]
-python-source = "src"
+python-source = "crates/mboxturbo-py/src"
 profile = "release"
-exclude = ["src/mboxturbo/tests/**"]
+exclude = ["crates/mboxturbo-py/src/mboxturbo/tests/**"]
 
 [tool.pytest.ini_options]
 addopts = ["--strict-markers", "--strict-config", "-p", "mboxturbo.tests.fixtures"]
-testpaths = ["tests"]
+testpaths = ["crates/mboxturbo-py/tests"]
 xfail_strict = true
 markers = [
     "integration: exercises the compiled extension against files on disk",
@@ -44,13 +46,15 @@ markers = [
 default-groups = ["dev", "polars"]
 cache-keys = [
     { file = "pyproject.toml" },
-    { file = "src/**/*.rs" },
     { file = "Cargo.toml" },
-    { file = "../mboxturbo/src/**/*.rs" },
-    { file = "../mboxturbo/Cargo.toml" },
-    { file = "../../Cargo.lock" },
+    { file = "Cargo.lock" },
+    { file = "crates/*/Cargo.toml" },
+    { file = "crates/*/src/**/*.rs" },
 ]
 
 [build-system]
 requires = ["maturin>=1.16,<2.0"]
 build-backend = "maturin"
+
+[tool.ty.environment]
+root = ["crates/mboxturbo-py/src"]

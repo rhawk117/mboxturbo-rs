@@ -44,12 +44,12 @@ jobs:
   continuous-integration:
     name: 🔁 Run CI Pipeline
     needs: [release-guard]
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] remove once actionlint supports '$/' (rhysd/actionlint#711)
     permissions:
-      contents: read
-      actions: read
-      pull-requests: write
-      security-events: write
+      contents: read # called ci.yml checks out the repository
+      actions: read # called ci.yml jobs read workflow run data (narrator, code scanning upload)
+      pull-requests: write # called ci.yml labeler and narrator write PR labels and comments
+      security-events: write # called ci.yml supply chain audit uploads SARIF to code scanning
 
   prepare-release:
     name: 🚀 Prepare Release
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: write # release.sh pushes the release commit and tag
     outputs:
       version: ${{ steps.prepare.outputs.version }}
       tag: ${{ steps.prepare.outputs.tag }}
@@ -73,7 +73,7 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ vars.UV_VERSION }}
-          cache-dependency-glob: crates/mboxturbo-py/uv.lock
+          cache-dependency-glob: uv.lock
 
       - name: Install Pinned Toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
@@ -88,7 +88,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
-      contents: read
+      contents: read # checkout
     strategy:
       fail-fast: false
       matrix:
@@ -113,7 +113,6 @@ jobs:
       - name: Build Wheels for CPython 3.14 and 3.14t
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
-          working-directory: crates/mboxturbo-py
           target: ${{ matrix.target }}
           manylinux: "2_28"
           args: --release --locked --out dist --interpreter 3.14 3.14t
@@ -122,7 +121,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.target }}
-          path: crates/mboxturbo-py/dist/*.whl
+          path: dist/*.whl
           if-no-files-found: error
           retention-days: 7
 
@@ -132,7 +131,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: write # gh release create and upload manage the GitHub Release
     steps:
       - name: Download Wheels
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0

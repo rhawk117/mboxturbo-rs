@@ -1,0 +1,20 @@
+include = ["**/*.toml"]
+exclude = ["target/**", ".venv/**"]
+
+[formatting]
+column_width = 100
+indent_string = "    "
+array_auto_expand = true
+array_auto_collapse = true
+compact_arrays = true
+align_entries = false
+reorder_keys = false
+trailing_newline = true
+allowed_blank_lines = 1
+
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = ["dependencies", "dev-dependencies", "build-dependencies", "workspace.dependencies"]
+
+[rule.formatting]
+reorder_keys = true

@@ -23,22 +23,31 @@ create_exception!(
     "An index file was built for a different version of the mailbox."
 );
 
-pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::Error) -> PyErr {
+/// The Python exception for a core error: `OSError` (with `filename`) for I/O, the matching
+/// `MboxTurboError` subclass for a damaged or stale index, the base class otherwise.
+pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> PyErr {
     let message = error.to_string();
     match error {
-        mboxturbo::Error::Io { path, source } => {
+        mboxturbo::MboxTurboError::Io { path, source } => {
             let raised = PyErr::from(source);
             let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
             tagged.err().unwrap_or(raised)
-        }
-        mboxturbo::Error::CorruptIndex { .. } => CorruptIndexError::new_err(message),
-        mboxturbo::Error::StaleIndex { .. } => StaleIndexError::new_err(message),
-        mboxturbo::Error::Arrow { .. } | mboxturbo::Error::Parquet { .. } => {
+        },
+        mboxturbo::MboxTurboError::CorruptIndex { .. } => CorruptIndexError::new_err(message),
+        mboxturbo::MboxTurboError::StaleIndex { .. } => StaleIndexError::new_err(message),
+        // Naming Arrow and Parquet keeps `clippy::wildcard_enum_match_arm` quiet for the
+        // wildcard below.
+        mboxturbo::MboxTurboError::Arrow { .. } | mboxturbo::MboxTurboError::Parquet { .. } => {
             MboxTurboError::new_err(message)
-        }
+        },
+        // The Python API is frozen (plan invariant I2): the non-exhaustive remainder raises the
+        // base class. A new core variant needs an explicit decision about its Python exception,
+        // not this fallback.
+        _ => MboxTurboError::new_err(message),
     }
 }
 
+/// The `ValueError` raised when a closed mailbox is used.
 pub(crate) fn closed() -> PyErr {
     PyValueError::new_err("I/O operation on a closed mailbox")
 }

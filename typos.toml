@@ -1,0 +1,4 @@
+[default]
+# RFC 2047 encoded words in test mail (=?utf-8?q?caf=C3=A9?=) are not prose.
+# A word running straight into a Rust unicode escape (caf\u{e9}) is a string literal, not prose.
+extend-ignore-re = ['=\?[A-Za-z0-9_-]+\?[QqBb]\?[^?\s]*\?=', '[A-Za-z]+(\\u\{[0-9A-Fa-f]+\})+']

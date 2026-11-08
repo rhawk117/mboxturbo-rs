@@ -18,9 +18,10 @@ python:
   - changed-files:
       - any-glob-to-any-file:
           - crates/mboxturbo-py/src/mboxturbo/**
-          - crates/mboxturbo-py/pyproject.toml
-          - crates/mboxturbo-py/uv.lock
-          - crates/mboxturbo-py/ruff.toml
+          - pyproject.toml
+          - uv.lock
+          - ruff.toml
+          - .python-version
 
 tests:
   - changed-files:
