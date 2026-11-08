@@ -9,22 +9,35 @@ use memmap2::Mmap;
 
 use crate::fields::{self, FULL_PARSER, contain_parser_panic, strip_separator};
 
+/// A message's bytes: its span within the shared mapping.
 #[derive(Debug, Clone)]
 struct Source {
+    /// The mailbox mapping, shared with every message cut from it.
     contents: Arc<Mmap>,
+    /// Where the message lies in `contents`, separator line included.
     span: Range<usize>,
 }
 
 impl Source {
+    /// The message's bytes exactly as stored, separator line included.
+    #[expect(
+        clippy::expect_used,
+        reason = "`span` comes from the validated index, which keeps every span inside the \
+                  mapping (see Mailbox::rows), so `contents` always has these bytes"
+    )]
     fn bytes(&self) -> &[u8] {
-        self.contents.get(self.span.clone()).unwrap_or_default()
+        self.contents
+            .get(self.span.clone())
+            .expect("a span from the validated index lies inside the mapping")
     }
 
+    /// The RFC 822 content: the bytes without the `From ` separator line.
     fn rfc822(&self) -> &[u8] {
         strip_separator(self.bytes())
     }
 }
 
+/// Owner and dependent in one value: a parsed message together with the bytes it borrows.
 mod cell {
     #![expect(
         clippy::mem_forget,
@@ -35,7 +48,8 @@ mod cell {
 
     use super::Source;
 
-    type ParsedMail<'a> = Option<mail_parser::Message<'a>>;
+    /// The parse result: `None` when the parser found no message.
+    type ParsedMail<'text> = Option<mail_parser::Message<'text>>;
 
     self_cell!(
         pub(super) struct Parsed {
@@ -52,11 +66,11 @@ mod cell {
 /// A mailbox address as written in a header: either part may be missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Address<'a> {
+pub struct Address<'mail> {
     /// Display name, such as `Jane Doe`.
-    pub name: Option<&'a str>,
+    pub name: Option<&'mail str>,
     /// Address, such as `jane@example.com`.
-    pub email: Option<&'a str>,
+    pub email: Option<&'mail str>,
 }
 
 /// A `Date:` header resolved to an instant plus the offset it was written in.
@@ -72,15 +86,15 @@ pub struct Timestamp {
 /// A decoded attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Attachment<'a> {
+pub struct Attachment<'mail> {
     /// File name from `Content-Disposition` or `Content-Type`.
-    pub filename: Option<&'a str>,
+    pub filename: Option<&'mail str>,
     /// Top-level media type, such as `application`.
-    pub media_type: Option<&'a str>,
+    pub media_type: Option<&'mail str>,
     /// Media subtype, such as `pdf`.
-    pub media_subtype: Option<&'a str>,
+    pub media_subtype: Option<&'mail str>,
     /// Contents with the transfer encoding (base64, quoted-printable) removed.
-    pub data: Cow<'a, [u8]>,
+    pub data: Cow<'mail, [u8]>,
 }
 
 impl Attachment<'_> {
@@ -102,12 +116,16 @@ impl Attachment<'_> {
 /// header block only, and bodies or attachments trigger the full MIME parse.
 #[derive(Debug)]
 pub struct Message {
+    /// This message's bytes.
     source: Source,
+    /// The header-only parse, filled on first header access.
     head: OnceLock<Parsed>,
+    /// The full MIME parse, filled on first body or attachment access.
     whole: OnceLock<Parsed>,
 }
 
 impl Message {
+    /// A message over `span` of `contents`; `span` must come from the validated index.
     pub(crate) const fn new(contents: Arc<Mmap>, span: Range<usize>) -> Self {
         Self {
             source: Source { contents, span },
@@ -170,7 +188,10 @@ impl Message {
 
     /// Every value of the header called `name` (any case) in file order, unfolded onto one
     /// line each. Values are raw: encoded words such as `=?utf-8?...?=` are left as written.
-    pub fn header_values<'a>(&'a self, name: &str) -> impl Iterator<Item = Cow<'a, str>> + use<'a> {
+    pub fn header_values<'message>(
+        &'message self,
+        name: &str,
+    ) -> impl Iterator<Item = Cow<'message, str>> + use<'message> {
         let wanted = name.to_owned();
         self.head()
             .into_iter()
@@ -192,20 +213,24 @@ impl Message {
         self.whole().into_iter().flat_map(fields::attachments)
     }
 
+    /// The parsed message to read header fields from: the full parse when it already exists,
+    /// else the header-only parse, made on first use. `None` when nothing parsed.
     fn head(&self) -> Option<&mail_parser::Message<'_>> {
-        self.whole
+        let parsed = self
+            .whole
             .get()
-            .unwrap_or_else(|| {
-                self.head.get_or_init(|| {
-                    Parsed::new(self.source.clone(), |source| {
-                        contain_parser_panic(|| FULL_PARSER.parse_headers(source.rfc822()))
-                    })
-                })
-            })
-            .borrow_dependent()
-            .as_ref()
+            .unwrap_or_else(|| self.head.get_or_init(|| self.parse_head()));
+        parsed.borrow_dependent().as_ref()
     }
 
+    /// Parses the header block alone.
+    fn parse_head(&self) -> Parsed {
+        Parsed::new(self.source.clone(), |source| {
+            contain_parser_panic(|| FULL_PARSER.parse_headers(source.rfc822()))
+        })
+    }
+
+    /// The full MIME parse, made on first use. `None` when nothing parsed.
     fn whole(&self) -> Option<&mail_parser::Message<'_>> {
         self.whole
             .get_or_init(|| {
@@ -232,17 +257,19 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
 --B\nContent-Type: application/octet-stream\nContent-Transfer-Encoding: base64\n\nAAEC\n--B--\n";
 
     fn mailbox() -> (tempfile::TempDir, Mailbox) {
-        let directory = tempfile::tempdir().expect("tempdir");
+        let directory = tempfile::tempdir().expect("temp directory is created");
         let path = directory.path().join("lazy.mbox");
-        fs::write(&path, MESSAGE).expect("write");
-        let mailbox = Mailbox::open(&path).expect("open");
+        fs::write(&path, MESSAGE).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(&path).expect("fixture mbox opens");
         (directory, mailbox)
     }
 
     #[test]
     fn header_fields_never_trigger_the_full_parse() {
         let (_directory, mailbox) = mailbox();
-        let message = mailbox.message(0).expect("message");
+        let message = mailbox
+            .message(0)
+            .expect("the fixture holds a first message");
         assert_eq!(
             message.subject(),
             Some("lazy"),
@@ -268,8 +295,12 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
     #[test]
     fn both_tiers_agree_on_header_fields() {
         let (_directory, mailbox) = mailbox();
-        let headers_only = mailbox.message(0).expect("message");
-        let parsed_fully = mailbox.message(0).expect("message");
+        let headers_only = mailbox
+            .message(0)
+            .expect("the fixture holds a first message");
+        let parsed_fully = mailbox
+            .message(0)
+            .expect("the fixture holds a first message");
         assert!(parsed_fully.parse(), "full parse succeeds");
         assert_eq!(headers_only.subject(), parsed_fully.subject(), "subject");
         assert_eq!(
