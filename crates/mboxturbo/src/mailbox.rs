@@ -49,6 +49,15 @@ struct Mapped {
 }
 
 impl Mapped {
+    /// Builds a fresh index over the mapping.
+    fn into_indexed(self) -> Mailbox {
+        let index = Index::build(&self.contents, self.fingerprint);
+        Mailbox {
+            contents: Arc::new(self.contents),
+            index,
+        }
+    }
+
     /// Opens and maps `path`, fingerprinting what was mapped.
     ///
     /// Fails with [`MboxturboError::Io`] when the file cannot be opened or mapped.
@@ -72,15 +81,6 @@ impl Mapped {
         })
     }
 
-    /// Builds a fresh index over the mapping.
-    fn into_indexed(self) -> Mailbox {
-        let index = Index::build(&self.contents, self.fingerprint);
-        Mailbox {
-            contents: Arc::new(self.contents),
-            index,
-        }
-    }
-
     /// Attaches an index that was already validated against this mapping's fingerprint.
     fn with_index(self, index: Index) -> Mailbox {
         Mailbox {
@@ -90,22 +90,40 @@ impl Mapped {
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "a read-only map is sound while the file is neither written nor truncated, which \
-              is the documented contract of Mailbox and of every Message borrowed from it"
-)]
-#[expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "the safety argument is the reason on the unsafe_code expectation; the crate keeps \
-              code free of comments"
-)]
-/// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`].
-fn map_read_only(file: &File) -> io::Result<Mmap> {
-    unsafe { Mmap::map(file) }
-}
-
 impl Mailbox {
+    /// The message index.
+    #[must_use]
+    pub const fn index(&self) -> &Index {
+        &self.index
+    }
+
+    /// Whether the mailbox holds no messages.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Raw bytes of every message, in file order.
+    #[must_use]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
+        (0..self.len()).map(|position| self.row(position).1)
+    }
+
+    /// Number of messages.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// The message at `position`, parsed lazily on first field access.
+    #[must_use]
+    pub fn message(&self, position: usize) -> Option<Message> {
+        Some(Message::new(
+            Arc::clone(&self.contents),
+            self.index.span(position)?,
+        ))
+    }
+
     /// Maps the mbox at `path` and indexes it on all rayon threads.
     ///
     /// # Errors
@@ -144,94 +162,12 @@ impl Mailbox {
         }
     }
 
-    /// The message index.
-    #[must_use]
-    pub const fn index(&self) -> &Index {
-        &self.index
-    }
-
-    /// Number of messages.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.index.len()
-    }
-
-    /// Whether the mailbox holds no messages.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.index.is_empty()
-    }
-
-    /// Raw bytes of the message at `position`, including its `From ` separator line.
-    #[must_use]
-    pub fn raw(&self, position: usize) -> Option<&[u8]> {
-        self.contents.get(self.index.span(position)?)
-    }
-
-    /// The span and raw bytes of every message in `positions`, clamped to the messages that
-    /// exist, as `(position, span, raw)`.
-    ///
-    /// Yields one item for every clamped position and never skips one. This rests on one
-    /// invariant: every index in use has starts that ascend, each below its end. A freshly
-    /// built index takes `end` from `contents.len()` in `Index::build`, and its starts come
-    /// from the scanner, which emits them ascending and each below that length. A cached index
-    /// is accepted by `Index::decode` only when its fingerprint, which includes the length,
-    /// matches the mapping's, and `validate_starts` has checked that its starts ascend with the
-    /// last one below `end`.
-    pub(crate) fn rows(
-        &self,
-        positions: Range<usize>,
-    ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
-        let end = positions.end.min(self.len());
-        let start = positions.start.min(end);
-        (start..end).map(|position| {
-            let (span, raw) = self.row(position);
-            (position, span, raw)
-        })
-    }
-
-    /// The span and raw bytes of the message at `position`, which must be below `len()`.
-    #[expect(
-        clippy::expect_used,
-        reason = "`position` is below `len()`, so the index has a span for it, and every index in \
-                  use keeps its spans inside the mapping: `Index::build` takes `end` from \
-                  `contents.len()` and emits ascending starts below it, and `Index::decode` \
-                  accepts a cached index only on a matching fingerprint and after \
-                  `validate_starts` checked its starts"
-    )]
-    fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
-        let span = self
-            .index
-            .span(position)
-            .expect("a position below len() has a span");
-        let raw = self
-            .contents
-            .get(span.clone())
-            .expect("a validated index spans bytes inside the mapping");
-        (span, raw)
-    }
-
-    /// Raw bytes of every message, in file order.
-    #[must_use]
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
-        (0..self.len()).map(|position| self.row(position).1)
-    }
-
     /// Raw bytes of every message, split across rayon threads.
     #[must_use]
     pub fn par_iter(&self) -> impl IndexedParallelIterator<Item = &[u8]> {
         (0..self.len())
             .into_par_iter()
             .map(|position| self.row(position).1)
-    }
-
-    /// The message at `position`, parsed lazily on first field access.
-    #[must_use]
-    pub fn message(&self, position: usize) -> Option<Message> {
-        Some(Message::new(
-            Arc::clone(&self.contents),
-            self.index.span(position)?,
-        ))
     }
 
     /// The messages at `positions` (clamped to those that exist), all parsed in parallel.
@@ -268,6 +204,70 @@ impl Mailbox {
             hint::read_ahead(&self.contents, span);
         }
     }
+
+    /// Raw bytes of the message at `position`, including its `From ` separator line.
+    #[must_use]
+    pub fn raw(&self, position: usize) -> Option<&[u8]> {
+        self.contents.get(self.index.span(position)?)
+    }
+
+    /// The span and raw bytes of the message at `position`, which must be below `len()`.
+    #[expect(
+        clippy::expect_used,
+        reason = "`position` is below `len()`, so the index has a span for it, and every index in \
+                  use keeps its spans inside the mapping: `Index::build` takes `end` from \
+                  `contents.len()` and emits ascending starts below it, and `Index::decode` \
+                  accepts a cached index only on a matching fingerprint and after \
+                  `validate_starts` checked its starts"
+    )]
+    fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
+        let span = self
+            .index
+            .span(position)
+            .expect("a position below len() has a span");
+        let raw = self
+            .contents
+            .get(span.clone())
+            .expect("a validated index spans bytes inside the mapping");
+        (span, raw)
+    }
+
+    /// The span and raw bytes of every message in `positions`, clamped to the messages that
+    /// exist, as `(position, span, raw)`.
+    ///
+    /// Yields one item for every clamped position and never skips one. This rests on one
+    /// invariant: every index in use has starts that ascend, each below its end. A freshly
+    /// built index takes `end` from `contents.len()` in `Index::build`, and its starts come
+    /// from the scanner, which emits them ascending and each below that length. A cached index
+    /// is accepted by `Index::decode` only when its fingerprint, which includes the length,
+    /// matches the mapping's, and `validate_starts` has checked that its starts ascend with the
+    /// last one below `end`.
+    pub(crate) fn rows(
+        &self,
+        positions: Range<usize>,
+    ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
+        let end = positions.end.min(self.len());
+        let start = positions.start.min(end);
+        (start..end).map(|position| {
+            let (span, raw) = self.row(position);
+            (position, span, raw)
+        })
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "a read-only map is sound while the file is neither written nor truncated, which \
+              is the documented contract of Mailbox and of every Message borrowed from it"
+)]
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "the safety argument is the reason on the unsafe_code expectation; the crate keeps \
+              code free of comments"
+)]
+/// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`].
+fn map_read_only(file: &File) -> io::Result<Mmap> {
+    unsafe { Mmap::map(file) }
 }
 
 #[cfg(test)]
