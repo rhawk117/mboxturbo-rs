@@ -1,6 +1,7 @@
 //! Errors raised while opening mailboxes and reading or writing index files.
 
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// Why an index file was rejected.
@@ -88,8 +89,10 @@ pub enum MboxturboError {
         path: PathBuf,
     },
     /// Extracted columns could not be assembled into an Arrow batch.
-    #[error("cannot assemble an Arrow batch")]
+    #[error("cannot assemble an Arrow batch for messages {}..{}", positions.start, positions.end)]
     Arrow {
+        /// The message positions the failed batch covered, clamped to those that exist.
+        positions: Range<usize>,
         /// The Arrow failure.
         #[source]
         source: arrow_schema::ArrowError,

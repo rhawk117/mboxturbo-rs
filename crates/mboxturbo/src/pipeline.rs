@@ -8,7 +8,7 @@ use std::panic::resume_unwind;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
-use std::thread;
+use std::{iter, thread};
 
 use arrow_array::builder::{
     Int32Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, UInt64Builder,
@@ -89,7 +89,8 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// [`MboxturboError::Arrow`] if the columns cannot be assembled into a batch.
+    /// [`MboxturboError::Arrow`], naming the clamped positions, if the columns cannot be
+    /// assembled into a batch.
     pub fn extract(
         &self,
         mailbox: &Mailbox,
@@ -102,7 +103,7 @@ impl Pipeline {
             .iter()
             .map(|column| Slot::new(column, positions.len()))
             .collect();
-        for position in positions {
+        for position in positions.clone() {
             let Some(span) = mailbox.index().span(position) else {
                 continue;
             };
@@ -119,7 +120,7 @@ impl Pipeline {
         }
         let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
         RecordBatch::try_new(self.schema(), arrays)
-            .map_err(|source| MboxturboError::Arrow { source })
+            .map_err(|source| MboxturboError::Arrow { positions, source })
     }
 
     /// Streams batches over the whole mailbox, extracting several batches in parallel at a time.
@@ -183,12 +184,13 @@ impl Pipeline {
         let mut writer =
             ArrowWriter::try_new(file, self.schema(), Some(properties)).map_err(parquet_error)?;
         let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
-        let mut reader = self.reader(mailbox);
+        let mut batches = self.reader(mailbox);
+        let mut reader = iter::from_fn(move || batches.next_batch());
         let produced = thread::scope(|scope| {
             let reader_thread =
                 scope.spawn(move || reader.try_for_each(|batch| sender.send(batch).map_err(drop)));
-            let rows = receiver.into_iter().try_fold(0_u64, |rows, batch| {
-                let batch = batch.map_err(|source| MboxturboError::Arrow { source })?;
+            let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
+                let batch = received?;
                 writer.write(&batch).map_err(parquet_error)?;
                 Ok::<u64, MboxturboError>(rows.saturating_add(widen(batch.num_rows())))
             });
@@ -276,13 +278,12 @@ pub struct BatchReader {
     pipeline: Arc<Pipeline>,
     mailbox: Arc<Mailbox>,
     next: usize,
-    ready: VecDeque<Result<RecordBatch, ArrowError>>,
+    ready: VecDeque<Result<RecordBatch, MboxturboError>>,
 }
 
-impl Iterator for BatchReader {
-    type Item = Result<RecordBatch, ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl BatchReader {
+    /// The next batch, keeping the typed error so callers can read the positions it covers.
+    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxturboError>> {
         if self.ready.is_empty() {
             let window = self.pipeline.window(self.next, &self.mailbox);
             self.next = window.last().map_or(self.next, |last| last.end);
@@ -290,15 +291,20 @@ impl Iterator for BatchReader {
                 .prefetch(self.next..self.next.saturating_add(self.pipeline.batch_size));
             let extracted: Vec<_> = window
                 .into_par_iter()
-                .map(|positions| {
-                    self.pipeline
-                        .extract(&self.mailbox, positions)
-                        .map_err(|error| ArrowError::ExternalError(Box::new(error)))
-                })
+                .map(|positions| self.pipeline.extract(&self.mailbox, positions))
                 .collect();
             self.ready.extend(extracted);
         }
         self.ready.pop_front()
+    }
+}
+
+impl Iterator for BatchReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch()
+            .map(|batch| batch.map_err(|error| ArrowError::ExternalError(Box::new(error))))
     }
 }
 
