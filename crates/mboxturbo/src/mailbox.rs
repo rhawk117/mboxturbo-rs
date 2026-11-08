@@ -21,7 +21,9 @@ use crate::message::Message;
 /// from it, is alive.
 #[derive(Debug)]
 pub struct Mailbox {
+    /// The read-only mapping, shared with every [`Message`] taken from this mailbox.
     contents: Arc<Mmap>,
+    /// Start offsets of the messages within `contents`.
     index: Index,
 }
 
@@ -37,15 +39,27 @@ pub struct ParsedBatch {
     pub unparsed: Vec<usize>,
 }
 
+/// A mapped file with its fingerprint, before an index is attached.
 #[derive(Debug)]
 struct Mapped {
+    /// The read-only mapping of the whole file.
     contents: Mmap,
+    /// Identity of the mapped bytes, which a cached index must match to be reused.
     fingerprint: Fingerprint,
 }
 
 impl Mapped {
+    /// Opens and maps `path`, fingerprinting what was mapped.
+    ///
+    /// Fails with [`MboxturboError::Io`] when the file cannot be opened or mapped.
     fn open(path: &Path) -> Result<Self, MboxturboError> {
         let file = File::open(path).map_err(|source| MboxturboError::io(path, source))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a missing modification time becomes mtime 0: the length and sample hash in \
+                      the fingerprint still guard a cached index, and a platform or filesystem \
+                      without mtime support must still open"
+        )]
         let modified = file
             .metadata()
             .and_then(|metadata| metadata.modified())
@@ -58,6 +72,7 @@ impl Mapped {
         })
     }
 
+    /// Builds a fresh index over the mapping.
     fn into_indexed(self) -> Mailbox {
         let index = Index::build(&self.contents, self.fingerprint);
         Mailbox {
@@ -66,6 +81,7 @@ impl Mapped {
         }
     }
 
+    /// Attaches an index that was already validated against this mapping's fingerprint.
     fn with_index(self, index: Index) -> Mailbox {
         Mailbox {
             contents: Arc::new(self.contents),
@@ -84,6 +100,7 @@ impl Mapped {
     reason = "the safety argument is the reason on the unsafe_code expectation; the crate keeps \
               code free of comments"
 )]
+/// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`].
 fn map_read_only(file: &File) -> io::Result<Mmap> {
     unsafe { Mmap::map(file) }
 }
@@ -94,7 +111,10 @@ impl Mailbox {
     /// # Errors
     ///
     /// [`MboxturboError::Io`] when the file cannot be opened or mapped.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, MboxturboError> {
+    pub fn open<P>(path: P) -> Result<Self, MboxturboError>
+    where
+        P: AsRef<Path>,
+    {
         Ok(Mapped::open(path.as_ref())?.into_indexed())
     }
 
@@ -106,17 +126,18 @@ impl Mailbox {
     /// [`MboxturboError::Io`] when either file cannot be read or the new index cannot be written,
     /// and [`MboxturboError::CorruptIndex`] when `index_path` exists but fails validation; a
     /// corrupt file is left in place for inspection rather than overwritten.
-    pub fn open_cached(
-        path: impl AsRef<Path>,
-        index_path: impl AsRef<Path>,
-    ) -> Result<Self, MboxturboError> {
-        let index_path = index_path.as_ref();
+    pub fn open_cached<P, Q>(path: P, index_path: Q) -> Result<Self, MboxturboError>
+    where
+        P: AsRef<Path>,
+        Q: AsRef<Path>,
+    {
+        let cache_file = index_path.as_ref();
         let mapped = Mapped::open(path.as_ref())?;
-        match Index::load(index_path, mapped.fingerprint) {
+        match Index::load(cache_file, mapped.fingerprint) {
             Ok(index) => Ok(mapped.with_index(index)),
             Err(error) if error.calls_for_rebuild() => {
                 let mailbox = mapped.into_indexed();
-                mailbox.index.save(index_path)?;
+                mailbox.index.save(cache_file)?;
                 Ok(mailbox)
             },
             Err(error) => Err(error),
@@ -172,8 +193,11 @@ impl Mailbox {
     /// The span and raw bytes of the message at `position`, which must be below `len()`.
     #[expect(
         clippy::expect_used,
-        reason = "`position` is below `len()`, so the index has a span for it, and a validated \
-                  index keeps every span inside the mapping, which is `contents.len()` long"
+        reason = "`position` is below `len()`, so the index has a span for it, and every index in \
+                  use keeps its spans inside the mapping: `Index::build` takes `end` from \
+                  `contents.len()` and emits ascending starts below it, and `Index::decode` \
+                  accepts a cached index only on a matching fingerprint and after \
+                  `validate_starts` checked its starts"
     )]
     fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
         let span = self
@@ -190,7 +214,7 @@ impl Mailbox {
     /// Raw bytes of every message, in file order.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
-        (0..self.len()).map(|position| self.raw(position).unwrap_or_default())
+        (0..self.len()).map(|position| self.row(position).1)
     }
 
     /// Raw bytes of every message, split across rayon threads.
@@ -198,7 +222,7 @@ impl Mailbox {
     pub fn par_iter(&self) -> impl IndexedParallelIterator<Item = &[u8]> {
         (0..self.len())
             .into_par_iter()
-            .map(|position| self.raw(position).unwrap_or_default())
+            .map(|position| self.row(position).1)
     }
 
     /// The message at `position`, parsed lazily on first field access.
@@ -243,5 +267,72 @@ impl Mailbox {
         if let Some(span) = self.index.span_of(positions) {
             hint::read_ahead(&self.contents, span);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use tempfile::NamedTempFile;
+
+    use super::Mailbox;
+
+    const MBOX: &[u8] = b"From a@x Mon Jan  1 00:00:00 2024\nSubject: one\n\nfirst\n\
+From b@x Mon Jan  1 00:00:01 2024\nSubject: two\n\nsecond\n\
+From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
+
+    fn three_message_mailbox() -> (NamedTempFile, Mailbox) {
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        file.write_all(MBOX).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(file.path()).expect("fixture mbox opens");
+        (file, mailbox)
+    }
+
+    #[test]
+    fn rows_in_range_yield_one_row_per_position_with_its_span_and_bytes() {
+        let (_file, mailbox) = three_message_mailbox();
+        let rows: Vec<_> = mailbox.rows(0..3).collect();
+        let positions: Vec<usize> = rows.iter().map(|(position, ..)| *position).collect();
+        assert_eq!(positions, [0, 1, 2], "one row per position, in order");
+        let spans: Vec<_> = rows.iter().map(|(_, span, _)| span.clone()).collect();
+        let indexed: Vec<_> = (0..3)
+            .filter_map(|position| mailbox.index().span(position))
+            .collect();
+        assert_eq!(
+            spans, indexed,
+            "each row span is the index span for its position"
+        );
+        let row_bytes: Vec<&[u8]> = rows.iter().map(|(_, _, raw)| *raw).collect();
+        let file_bytes: Vec<&[u8]> = spans.iter().map(|span| &MBOX[span.clone()]).collect();
+        assert_eq!(
+            row_bytes, file_bytes,
+            "each row holds the file bytes under its span"
+        );
+        assert_eq!(
+            (spans[0].start, spans[2].end),
+            (0, MBOX.len()),
+            "the rows cover the file from its first byte to its last",
+        );
+    }
+
+    #[test]
+    fn rows_past_the_end_are_clamped_to_the_messages_that_exist() {
+        let (_file, mailbox) = three_message_mailbox();
+        let positions: Vec<usize> = mailbox
+            .rows(1..10)
+            .map(|(position, _span, _raw)| position)
+            .collect();
+        assert_eq!(positions, [1, 2], "only positions 1 and 2 exist in 1..10");
+    }
+
+    #[test]
+    fn rows_starting_past_the_end_yield_nothing() {
+        let (_file, mailbox) = three_message_mailbox();
+        assert_eq!(
+            mailbox.rows(5..9).count(),
+            0,
+            "a range wholly beyond the last message has no rows",
+        );
     }
 }
