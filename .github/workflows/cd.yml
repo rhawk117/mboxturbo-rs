@@ -44,12 +44,12 @@ jobs:
   continuous-integration:
     name: 🔁 Run CI Pipeline
     needs: [release-guard]
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] remove once actionlint supports '$/' (rhysd/actionlint#711)
     permissions:
-      contents: read
-      actions: read
-      pull-requests: write
-      security-events: write
+      contents: read # called ci.yml checks out the repository
+      actions: read # called ci.yml jobs read workflow run data (narrator, code scanning upload)
+      pull-requests: write # called ci.yml labeler and narrator write PR labels and comments
+      security-events: write # called ci.yml supply chain audit uploads SARIF to code scanning
 
   prepare-release:
     name: 🚀 Prepare Release
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: write # release.sh pushes the release commit and tag
     outputs:
       version: ${{ steps.prepare.outputs.version }}
       tag: ${{ steps.prepare.outputs.tag }}
@@ -88,7 +88,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
-      contents: read
+      contents: read # checkout
     strategy:
       fail-fast: false
       matrix:
@@ -131,7 +131,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: write # gh release create and upload manage the GitHub Release
     steps:
       - name: Download Wheels
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0

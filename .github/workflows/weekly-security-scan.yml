@@ -16,9 +16,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: read
-      actions: read
-      security-events: write
+      contents: read # checkout and code scanning upload
+      actions: read # code scanning upload on private repositories (pysentry action)
+      security-events: write # pysentry action uploads SARIF to code scanning
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,7 +32,7 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Audit Dependencies
-        uses: ./.github/actions/pysentry
+        uses: ./.github/actions/pysentry # zizmor: ignore[self-repository] remove once actionlint supports '$/' (rhysd/actionlint#711)
         with:
           uv-version: ${{ vars.UV_VERSION }}
           project-directory: .
@@ -64,9 +64,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      contents: read
-      actions: read
-      issues: write
+      contents: read # checkout
+      actions: read # gh run download fetches the audit artifacts
+      issues: write # report-security.sh opens, updates and closes the security issue
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
