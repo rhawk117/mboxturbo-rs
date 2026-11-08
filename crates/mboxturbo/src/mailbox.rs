@@ -91,6 +91,13 @@ impl Mapped {
 }
 
 impl Mailbox {
+    /// Narrows `positions` to the messages that exist. A range that starts past the end becomes
+    /// empty and sits at the end, never inverted.
+    pub(crate) fn clamped(&self, positions: Range<usize>) -> Range<usize> {
+        let end = positions.end.min(self.len());
+        positions.start.min(end)..end
+    }
+
     /// The message index.
     #[must_use]
     pub const fn index(&self) -> &Index {
@@ -177,12 +184,13 @@ impl Mailbox {
     /// produced nothing.
     #[must_use]
     pub fn parse_batch(&self, positions: Range<usize>) -> ParsedBatch {
-        let end = positions.end.min(self.len());
-        let parsed: Vec<(usize, bool, Message)> = (positions.start.min(end)..end)
+        let parsed: Vec<(usize, bool, Message)> = self
+            .clamped(positions)
             .into_par_iter()
-            .filter_map(|position| {
-                let message = self.message(position)?;
-                Some((position, message.parse(), message))
+            .map(|position| {
+                let (span, _raw) = self.row(position);
+                let message = Message::new(Arc::clone(&self.contents), span);
+                (position, message.parse(), message)
             })
             .collect();
         let mut batch = ParsedBatch {
@@ -246,9 +254,7 @@ impl Mailbox {
         &self,
         positions: Range<usize>,
     ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
-        let end = positions.end.min(self.len());
-        let start = positions.start.min(end);
-        (start..end).map(|position| {
+        self.clamped(positions).map(|position| {
             let (span, raw) = self.row(position);
             (position, span, raw)
         })
@@ -260,13 +266,10 @@ impl Mailbox {
     reason = "a read-only map is sound while the file is neither written nor truncated, which \
               is the documented contract of Mailbox and of every Message borrowed from it"
 )]
-#[expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "the safety argument is the reason on the unsafe_code expectation; the crate keeps \
-              code free of comments"
-)]
 /// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`].
 fn map_read_only(file: &File) -> io::Result<Mmap> {
+    // SAFETY: a read-only map is sound while the file is neither written nor truncated, which
+    // is the documented contract of `Mailbox` and of every `Message` borrowed from it.
     unsafe { Mmap::map(file) }
 }
 
@@ -314,6 +317,24 @@ From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
             (0, MBOX.len()),
             "the rows cover the file from its first byte to its last",
         );
+    }
+
+    #[test]
+    fn positions_past_the_end_are_clamped_to_the_messages_that_exist() {
+        let (_file, mailbox) = three_message_mailbox();
+        assert_eq!(mailbox.clamped(1..99), 1..3, "end is cut to the length");
+    }
+
+    #[test]
+    fn a_range_starting_past_the_end_becomes_empty_at_the_end() {
+        let (_file, mailbox) = three_message_mailbox();
+        assert_eq!(mailbox.clamped(9..12), 3..3, "start must not exceed end");
+    }
+
+    #[test]
+    fn positions_inside_the_mailbox_are_unchanged() {
+        let (_file, mailbox) = three_message_mailbox();
+        assert_eq!(mailbox.clamped(1..2), 1..2, "in-range input is kept");
     }
 
     #[test]

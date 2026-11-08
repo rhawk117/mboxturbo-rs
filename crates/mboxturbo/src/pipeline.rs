@@ -144,7 +144,7 @@ impl Pipeline {
         mailbox: &Mailbox,
         positions: Range<usize>,
     ) -> Result<RecordBatch, MboxTurboError> {
-        let clamped = clamp_positions(positions, mailbox.len());
+        let clamped = mailbox.clamped(positions);
         let mut slots: Vec<Slot> = self
             .columns
             .iter()
@@ -503,13 +503,6 @@ fn text_list() -> ListBuilder<StringBuilder> {
     ListBuilder::new(StringBuilder::new())
 }
 
-/// Narrows `positions` to the messages that exist in a mailbox of `len` messages. A range that
-/// starts past the end becomes empty and sits at the end, never inverted.
-fn clamp_positions(positions: Range<usize>, len: usize) -> Range<usize> {
-    let end = positions.end.min(len);
-    positions.start.min(end)..end
-}
-
 /// Sends `batches` to `sender` in order until they run out or the receiver is gone.
 fn forward_batches(
     batches: impl Iterator<Item = Result<RecordBatch, MboxTurboError>>,
@@ -691,9 +684,8 @@ mod tests {
 
     use super::{
         AddressHeader, AttachmentSlot, Depth, Pipeline, Slot, append_addresses,
-        append_header_values, clamp_positions, date_micros, date_offset_minutes, depth_for,
-        first_header_value, forward_batches, header_form, html_body, joined, text_body,
-        utc_timestamps,
+        append_header_values, date_micros, date_offset_minutes, depth_for, first_header_value,
+        forward_batches, header_form, html_body, joined, text_body, utc_timestamps,
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
@@ -732,21 +724,6 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![0; rows]))])
             .expect("fixture batch matches its schema")
-    }
-
-    #[test]
-    fn positions_past_the_end_are_clamped_to_the_messages_that_exist() {
-        assert_eq!(clamp_positions(2..99, 5), 2..5, "end is cut to the length");
-    }
-
-    #[test]
-    fn a_range_starting_past_the_end_becomes_empty_at_the_end() {
-        assert_eq!(clamp_positions(9..12, 5), 5..5, "start must not exceed end");
-    }
-
-    #[test]
-    fn positions_inside_the_mailbox_are_unchanged() {
-        assert_eq!(clamp_positions(1..3, 5), 1..3, "in-range input is kept");
     }
 
     #[test]
