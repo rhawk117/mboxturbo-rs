@@ -55,3 +55,6 @@ cache-keys = [
 [build-system]
 requires = ["maturin>=1.16,<2.0"]
 build-backend = "maturin"
+
+[tool.ty.environment]
+root = ["crates/mboxturbo-py/src"]
