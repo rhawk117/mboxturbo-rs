@@ -32,7 +32,12 @@ multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
-skip = []
+skip = [
+    { crate = "getrandom@0.2.17", reason = "older of three; pulled by arrow-array/parquet -> ahash 0.8.12 -> const-random -> const-random-macro; newest 0.4.3 stays checked" },
+    { crate = "getrandom@0.3.4", reason = "older of three; pulled by arrow-array/parquet -> ahash 0.8.12; newest 0.4.3 (tempfile, proptest -> rand, parquet -> zstd -> cc -> jobserver) stays checked" },
+    { crate = "r-efi@5.3.0", reason = "older of two; pulled by getrandom 0.3.4 via arrow-array/parquet -> ahash 0.8.12; newest 6.0.0 (via getrandom 0.4.3) stays checked" },
+    { crate = "syn@2.0.119", reason = "older of two; pulled by arrow-array/parquet -> chrono -> iana-time-zone -> windows-core -> windows-implement/windows-interface, and arrow-array/parquet -> ahash/half -> zerocopy -> zerocopy-derive; newest 3.0.9 (mail-parser -> hashify, pyo3 -> pyo3-macros, thiserror -> thiserror-impl) stays checked" },
+]
 skip-tree = []
 
 [sources]
