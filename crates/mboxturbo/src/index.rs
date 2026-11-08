@@ -25,12 +25,12 @@ const WORD: usize = 8;
 /// Byte offset of every message in one mailbox, tied to that mailbox by its [`Fingerprint`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
-    /// Offset where each message starts, strictly increasing and all below `end`.
-    starts: Box<[usize]>,
     /// Mailbox length in bytes, where the last message stops.
     end: usize,
     /// Identity of the mailbox the offsets were computed from.
     fingerprint: Fingerprint,
+    /// Offset where each message starts, strictly increasing and all below `end`.
+    starts: Box<[usize]>,
 }
 
 /// Why a stored index was not accepted; [`Rejection::at`] attaches the file path.
@@ -75,22 +75,56 @@ impl Index {
         }
     }
 
-    /// Number of messages.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.starts.len()
+    /// Parses and validates `bytes`, accepting it only for the mailbox `expected` identifies.
+    ///
+    /// Every length and offset comes from the file, so each is checked before use; nothing here
+    /// panics on malformed input.
+    fn decode(bytes: &[u8], expected: Fingerprint) -> Result<Self, Rejection> {
+        let (body, checksum) = bytes
+            .split_last_chunk::<WORD>()
+            .ok_or_else(|| truncated(WORD, bytes.len()))?;
+        let after_version = check_signature_and_version(body)?;
+        if xxh3_64(body) != u64::from_le_bytes(*checksum) {
+            return Err(Corruption::Checksum.into());
+        }
+        let (stored, after_fingerprint) = take_fingerprint(after_version)?;
+        if stored != expected {
+            return Err(Rejection::Stale);
+        }
+        let (count, offsets) = take_u64(after_fingerprint)?;
+        let starts = decode_starts(offsets, count)?;
+        let end = narrow(stored.len()).ok_or(Corruption::Bounds {
+            position: None,
+            offset: stored.len(),
+        })?;
+        validate_starts(&starts, end)?;
+        Ok(Self {
+            starts,
+            end,
+            fingerprint: stored,
+        })
     }
 
-    /// Whether the mailbox holds no messages.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.starts.is_empty()
-    }
-
-    /// Byte offset where each message starts, in file order.
-    #[must_use]
-    pub const fn starts(&self) -> &[usize] {
-        &self.starts
+    /// The on-disk form: header, little-endian offsets, then an xxh3 checksum of all before it.
+    fn encode(&self) -> Vec<u8> {
+        let offsets_len = self.starts.len().saturating_mul(WORD);
+        let mut out =
+            Vec::with_capacity(HEADER_LEN.saturating_add(offsets_len).saturating_add(WORD));
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&self.fingerprint.len().to_le_bytes());
+        out.extend_from_slice(&self.fingerprint.modified_nanos().to_le_bytes());
+        out.extend_from_slice(&self.fingerprint.sample_hash().to_le_bytes());
+        out.extend_from_slice(&widen(self.starts.len()).to_le_bytes());
+        out.extend(
+            self.starts
+                .iter()
+                .flat_map(|&start| widen(start).to_le_bytes()),
+        );
+        let checksum = xxh3_64(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
     }
 
     /// Identity of the mailbox this index describes.
@@ -99,23 +133,28 @@ impl Index {
         self.fingerprint
     }
 
-    /// Byte range of the message at `position`, or `None` past the last message.
+    /// Whether the mailbox holds no messages.
     #[must_use]
-    pub fn span(&self, position: usize) -> Option<Range<usize>> {
-        let mut following = self.starts.get(position..)?.iter().copied();
-        let start = following.next()?;
-        Some(start..following.next().unwrap_or(self.end))
+    pub const fn is_empty(&self) -> bool {
+        self.starts.is_empty()
     }
 
-    /// Byte range covering the messages at `positions`, clamped to the messages that exist.
+    /// Number of messages.
     #[must_use]
-    pub fn span_of(&self, positions: Range<usize>) -> Option<Range<usize>> {
-        let first = self.span(positions.start)?;
-        let last = positions
-            .end
-            .checked_sub(1)
-            .and_then(|end| self.span(end.min(self.len().checked_sub(1)?)))?;
-        (first.start < last.end).then_some(first.start..last.end)
+    pub const fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// Reads an index from `path` and checks it was built for the mailbox `expected` identifies.
+    ///
+    /// # Errors
+    ///
+    /// [`MboxturboError::Io`] when the file cannot be read, [`MboxturboError::CorruptIndex`] when
+    /// it fails validation, and [`MboxturboError::StaleIndex`] when it belongs to a different
+    /// mailbox than `expected`.
+    pub fn load(path: &Path, expected: Fingerprint) -> Result<Self, MboxturboError> {
+        let bytes = fs::read(path).map_err(|source| MboxturboError::io(path, source))?;
+        Self::decode(&bytes, expected).map_err(|rejection| rejection.at(path))
     }
 
     /// Writes the index to `path` atomically: readers see the old file or the new one, never a
@@ -145,68 +184,29 @@ impl Index {
         Ok(())
     }
 
-    /// Reads an index from `path` and checks it was built for the mailbox `expected` identifies.
-    ///
-    /// # Errors
-    ///
-    /// [`MboxturboError::Io`] when the file cannot be read, [`MboxturboError::CorruptIndex`] when
-    /// it fails validation, and [`MboxturboError::StaleIndex`] when it belongs to a different
-    /// mailbox than `expected`.
-    pub fn load(path: &Path, expected: Fingerprint) -> Result<Self, MboxturboError> {
-        let bytes = fs::read(path).map_err(|source| MboxturboError::io(path, source))?;
-        Self::decode(&bytes, expected).map_err(|rejection| rejection.at(path))
+    /// Byte range of the message at `position`, or `None` past the last message.
+    #[must_use]
+    pub fn span(&self, position: usize) -> Option<Range<usize>> {
+        let mut following = self.starts.get(position..)?.iter().copied();
+        let start = following.next()?;
+        Some(start..following.next().unwrap_or(self.end))
     }
 
-    /// The on-disk form: header, little-endian offsets, then an xxh3 checksum of all before it.
-    fn encode(&self) -> Vec<u8> {
-        let offsets_len = self.starts.len().saturating_mul(WORD);
-        let mut out =
-            Vec::with_capacity(HEADER_LEN.saturating_add(offsets_len).saturating_add(WORD));
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.len().to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.modified_nanos().to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.sample_hash().to_le_bytes());
-        out.extend_from_slice(&widen(self.starts.len()).to_le_bytes());
-        out.extend(
-            self.starts
-                .iter()
-                .flat_map(|&start| widen(start).to_le_bytes()),
-        );
-        let checksum = xxh3_64(&out);
-        out.extend_from_slice(&checksum.to_le_bytes());
-        out
+    /// Byte range covering the messages at `positions`, clamped to the messages that exist.
+    #[must_use]
+    pub fn span_of(&self, positions: Range<usize>) -> Option<Range<usize>> {
+        let first = self.span(positions.start)?;
+        let last = positions
+            .end
+            .checked_sub(1)
+            .and_then(|end| self.span(end.min(self.len().checked_sub(1)?)))?;
+        (first.start < last.end).then_some(first.start..last.end)
     }
 
-    /// Parses and validates `bytes`, accepting it only for the mailbox `expected` identifies.
-    ///
-    /// Every length and offset comes from the file, so each is checked before use; nothing here
-    /// panics on malformed input.
-    fn decode(bytes: &[u8], expected: Fingerprint) -> Result<Self, Rejection> {
-        let (body, checksum) = bytes
-            .split_last_chunk::<WORD>()
-            .ok_or_else(|| truncated(WORD, bytes.len()))?;
-        let after_version = check_signature_and_version(body)?;
-        if xxh3_64(body) != u64::from_le_bytes(*checksum) {
-            return Err(Corruption::Checksum.into());
-        }
-        let (stored, after_fingerprint) = take_fingerprint(after_version)?;
-        if stored != expected {
-            return Err(Rejection::Stale);
-        }
-        let (count, offsets) = take_u64(after_fingerprint)?;
-        let starts = decode_starts(offsets, count)?;
-        let end = narrow(stored.len()).ok_or(Corruption::Bounds {
-            position: None,
-            offset: stored.len(),
-        })?;
-        validate_starts(&starts, end)?;
-        Ok(Self {
-            starts,
-            end,
-            fingerprint: stored,
-        })
+    /// Byte offset where each message starts, in file order.
+    #[must_use]
+    pub const fn starts(&self) -> &[usize] {
+        &self.starts
     }
 }
 

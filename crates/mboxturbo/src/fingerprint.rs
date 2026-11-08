@@ -25,6 +25,33 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// Rebuilds a fingerprint from the three values an index file stores for it.
+    pub(crate) const fn from_parts(len: u64, modified_nanos: i128, sample_hash: u64) -> Self {
+        Self {
+            len,
+            modified_nanos,
+            sample_hash,
+        }
+    }
+
+    /// Whether the fingerprinted mailbox was empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Length in bytes of the fingerprinted mailbox.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Nanoseconds from the Unix epoch to the mailbox's modification time, negative before it
+    /// and 0 when the time was unknown.
+    pub(crate) const fn modified_nanos(&self) -> i128 {
+        self.modified_nanos
+    }
+
     /// Fingerprints mailbox `contents` last modified at `modified`, if known.
     #[must_use]
     pub fn new(contents: &[u8], modified: Option<SystemTime>) -> Self {
@@ -35,36 +62,9 @@ impl Fingerprint {
         }
     }
 
-    /// Rebuilds a fingerprint from the three values an index file stores for it.
-    pub(crate) const fn from_parts(len: u64, modified_nanos: i128, sample_hash: u64) -> Self {
-        Self {
-            len,
-            modified_nanos,
-            sample_hash,
-        }
-    }
-
-    /// Nanoseconds from the Unix epoch to the mailbox's modification time, negative before it
-    /// and 0 when the time was unknown.
-    pub(crate) const fn modified_nanos(&self) -> i128 {
-        self.modified_nanos
-    }
-
     /// Hash of the mailbox length and its first and last 4 KiB.
     pub(crate) const fn sample_hash(&self) -> u64 {
         self.sample_hash
-    }
-
-    /// Length in bytes of the fingerprinted mailbox.
-    #[must_use]
-    pub const fn len(&self) -> u64 {
-        self.len
-    }
-
-    /// Whether the fingerprinted mailbox was empty.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
 
