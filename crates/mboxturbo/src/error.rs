@@ -17,14 +17,46 @@ pub enum Corruption {
     #[error("checksum mismatch")]
     Checksum,
     /// The file is shorter or longer than its header declares.
-    #[error("length does not match the declared message count")]
-    Length,
+    #[error("index holds {actual} bytes where {declared} are called for")]
+    Length {
+        /// Bytes the header or the format calls for at the point of failure: the next field's
+        /// width, or the offset table's size implied by the declared message count.
+        declared: u64,
+        /// Bytes actually present at that point.
+        actual: u64,
+    },
     /// Message offsets are not strictly increasing.
-    #[error("message offsets are not strictly increasing")]
-    Order,
-    /// A message offset points past the end of the mailbox.
-    #[error("a message offset points past the end of the mailbox")]
-    Bounds,
+    #[error(
+        "message {position} starts at offset {offset}, not after the previous message's {previous}"
+    )]
+    Order {
+        /// Position of the first message whose start does not exceed the previous start.
+        position: usize,
+        /// The start offset stored for that message.
+        offset: usize,
+        /// The start offset of the message before it.
+        previous: usize,
+    },
+    /// A message offset points past the end of the mailbox, or the mailbox length does not fit
+    /// in memory.
+    #[error("{}", describe_bounds(*position, *offset))]
+    Bounds {
+        /// Position of the message with the offending offset; `None` when the offender is the
+        /// mailbox length itself.
+        position: Option<usize>,
+        /// The offending byte offset, or the mailbox length when `position` is `None`.
+        offset: u64,
+    },
+}
+
+/// Renders the [`Corruption::Bounds`] message, naming the message position when there is one.
+fn describe_bounds(position: Option<usize>, offset: u64) -> String {
+    position.map_or_else(
+        || format!("mailbox length {offset} does not fit in memory"),
+        |message| {
+            format!("message {message} starts at offset {offset}, past the end of the mailbox")
+        },
+    )
 }
 
 /// Everything that can go wrong opening a mailbox or handling its index.

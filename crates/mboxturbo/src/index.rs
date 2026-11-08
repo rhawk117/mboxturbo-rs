@@ -165,7 +165,9 @@ impl Index {
     }
 
     fn decode(bytes: &[u8], expected: Fingerprint) -> Result<Self, Rejection> {
-        let (body, checksum) = bytes.split_last_chunk::<WORD>().ok_or(Corruption::Length)?;
+        let (body, checksum) = bytes
+            .split_last_chunk::<WORD>()
+            .ok_or_else(|| truncated(WORD, bytes.len()))?;
         let (magic, rest) = body.split_first_chunk::<8>().ok_or(Corruption::Signature)?;
         if *magic != MAGIC {
             return Err(Corruption::Signature.into());
@@ -182,7 +184,9 @@ impl Index {
         }
         let (_reserved, rest) = take_u32(rest)?;
         let (len, rest) = take_u64(rest)?;
-        let (modified, rest) = rest.split_first_chunk::<16>().ok_or(Corruption::Length)?;
+        let (modified, rest) = rest
+            .split_first_chunk::<16>()
+            .ok_or_else(|| truncated(16, rest.len()))?;
         let (sample_hash, rest) = take_u64(rest)?;
         let stored = Fingerprint {
             len,
@@ -194,7 +198,10 @@ impl Index {
         }
         let (count, rest) = take_u64(rest)?;
         let starts = decode_starts(rest, count)?;
-        let end = narrow(len).ok_or(Corruption::Bounds)?;
+        let end = narrow(len).ok_or(Corruption::Bounds {
+            position: None,
+            offset: len,
+        })?;
         validate_starts(&starts, end)?;
         Ok(Self {
             starts,
@@ -204,47 +211,78 @@ impl Index {
     }
 }
 
+/// A [`Corruption::Length`] for a read of `declared` bytes with only `actual` left.
+fn truncated(declared: usize, actual: usize) -> Corruption {
+    Corruption::Length {
+        declared: widen(declared),
+        actual: widen(actual),
+    }
+}
+
 fn take_u32(bytes: &[u8]) -> Result<(u32, &[u8]), Corruption> {
-    let (word, rest) = bytes.split_first_chunk::<4>().ok_or(Corruption::Length)?;
+    let (word, rest) = bytes
+        .split_first_chunk::<4>()
+        .ok_or_else(|| truncated(4, bytes.len()))?;
     Ok((u32::from_le_bytes(*word), rest))
 }
 
 fn take_u64(bytes: &[u8]) -> Result<(u64, &[u8]), Corruption> {
     let (word, rest) = bytes
         .split_first_chunk::<WORD>()
-        .ok_or(Corruption::Length)?;
+        .ok_or_else(|| truncated(WORD, bytes.len()))?;
     Ok((u64::from_le_bytes(*word), rest))
 }
 
 fn decode_starts(bytes: &[u8], count: u64) -> Result<Box<[usize]>, Corruption> {
     let (words, remainder) = bytes.as_chunks::<WORD>();
     if !remainder.is_empty() || widen(words.len()) != count {
-        return Err(Corruption::Length);
+        return Err(Corruption::Length {
+            declared: count.saturating_mul(widen(WORD)),
+            actual: widen(bytes.len()),
+        });
     }
     words
         .iter()
-        .map(|&word| narrow(u64::from_le_bytes(word)).ok_or(Corruption::Bounds))
+        .enumerate()
+        .map(|(position, &word)| {
+            let offset = u64::from_le_bytes(word);
+            narrow(offset).ok_or(Corruption::Bounds {
+                position: Some(position),
+                offset,
+            })
+        })
         .collect()
 }
 
 fn validate_starts(starts: &[usize], end: usize) -> Result<(), Corruption> {
-    if !starts
+    let disordered = starts
         .windows(2)
-        .all(|pair| matches!(pair, [earlier, later] if earlier < later))
-    {
-        return Err(Corruption::Order);
+        .enumerate()
+        .find_map(|(index, pair)| match *pair {
+            [previous, offset] if previous >= offset => Some(Corruption::Order {
+                position: index.saturating_add(1),
+                offset,
+                previous,
+            }),
+            _ => None,
+        });
+    if let Some(corruption) = disordered {
+        return Err(corruption);
     }
-    if starts.last().is_some_and(|&last| last >= end) {
-        return Err(Corruption::Bounds);
+    match starts.last() {
+        Some(&last) if last >= end => Err(Corruption::Bounds {
+            position: Some(starts.len().saturating_sub(1)),
+            offset: widen(last),
+        }),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
-    use super::{HEADER_LEN, Index, Rejection};
+    use super::{HEADER_LEN, Index, Rejection, xxh3_64};
     use crate::error::Corruption;
     use crate::fingerprint::Fingerprint;
 
@@ -327,20 +365,83 @@ mod tests {
         );
     }
 
+    fn resealed(mut body: Vec<u8>) -> Vec<u8> {
+        let checksum = xxh3_64(&body);
+        body.extend_from_slice(&checksum.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn a_file_shorter_than_its_checksum_reports_the_bytes_it_has() {
+        assert!(
+            matches!(
+                rejection(&[0; 3]),
+                Rejection::Corrupt(Corruption::Length {
+                    declared: 8,
+                    actual: 3
+                })
+            ),
+            "three bytes cannot hold a checksum word"
+        );
+    }
+
+    #[test]
+    fn an_offset_table_shorter_than_the_declared_count_reports_both_sizes() {
+        let mut body = built().encode();
+        body.truncate(body.len() - 16);
+        let bytes = resealed(body);
+        assert!(
+            matches!(
+                rejection(&bytes),
+                Rejection::Corrupt(Corruption::Length {
+                    declared: 16,
+                    actual: 8
+                })
+            ),
+            "two offsets are declared and one word is present"
+        );
+    }
+
+    #[test]
+    fn a_start_at_or_past_the_end_names_its_position_and_offset() {
+        let mut body = built().encode();
+        body.truncate(body.len() - 8);
+        let second = HEADER_LEN + 8;
+        let past = u64::try_from(MAILBOX.len()).expect("fixture length fits u64");
+        body[second..second + 8].copy_from_slice(&past.to_le_bytes());
+        let bytes = resealed(body);
+        assert!(
+            matches!(
+                rejection(&bytes),
+                Rejection::Corrupt(Corruption::Bounds {
+                    position: Some(1),
+                    offset
+                }) if offset == past
+            ),
+            "the second start equals the mailbox length"
+        );
+    }
+
     #[test]
     fn rejects_offsets_that_are_out_of_order_even_with_a_valid_checksum() {
         let index = built();
-        let mut bytes = index.encode();
-        bytes.truncate(bytes.len() - 8);
+        let mut body = index.encode();
+        body.truncate(body.len() - 8);
         let first = HEADER_LEN;
         let second = HEADER_LEN + 8;
-        let (head, tail) = bytes.split_at_mut(second);
+        let (head, tail) = body.split_at_mut(second);
         head[first..second].swap_with_slice(&mut tail[..8]);
-        let checksum = xxhash_rust::xxh3::xxh3_64(&bytes);
-        bytes.extend_from_slice(&checksum.to_le_bytes());
+        let bytes = resealed(body);
         assert!(
-            matches!(rejection(&bytes), Rejection::Corrupt(Corruption::Order)),
-            "order"
+            matches!(
+                rejection(&bytes),
+                Rejection::Corrupt(Corruption::Order {
+                    position: 1,
+                    offset: 0,
+                    previous: 27,
+                })
+            ),
+            "the swapped second start is not after the first"
         );
     }
 
