@@ -1,15 +1,7 @@
 # Run with `uv run prek run --all-files`; install the git hooks with `uv run prek install`.
 
-default_install_hook_types = [
-    "pre-commit",
-    "commit-msg",
-    "pre-push",
-]
-default_stages = [
-    "pre-commit",
-    "pre-push",
-    "manual",
-]
+default_install_hook_types = ["pre-commit", "commit-msg", "pre-push"]
+default_stages = ["pre-commit", "pre-push", "manual"]
 fail_fast = false
 exclude = '^(target/|\.venv/|uv\.lock$|Cargo\.lock$)'
 
@@ -24,9 +16,7 @@ id = "end-of-file-fixer"
 
 [[repos.hooks]]
 id = "mixed-line-ending"
-args = [
-    "--fix=lf",
-]
+args = ["--fix=lf"]
 
 [[repos.hooks]]
 id = "fix-byte-order-marker"
@@ -36,10 +26,7 @@ id = "check-merge-conflict"
 
 [[repos.hooks]]
 id = "check-added-large-files"
-args = [
-    "--enforce-all",
-    "--maxkb=256",
-]
+args = ["--enforce-all", "--maxkb=256"]
 
 [[repos.hooks]]
 id = "check-case-conflict"
@@ -76,54 +63,41 @@ id = "check-json"
 
 [[repos.hooks]]
 id = "no-commit-to-branch"
-args = [
-    "--branch",
-    "main",
-]
+args = ["--branch", "main"]
 
 [[repos.hooks]]
 id = "deny-pattern"
 alias = "rust-terse-expect-message"
 name = "rust-tests.md 4: expect messages say what the expectation means"
-args = [
-    '\.expect(_err)?\("[^" ]*( [^" ]*)?"\)',
-]
+args = ['\.expect(_err)?\("[^" ]*( [^" ]*)?"\)']
 files = '^crates/.*\.rs$'
 
 [[repos.hooks]]
 id = "deny-pattern"
 alias = "rust-bare-prop-assert"
 name = "rust-tests.md 4: prop_assert carries a message"
-args = [
-    'prop_assert(_eq|_ne)?!\([^"\n]*\);\s*$',
-]
+args = ['prop_assert(_eq|_ne)?!\([^"\n]*\);\s*$']
 files = '^crates/.*\.rs$'
 
 [[repos.hooks]]
 id = "deny-pattern"
 alias = "rust-display-assertion"
 name = "rust-tests.md 3: assert errors by variant, not Display"
-args = [
-    '\.to_string\(\)\s*\.(contains|starts_with|ends_with)\(',
-]
+args = ['\.to_string\(\)\s*\.(contains|starts_with|ends_with)\(']
 files = '^crates/.*\.rs$'
 
 [[repos.hooks]]
 id = "deny-pattern"
 alias = "rust-name-echo-doc"
 name = "rust.md 5: doc comments state the contract, not the name"
-args = [
-    '^\s*//[/!]\s*[A-Za-z_]+\.?\s*$',
-]
+args = ['^\s*//[/!]\s*[A-Za-z_]+\.?\s*$']
 files = '^crates/.*\.rs$'
 
 [[repos.hooks]]
 id = "deny-pattern"
 alias = "no-todo-markers"
 name = "no TODO, FIXME, XXX or HACK markers: open an issue"
-args = [
-    '\b(TODO|FIXME|XXX|HACK)\b',
-]
+args = ['\b(TODO|FIXME|XXX|HACK)\b']
 exclude = '^prek\.toml$'
 
 [[repos.hooks]]
@@ -134,9 +108,7 @@ args = [
     "--multiline",
     '\A((build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)\([a-z0-9][a-z0-9-]*\)!?: \S|Merge |Revert "|fixup! |squash! |amend! )',
 ]
-stages = [
-    "commit-msg",
-]
+stages = ["commit-msg"]
 
 [[repos]]
 repo = "local"
@@ -188,40 +160,28 @@ language = "system"
 entry = "cargo test --workspace --all-features --locked"
 files = '(\.rs|Cargo\.toml|Cargo\.lock)$'
 pass_filenames = false
-stages = [
-    "pre-push",
-    "manual",
-]
+stages = ["pre-push", "manual"]
 
 [[repos.hooks]]
 id = "ruff-format"
 name = "ruff format"
 language = "system"
 entry = "uv run --no-sync ruff format --check"
-types_or = [
-    "python",
-    "pyi",
-]
+types_or = ["python", "pyi"]
 
 [[repos.hooks]]
 id = "ruff"
 name = "ruff check"
 language = "system"
 entry = "uv run --no-sync ruff check"
-types_or = [
-    "python",
-    "pyi",
-]
+types_or = ["python", "pyi"]
 
 [[repos.hooks]]
 id = "ty"
 name = "ty check"
 language = "system"
 entry = "uv run --no-sync ty check crates/mboxturbo-py/src crates/mboxturbo-py/tests"
-types_or = [
-    "python",
-    "pyi",
-]
+types_or = ["python", "pyi"]
 pass_filenames = false
 
 [[repos.hooks]]
@@ -231,46 +191,35 @@ language = "system"
 entry = "uv run pytest -q"
 files = '(\.py|\.pyi|\.rs|Cargo\.toml|pyproject\.toml)$'
 pass_filenames = false
-stages = [
-    "pre-push",
-    "manual",
-]
+stages = ["pre-push", "manual"]
 
 [[repos.hooks]]
 id = "typos"
 name = "typos"
 language = "system"
 entry = "uv run --no-sync typos --force-exclude"
-types = [
-    "text",
-]
+types = ["text"]
 
 [[repos.hooks]]
 id = "taplo-fmt"
 name = "taplo fmt"
 language = "system"
 entry = "uv run --no-sync taplo fmt --check"
-types = [
-    "toml",
-]
+types = ["toml"]
 
 [[repos.hooks]]
 id = "taplo-lint"
 name = "taplo lint"
 language = "system"
 entry = "uv run --no-sync taplo lint"
-types = [
-    "toml",
-]
+types = ["toml"]
 
 [[repos.hooks]]
 id = "shellcheck"
 name = "shellcheck (all optional checks)"
 language = "system"
 entry = "shellcheck --enable=all --severity=style --external-sources"
-types = [
-    "shell",
-]
+types = ["shell"]
 
 [[repos.hooks]]
 id = "actionlint"

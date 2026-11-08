@@ -8,12 +8,12 @@ mod pipeline {
     use std::sync::Arc;
 
     use arrow_array::RecordBatch;
-    use arrow_array::cast::AsArray;
+    use arrow_array::cast::AsArray as _;
     use arrow_array::types::UInt64Type;
     use mboxturbo::{Column, Compression, Mailbox, Pipeline};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use proptest::prelude::*;
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest as _, Sha256};
     use tempfile::TempDir;
 
     const MESSAGES: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
@@ -188,15 +188,24 @@ AAEC\n\
         #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
-        fn batches_cover_every_row_in_order_at_any_batch_size(count in 0_usize..60, batch_size in 1_usize..12) {
-            let contents = (0..count).map(|n| format!("From x Mon Jan  1 00:00:00 2024\nSubject: {n}\n\nb\n")).collect::<Vec<_>>().concat();
+        fn batches_cover_every_row_in_order_at_any_batch_size(
+            count in 0_usize..60,
+            batch_size in 1_usize..12,
+        ) {
+            let contents = (0..count)
+                .map(|n| format!("From x Mon Jan  1 00:00:00 2024\nSubject: {n}\n\nb\n"))
+                .collect::<Vec<_>>()
+                .concat();
             let fixture = Fixture::with(&contents);
             let positions: Vec<u64> = fixture
                 .batches(&[Column::Position], batch_size)
                 .iter()
                 .flat_map(|batch| batch.column(0).as_primitive::<UInt64Type>().values().to_vec())
                 .collect();
-            prop_assert_eq!(positions, (0..count).map(|n| u64::try_from(n).unwrap()).collect::<Vec<_>>());
+            prop_assert_eq!(
+                positions,
+                (0..count).map(|n| u64::try_from(n).unwrap()).collect::<Vec<_>>()
+            );
         }
     }
 }

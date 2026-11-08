@@ -118,7 +118,7 @@ impl Mailbox {
                 let mailbox = mapped.into_indexed();
                 mailbox.index.save(index_path)?;
                 Ok(mailbox)
-            }
+            },
             Err(error) => Err(error),
         }
     }

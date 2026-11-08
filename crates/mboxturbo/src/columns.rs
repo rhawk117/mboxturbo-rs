@@ -150,7 +150,7 @@ impl Column {
             Self::Position | Self::Offset | Self::Size => DataType::UInt64,
             Self::Subject | Self::MessageId | Self::ReturnPath | Self::Text | Self::Html => {
                 DataType::Utf8
-            }
+            },
             Self::Date => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             Self::DateOffsetMinutes => DataType::Int32,
             Self::AttachmentSizes => DataType::new_list(DataType::UInt64, true),

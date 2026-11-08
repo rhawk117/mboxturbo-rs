@@ -94,7 +94,7 @@ mod tests {
         #[test]
         fn matches_a_line_by_line_scan_at_every_segment_size(
             contents in mbox_fragments(),
-            segment_len in 1usize..48,
+            segment_len in 1_usize..48,
         ) {
             prop_assert_eq!(
                 find_message_starts_in_segments(&contents, segment_len),

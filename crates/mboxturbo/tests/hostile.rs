@@ -33,7 +33,9 @@ mod hostile {
         let _bodies = black_box(message.text_bodies().chain(message.html_bodies()).count());
         let _attachments = message
             .attachments()
-            .map(|attachment| black_box((attachment.data.len(), attachment.content_type().is_some())))
+            .map(|attachment| {
+                black_box((attachment.data.len(), attachment.content_type().is_some()))
+            })
             .count();
         let _raw = black_box(message.raw());
     }

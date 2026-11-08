@@ -20,7 +20,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::columns::Column;
@@ -192,10 +192,7 @@ impl Pipeline {
                 Err(payload) => resume_unwind(payload),
             }
         })?;
-        writer
-            .close()
-            .map(|_metadata| ())
-            .map_err(parquet_error)?;
+        writer.close().map(|_metadata| ()).map_err(parquet_error)?;
         Ok(produced)
     }
 
@@ -239,7 +236,7 @@ fn depth_for(columns: &[Column]) -> Depth {
                 Column::Subject => parser.header(HeaderName::Subject, HeaderForm::Text),
                 Column::Date | Column::DateOffsetMinutes => {
                     parser.header(HeaderName::Date, HeaderForm::Date)
-                }
+                },
                 Column::MessageId => parser.header(HeaderName::MessageId, HeaderForm::MessageIds),
                 Column::Position
                 | Column::Offset
@@ -340,23 +337,23 @@ impl AttachmentSlot {
                     .values()
                     .extend(attachments.map(|attachment| attachment.filename));
                 builder.append(true);
-            }
+            },
             Self::Types(builder) => {
                 builder
                     .values()
                     .extend(attachments.map(|attachment| attachment.content_type()));
                 builder.append(true);
-            }
+            },
             Self::Sizes(builder) => {
                 let sizes = attachments.map(|attachment| Some(widen(attachment.data.len())));
                 builder.values().extend(sizes);
                 builder.append(true);
-            }
+            },
             Self::Sha256(builder) => {
                 let digests = attachments.map(|attachment| Some(sha256_hex(&attachment.data)));
                 builder.values().extend(digests);
                 builder.append(true);
-            }
+            },
         }
     }
 
@@ -364,7 +361,7 @@ impl AttachmentSlot {
         match self {
             Self::Names(builder) | Self::Types(builder) | Self::Sha256(builder) => {
                 Arc::new(builder.finish())
-            }
+            },
             Self::Sizes(builder) => Arc::new(builder.finish()),
         }
     }
@@ -407,18 +404,18 @@ impl Slot {
             Column::Subject => Self::Subject(StringBuilder::new()),
             Column::Date => {
                 Self::Date(TimestampMicrosecondBuilder::with_capacity(rows).with_timezone("UTC"))
-            }
+            },
             Column::DateOffsetMinutes => Self::DateOffset(Int32Builder::with_capacity(rows)),
             Column::MessageId => Self::MessageId(StringBuilder::new()),
             Column::Received => Self::HeaderValues("received".to_owned(), text_list()),
             Column::AuthenticationResults => {
                 Self::HeaderValues("authentication-results".to_owned(), text_list())
-            }
+            },
             Column::ReceivedSpf => Self::HeaderValues("received-spf".to_owned(), text_list()),
             Column::DkimSignature => Self::HeaderValues("dkim-signature".to_owned(), text_list()),
             Column::ReturnPath => {
                 Self::FirstHeaderValue("return-path".to_owned(), StringBuilder::new())
-            }
+            },
             Column::Text => Self::Text(StringBuilder::new()),
             Column::Html => Self::Html(StringBuilder::new()),
             Column::AttachmentNames => Self::Attachments(AttachmentSlot::Names(text_list())),
@@ -443,17 +440,17 @@ impl Slot {
                     .values()
                     .extend(addresses.map(|address| address.email));
                 builder.append(true);
-            }
+            },
             Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
             Self::Date(builder) => {
                 builder.append_option(
                     mail.and_then(fields::date)
                         .map(|date| micros(date.unix_seconds)),
                 );
-            }
+            },
             Self::DateOffset(builder) => {
                 builder.append_option(mail.and_then(fields::date).map(|date| date.offset_minutes));
-            }
+            },
             Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
             Self::HeaderValues(name, builder) => {
                 builder.values().extend(
@@ -462,16 +459,16 @@ impl Slot {
                         .map(Some),
                 );
                 builder.append(true);
-            }
+            },
             Self::FirstHeaderValue(name, builder) => builder.append_option(
                 mail.and_then(|mail| fields::header_values(mail, name.as_str()).next()),
             ),
             Self::Text(builder) => {
                 builder.append_option(mail.map(|mail| joined(fields::text_bodies(mail))));
-            }
+            },
             Self::Html(builder) => {
                 builder.append_option(mail.map(|mail| joined(fields::html_bodies(mail))));
-            }
+            },
             Self::Attachments(slot) => slot.append(mail),
         }
     }
@@ -480,10 +477,10 @@ impl Slot {
         match self {
             Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
                 Arc::new(builder.finish())
-            }
+            },
             Self::Addresses(_, builder) | Self::HeaderValues(_, builder) => {
                 Arc::new(builder.finish())
-            }
+            },
             Self::Subject(builder)
             | Self::MessageId(builder)
             | Self::FirstHeaderValue(_, builder)

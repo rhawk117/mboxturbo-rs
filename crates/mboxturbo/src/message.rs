@@ -4,10 +4,10 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use cell::Parsed;
 use memmap2::Mmap;
 
 use crate::fields::{self, FULL_PARSER, contain_parser_panic, strip_separator};
-use cell::Parsed;
 
 #[derive(Debug, Clone)]
 struct Source {

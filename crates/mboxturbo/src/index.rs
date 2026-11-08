@@ -1,7 +1,7 @@
 //! Message boundary index and its versioned, checksummed on-disk format.
 
 use std::fs;
-use std::io::Write;
+use std::io::Write as _;
 use std::ops::Range;
 use std::path::Path;
 
@@ -344,7 +344,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn rejects_any_single_flipped_bit(byte in 0usize..96, bit in 0u8..8) {
+        fn rejects_any_single_flipped_bit(byte in 0_usize..96, bit in 0_u8..8) {
             let mut bytes = built().encode();
             let position = byte.strict_rem(bytes.len());
             bytes[position] ^= 1 << bit;
@@ -352,7 +352,7 @@ mod tests {
         }
 
         #[test]
-        fn rejects_any_truncation(cut in 0usize..96) {
+        fn rejects_any_truncation(cut in 0_usize..96) {
             let bytes = built().encode();
             let kept = cut.strict_rem(bytes.len());
             prop_assert!(Index::decode(&bytes[..kept], built().fingerprint()).is_err());

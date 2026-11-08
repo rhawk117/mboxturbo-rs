@@ -22,12 +22,8 @@ dev = [
     "typos>=1.52.0",
     "zizmor>=1.32.0",
 ]
-polars = [
-    "polars>=2.1.0",
-]
-security = [
-    "pysentry-rs>=0.5.0",
-]
+polars = ["polars>=2.1.0"]
+security = ["pysentry-rs>=0.5.0"]
 
 [tool.maturin]
 manifest-path = "crates/mboxturbo-py/Cargo.toml"

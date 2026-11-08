@@ -44,10 +44,13 @@ pub(crate) fn addresses(field: Option<AddressList<'_>>) -> impl Iterator<Item = 
         })
 }
 
-pub(crate) fn header_values<'a, N: AsRef<str>>(
+pub(crate) fn header_values<'a, N>(
     mail: &'a Mail<'a>,
     name: N,
-) -> impl Iterator<Item = Cow<'a, str>> {
+) -> impl Iterator<Item = Cow<'a, str>>
+where
+    N: AsRef<str>,
+{
     mail.headers()
         .iter()
         .filter(move |header| header.name().as_str().eq_ignore_ascii_case(name.as_ref()))

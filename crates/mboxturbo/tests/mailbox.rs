@@ -109,7 +109,7 @@ AAEC\n\
             .expect("open")
             .message(0)
             .expect("first");
-        assert_eq!(message.subject(), Some("café"), "encoded word decoded");
+        assert_eq!(message.subject(), Some("caf\u{e9}"), "encoded word decoded");
         assert_eq!(
             message.message_id(),
             Some("one@example.com"),
