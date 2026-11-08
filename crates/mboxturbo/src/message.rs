@@ -1,5 +1,31 @@
 //! One message: raw bytes borrowed from the mailbox mapping, parsed once on first use.
 
+/// Owner and dependent in one value: a parsed message together with the bytes it borrows.
+mod cell {
+    #![expect(
+        clippy::mem_forget,
+        reason = "self_cell's expansion forgets its guard on purpose once ownership has moved"
+    )]
+
+    use self_cell::self_cell;
+
+    use super::Source;
+
+    /// The parse result: `None` when the parser found no message.
+    type ParsedMail<'text> = Option<mail_parser::Message<'text>>;
+
+    self_cell!(
+        pub(super) struct Parsed {
+            owner: Source,
+
+            #[covariant]
+            dependent: ParsedMail,
+        }
+
+        impl {Debug}
+    );
+}
+
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -37,64 +63,38 @@ impl Source {
     }
 }
 
-/// Owner and dependent in one value: a parsed message together with the bytes it borrows.
-mod cell {
-    #![expect(
-        clippy::mem_forget,
-        reason = "self_cell's expansion forgets its guard on purpose once ownership has moved"
-    )]
-
-    use self_cell::self_cell;
-
-    use super::Source;
-
-    /// The parse result: `None` when the parser found no message.
-    type ParsedMail<'text> = Option<mail_parser::Message<'text>>;
-
-    self_cell!(
-        pub(super) struct Parsed {
-            owner: Source,
-
-            #[covariant]
-            dependent: ParsedMail,
-        }
-
-        impl {Debug}
-    );
-}
-
 /// A mailbox address as written in a header: either part may be missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Address<'mail> {
-    /// Display name, such as `Jane Doe`.
-    pub name: Option<&'mail str>,
     /// Address, such as `jane@example.com`.
     pub email: Option<&'mail str>,
+    /// Display name, such as `Jane Doe`.
+    pub name: Option<&'mail str>,
 }
 
 /// A `Date:` header resolved to an instant plus the offset it was written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Timestamp {
-    /// Seconds since the Unix epoch, in UTC.
-    pub unix_seconds: i64,
     /// The header's UTC offset in minutes; `-300` for `-0500`.
     pub offset_minutes: i32,
+    /// Seconds since the Unix epoch, in UTC.
+    pub unix_seconds: i64,
 }
 
 /// A decoded attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Attachment<'mail> {
-    /// File name from `Content-Disposition` or `Content-Type`.
-    pub filename: Option<&'mail str>,
-    /// Top-level media type, such as `application`.
-    pub media_type: Option<&'mail str>,
-    /// Media subtype, such as `pdf`.
-    pub media_subtype: Option<&'mail str>,
     /// Contents with the transfer encoding (base64, quoted-printable) removed.
     pub data: Cow<'mail, [u8]>,
+    /// File name from `Content-Disposition` or `Content-Type`.
+    pub filename: Option<&'mail str>,
+    /// Media subtype, such as `pdf`.
+    pub media_subtype: Option<&'mail str>,
+    /// Top-level media type, such as `application`.
+    pub media_type: Option<&'mail str>,
 }
 
 impl Attachment<'_> {
@@ -116,51 +116,18 @@ impl Attachment<'_> {
 /// header block only, and bodies or attachments trigger the full MIME parse.
 #[derive(Debug)]
 pub struct Message {
-    /// This message's bytes.
-    source: Source,
     /// The header-only parse, filled on first header access.
     head: OnceLock<Parsed>,
+    /// This message's bytes.
+    source: Source,
     /// The full MIME parse, filled on first body or attachment access.
     whole: OnceLock<Parsed>,
 }
 
 impl Message {
-    /// A message over `span` of `contents`; `span` must come from the validated index.
-    pub(crate) const fn new(contents: Arc<Mmap>, span: Range<usize>) -> Self {
-        Self {
-            source: Source { contents, span },
-            head: OnceLock::new(),
-            whole: OnceLock::new(),
-        }
-    }
-
-    /// Raw bytes exactly as stored, including the mbox `From ` separator line.
-    #[must_use]
-    pub fn raw(&self) -> &[u8] {
-        self.source.bytes()
-    }
-
-    /// Parses the whole message now, bodies and attachments included, rather than on first
-    /// access; returns whether any MIME part was found. `false` also covers a parser panic that
-    /// was contained.
-    pub fn parse(&self) -> bool {
-        self.whole().is_some()
-    }
-
-    /// Decoded `Subject:`.
-    #[must_use]
-    pub fn subject(&self) -> Option<&str> {
-        self.head()?.subject()
-    }
-
-    /// Every address in `From:`.
-    pub fn from(&self) -> impl Iterator<Item = Address<'_>> {
-        fields::addresses(self.head().and_then(mail_parser::Message::from))
-    }
-
-    /// Every address in `To:`.
-    pub fn to(&self) -> impl Iterator<Item = Address<'_>> {
-        fields::addresses(self.head().and_then(mail_parser::Message::to))
+    /// Every attachment, decoded.
+    pub fn attachments(&self) -> impl Iterator<Item = Attachment<'_>> {
+        self.whole().into_iter().flat_map(fields::attachments)
     }
 
     /// Every address in `Cc:`.
@@ -175,10 +142,23 @@ impl Message {
         self.head().and_then(fields::date)
     }
 
-    /// `Message-ID:` without the angle brackets.
-    #[must_use]
-    pub fn message_id(&self) -> Option<&str> {
-        self.head()?.message_id()
+    /// Every address in `From:`.
+    pub fn from(&self) -> impl Iterator<Item = Address<'_>> {
+        fields::addresses(self.head().and_then(mail_parser::Message::from))
+    }
+
+    /// The parsed message to read header fields from: the full parse when it already produced a
+    /// message, else the header-only parse, made on first use. `None` when neither parsed.
+    fn head(&self) -> Option<&mail_parser::Message<'_>> {
+        self.whole
+            .get()
+            .and_then(|parsed| parsed.borrow_dependent().as_ref())
+            .or_else(|| {
+                self.head
+                    .get_or_init(|| self.parse_head())
+                    .borrow_dependent()
+                    .as_ref()
+            })
     }
 
     /// First value of the header called `name` (any case), unfolded onto one line.
@@ -199,33 +179,31 @@ impl Message {
             .flat_map(move |mail| fields::header_values(mail, wanted.clone()))
     }
 
-    /// Plain-text bodies; an HTML-only message yields its HTML converted to text.
-    pub fn text_bodies(&self) -> impl Iterator<Item = Cow<'_, str>> {
-        self.whole().into_iter().flat_map(fields::text_bodies)
-    }
-
     /// HTML bodies; a text-only message yields its text converted to HTML.
     pub fn html_bodies(&self) -> impl Iterator<Item = Cow<'_, str>> {
         self.whole().into_iter().flat_map(fields::html_bodies)
     }
 
-    /// Every attachment, decoded.
-    pub fn attachments(&self) -> impl Iterator<Item = Attachment<'_>> {
-        self.whole().into_iter().flat_map(fields::attachments)
+    /// `Message-ID:` without the angle brackets.
+    #[must_use]
+    pub fn message_id(&self) -> Option<&str> {
+        self.head()?.message_id()
     }
 
-    /// The parsed message to read header fields from: the full parse when it already produced a
-    /// message, else the header-only parse, made on first use. `None` when neither parsed.
-    fn head(&self) -> Option<&mail_parser::Message<'_>> {
-        self.whole
-            .get()
-            .and_then(|parsed| parsed.borrow_dependent().as_ref())
-            .or_else(|| {
-                self.head
-                    .get_or_init(|| self.parse_head())
-                    .borrow_dependent()
-                    .as_ref()
-            })
+    /// A message over `span` of `contents`; `span` must come from the validated index.
+    pub(crate) const fn new(contents: Arc<Mmap>, span: Range<usize>) -> Self {
+        Self {
+            source: Source { contents, span },
+            head: OnceLock::new(),
+            whole: OnceLock::new(),
+        }
+    }
+
+    /// Parses the whole message now, bodies and attachments included, rather than on first
+    /// access; returns whether any MIME part was found. `false` also covers a parser panic that
+    /// was contained.
+    pub fn parse(&self) -> bool {
+        self.whole().is_some()
     }
 
     /// Parses the header block alone.
@@ -233,6 +211,28 @@ impl Message {
         Parsed::new(self.source.clone(), |source| {
             contain_parser_panic(|| FULL_PARSER.parse_headers(source.rfc822()))
         })
+    }
+
+    /// Raw bytes exactly as stored, including the mbox `From ` separator line.
+    #[must_use]
+    pub fn raw(&self) -> &[u8] {
+        self.source.bytes()
+    }
+
+    /// Decoded `Subject:`.
+    #[must_use]
+    pub fn subject(&self) -> Option<&str> {
+        self.head()?.subject()
+    }
+
+    /// Plain-text bodies; an HTML-only message yields its HTML converted to text.
+    pub fn text_bodies(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        self.whole().into_iter().flat_map(fields::text_bodies)
+    }
+
+    /// Every address in `To:`.
+    pub fn to(&self) -> impl Iterator<Item = Address<'_>> {
+        fields::addresses(self.head().and_then(mail_parser::Message::to))
     }
 
     /// The full MIME parse, made on first use. `None` when nothing parsed.

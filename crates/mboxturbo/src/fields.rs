@@ -8,16 +8,16 @@ use mail_parser::{AddressList, DateTime, HeaderForm, HeaderName, MessageParser, 
 
 use crate::message::{Address, Attachment, Timestamp};
 
-/// A parsed message borrowing its text from the mapping.
-pub(crate) type Mail<'text> = mail_parser::Message<'text>;
-
-/// The mbox separator that opens every stored message, ahead of the RFC 822 content.
-const SEPARATOR: &[u8] = b"From ";
-
 /// The shared parser: stock `mail-parser` behavior, except `Received:` stays raw so its text
 /// reaches callers as written.
 pub(crate) static FULL_PARSER: LazyLock<MessageParser> =
     LazyLock::new(|| builtin_table_with_raw_received(MessageParser::new()));
+
+/// The mbox separator that opens every stored message, ahead of the RFC 822 content.
+const SEPARATOR: &[u8] = b"From ";
+
+/// A parsed message borrowing its text from the mapping.
+pub(crate) type Mail<'text> = mail_parser::Message<'text>;
 
 /// `parser` with `Received:` headers kept as raw text instead of parsed into a structure.
 pub(crate) fn builtin_table_with_raw_received(parser: MessageParser) -> MessageParser {
@@ -104,8 +104,8 @@ pub(crate) fn date(mail: &Mail<'_>) -> Option<Timestamp> {
     )]
     let unix_seconds = date.to_timestamp_local().strict_sub(offset_seconds);
     Some(Timestamp {
-        unix_seconds,
         offset_minutes,
+        unix_seconds,
     })
 }
 
