@@ -3,7 +3,6 @@
 #[cfg(test)]
 mod mailbox {
     use std::fs;
-    use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
 
     use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
@@ -332,15 +331,25 @@ AAEC\n\
     }
 
     #[test]
-    fn a_valid_cache_is_reused_without_being_rewritten() {
+    fn a_valid_cache_is_reused_with_the_same_index() {
         let fixture = Fixture::new();
         let first = fixture.cached();
-        let inode = fs::metadata(&fixture.index)
-            .expect("cache file is written")
-            .ino();
         let second = fixture.cached();
         assert_eq!(first.len(), 3, "the cache build indexes every message");
         assert_eq!(first.index(), second.index(), "same index");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_valid_cache_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let fixture = Fixture::new();
+        let _first = fixture.cached();
+        let inode = fs::metadata(&fixture.index)
+            .expect("cache file is written")
+            .ino();
+        let _second = fixture.cached();
         assert_eq!(
             fs::metadata(&fixture.index)
                 .expect("cache file is still present")

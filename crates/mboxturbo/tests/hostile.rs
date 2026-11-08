@@ -150,6 +150,13 @@ mod hostile {
                     parsed
                 );
             }
+        }
+
+        #[test]
+        fn a_whole_mailbox_batch_reports_exactly_the_unparsed_positions(
+            contents in hostile_fragments()
+        ) {
+            let (_directory, mailbox) = open(&contents);
             let batch = mailbox.parse_batch(0..mailbox.len());
             prop_assert_eq!(
                 batch.messages.len(),
