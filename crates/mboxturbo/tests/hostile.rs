@@ -6,14 +6,17 @@ mod hostile {
     use std::hint::black_box;
 
     use mboxturbo::{Mailbox, Message};
+    use proptest::collection;
     use proptest::prelude::*;
     use tempfile::TempDir;
 
     fn open(contents: &[u8]) -> (TempDir, Mailbox) {
-        let directory = tempfile::tempdir().expect("tempdir");
+        let directory =
+            tempfile::tempdir().expect("a temporary directory can be created for the fixture mbox");
         let path = directory.path().join("hostile.mbox");
-        fs::write(&path, contents).expect("write mbox");
-        let mailbox = Mailbox::open(&path).expect("open");
+        fs::write(&path, contents).expect("the hostile bytes are written to the fixture mbox");
+        let mailbox = Mailbox::open(&path)
+            .expect("the hostile mbox opens, since malformed messages are not an open error");
         (directory, mailbox)
     }
 
@@ -31,18 +34,18 @@ mod hostile {
                 .count(),
         );
         let _bodies = black_box(message.text_bodies().chain(message.html_bodies()).count());
-        let _attachments = message
-            .attachments()
-            .map(|attachment| {
-                black_box((attachment.data.len(), attachment.content_type().is_some()))
-            })
-            .count();
+        for attachment in message.attachments() {
+            let _attachment =
+                black_box((attachment.data.len(), attachment.content_type().is_some()));
+        }
         let _raw = black_box(message.raw());
     }
 
     fn only_message(contents: &[u8]) -> (TempDir, Message) {
         let (directory, mailbox) = open(contents);
-        let message = mailbox.message(0).expect("one message");
+        let message = mailbox
+            .message(0)
+            .expect("the fixture mbox holds a message at position 0");
         (directory, message)
     }
 
@@ -84,7 +87,7 @@ mod hostile {
             message
                 .date()
                 .map(|stamp| (stamp.unix_seconds, stamp.offset_minutes)),
-            Some((1_704_063_600, 780)),
+            Some((1_704_063_600_i64, 780_i32)),
             "12:00 at +1300 is 23:00 UTC the day before"
         );
     }
@@ -95,7 +98,7 @@ mod hostile {
         assert_eq!(
             message.header("x.trace").as_deref(),
             Some("route"),
-            "dotted name"
+            "a header name containing a dot is matched case-insensitively"
         );
     }
 
@@ -118,9 +121,9 @@ mod hostile {
             Just(b"\n".to_vec()),
             Just(b"\t".to_vec()),
             Just(b"AAEC\n".to_vec()),
-            proptest::collection::vec(any::<u8>(), 0..12),
+            collection::vec(any::<u8>(), 0..12),
         ];
-        proptest::collection::vec(fragment, 0..32).prop_map(|parts| parts.concat())
+        collection::vec(fragment, 0..32).prop_map(|parts| parts.concat())
     }
 
     proptest! {
@@ -130,14 +133,14 @@ mod hostile {
         fn every_accessor_answers_on_any_input(contents in hostile_fragments()) {
             let (_directory, mailbox) = open(&contents);
             for position in 0..mailbox.len() {
-                let message = mailbox.message(position).expect("indexed message");
+                let message = mailbox.message(position).expect("a position below len() is indexed");
                 exercise(&message);
                 let before = message.subject().map(str::to_owned);
                 let parsed = message.parse();
                 prop_assert_eq!(
                     message.subject(),
                     before.as_deref(),
-                    "a full parse (MIME part found: {}) leaves the subject unchanged",
+                    "a full parse (parse() returned {}) leaves the subject unchanged",
                     parsed
                 );
             }
