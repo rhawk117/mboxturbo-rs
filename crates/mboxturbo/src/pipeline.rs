@@ -37,23 +37,23 @@ use crate::width::widen;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Compression {
-    /// Zstandard at level 1: a good ratio at close to Snappy speed.
-    #[default]
-    Zstd,
     /// Snappy: cheaper to decode than Zstd, at the cost of larger files.
     Snappy,
     /// No compression.
     Uncompressed,
+    /// Zstandard at level 1: a good ratio at close to Snappy speed.
+    #[default]
+    Zstd,
 }
 
 /// How much of each message must be parsed to fill the selected columns; the cheapest depth that
 /// covers them is chosen so unused parsing work is skipped.
 #[derive(Debug)]
 enum Depth {
-    /// Columns need only raw bytes and offsets, so no message is parsed.
-    Nothing,
     /// Only the headers the selected columns read are parsed; the rest of the message is skipped.
     Headers(MessageParser),
+    /// Columns need only raw bytes and offsets, so no message is parsed.
+    Nothing,
     /// The body is parsed too, because a body or attachment column is selected.
     Whole(MessageParser),
 }
@@ -61,44 +61,76 @@ enum Depth {
 /// A reusable extraction plan: which columns, how deep to parse, and how many rows per batch.
 #[derive(Debug)]
 pub struct Pipeline {
-    /// Selected columns, in output order.
-    columns: Box<[Column]>,
-    /// Arrow schema derived from `columns`, shared by every batch.
-    schema: SchemaRef,
-    /// Parse depth required by `columns`.
-    depth: Depth,
     /// Rows per batch; never zero.
     batch_size: usize,
+    /// Selected columns, in output order.
+    columns: Box<[Column]>,
+    /// Parse depth required by `columns`.
+    depth: Depth,
+    /// Arrow schema derived from `columns`, shared by every batch.
+    schema: SchemaRef,
 }
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
 struct Record<'mail> {
+    /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
+    /// on it.
+    mail: Option<&'mail Mail<'mail>>,
     /// Zero-based index of the message in the mailbox.
     position: usize,
     /// Byte range of the message in the mailbox file.
     span: Range<usize>,
-    /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
-    /// on it.
-    mail: Option<&'mail Mail<'mail>>,
+}
+
+/// Batches over a whole mailbox, produced a window at a time on all rayon threads.
+#[derive(Debug)]
+pub struct BatchReader {
+    /// Mailbox being read.
+    mailbox: Arc<Mailbox>,
+    /// Position of the first message not yet scheduled for extraction.
+    next: usize,
+    /// Plan that decides columns, schema and batch size.
+    pipeline: Arc<Pipeline>,
+    /// Extracted batches, in mailbox order, awaiting delivery.
+    ready: VecDeque<Result<RecordBatch, MboxturboError>>,
 }
 
 impl Pipeline {
-    /// Plans extraction of `columns` in batches of `batch_size` rows (at least one).
-    #[must_use]
-    pub fn new(columns: Vec<Column>, batch_size: usize) -> Self {
-        let fields: Vec<_> = columns.iter().map(Column::field).collect();
-        Self {
-            depth: depth_for(&columns),
-            schema: Arc::new(Schema::new(fields)),
-            columns: columns.into_boxed_slice(),
-            batch_size: batch_size.max(1),
-        }
-    }
-
-    /// The Arrow schema of every batch this pipeline produces.
-    #[must_use]
-    pub fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+    /// Drains a batch reader on a producer thread into `writer` and closes it, returning the
+    /// number of rows written.
+    ///
+    /// # Errors
+    ///
+    /// [`MboxturboError::Parquet`] if writing or closing fails, or the first batch error
+    /// ([`MboxturboError::Arrow`]) the reader yields; extraction stops at that error.
+    ///
+    /// # Panics
+    ///
+    /// Re-raises a panic from the producer thread on the calling thread.
+    fn encode_parquet(
+        self: &Arc<Self>,
+        mailbox: &Arc<Mailbox>,
+        mut writer: ArrowWriter<File>,
+        path: &Path,
+    ) -> Result<u64, MboxturboError> {
+        let parquet_error = |source| parquet_failure(path, source);
+        let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
+        let mut batches = self.reader(mailbox);
+        let reader = iter::from_fn(move || batches.next_batch());
+        let produced = thread::scope(|scope| {
+            let reader_thread = scope.spawn(move || forward_batches(reader, &sender));
+            let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
+                let batch = received?;
+                writer.write(&batch).map_err(parquet_error)?;
+                Ok::<u64, MboxturboError>(rows.saturating_add(widen(batch.num_rows())))
+            });
+            if let Err(payload) = reader_thread.join() {
+                resume_unwind(payload);
+            }
+            rows
+        })?;
+        writer.close().map(|_metadata| ()).map_err(parquet_error)?;
+        Ok(produced)
     }
 
     /// Extracts the messages at `positions` (clamped to those that exist) into one batch.
@@ -136,6 +168,30 @@ impl Pipeline {
         })
     }
 
+    /// Plans extraction of `columns` in batches of `batch_size` rows (at least one).
+    #[must_use]
+    pub fn new(columns: Vec<Column>, batch_size: usize) -> Self {
+        let fields: Vec<_> = columns.iter().map(Column::field).collect();
+        Self {
+            depth: depth_for(&columns),
+            schema: Arc::new(Schema::new(fields)),
+            columns: columns.into_boxed_slice(),
+            batch_size: batch_size.max(1),
+        }
+    }
+
+    /// Parses `raw` just deeply enough for the selected columns, after stripping the mbox separator
+    /// line. Returns `None` when no column needs parsing, or when the parser fails or panics on
+    /// this message.
+    fn parse<'raw>(&self, raw: &'raw [u8]) -> Option<Mail<'raw>> {
+        let message = strip_separator(raw);
+        match &self.depth {
+            Depth::Nothing => None,
+            Depth::Headers(parser) => contain_parser_panic(|| parser.parse_headers(message)),
+            Depth::Whole(parser) => contain_parser_panic(|| parser.parse(message)),
+        }
+    }
+
     /// Streams batches over the whole mailbox, extracting several batches in parallel at a time.
     #[must_use]
     pub fn reader(self: &Arc<Self>, mailbox: &Arc<Mailbox>) -> BatchReader {
@@ -145,6 +201,26 @@ impl Pipeline {
             next: 0,
             ready: VecDeque::new(),
         }
+    }
+
+    /// The Arrow schema of every batch this pipeline produces.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Splits the span of messages from `from` onward that all threads can work on at once (two
+    /// batches per thread) into batch-sized position ranges. Empty when `from` is at or past
+    /// the end of `mailbox`; the last range may be shorter than the batch size.
+    fn window(&self, from: usize, mailbox: &Mailbox) -> Vec<Range<usize>> {
+        let span = self
+            .batch_size
+            .saturating_mul(rayon::current_num_threads().saturating_mul(2));
+        let end = from.saturating_add(span).min(mailbox.len());
+        (from..end)
+            .step_by(self.batch_size)
+            .map(|start| start..start.saturating_add(self.batch_size).min(end))
+            .collect()
     }
 
     /// Writes every batch to a Parquet file at `path`, atomically, while the next batches are
@@ -184,69 +260,247 @@ impl Pipeline {
             .map_err(|failure| MboxturboError::io(path, failure.error))?;
         Ok(rows)
     }
+}
 
-    /// Drains a batch reader on a producer thread into `writer` and closes it, returning the
-    /// number of rows written.
-    ///
-    /// # Errors
-    ///
-    /// [`MboxturboError::Parquet`] if writing or closing fails, or the first batch error
-    /// ([`MboxturboError::Arrow`]) the reader yields; extraction stops at that error.
-    ///
-    /// # Panics
-    ///
-    /// Re-raises a panic from the producer thread on the calling thread.
-    fn encode_parquet(
-        self: &Arc<Self>,
-        mailbox: &Arc<Mailbox>,
-        mut writer: ArrowWriter<File>,
-        path: &Path,
-    ) -> Result<u64, MboxturboError> {
-        let parquet_error = |source| parquet_failure(path, source);
-        let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
-        let mut batches = self.reader(mailbox);
-        let reader = iter::from_fn(move || batches.next_batch());
-        let produced = thread::scope(|scope| {
-            let reader_thread = scope.spawn(move || forward_batches(reader, &sender));
-            let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
-                let batch = received?;
-                writer.write(&batch).map_err(parquet_error)?;
-                Ok::<u64, MboxturboError>(rows.saturating_add(widen(batch.num_rows())))
-            });
-            if let Err(payload) = reader_thread.join() {
-                resume_unwind(payload);
-            }
-            rows
-        })?;
-        writer.close().map(|_metadata| ()).map_err(parquet_error)?;
-        Ok(produced)
+impl BatchReader {
+    /// The next batch, keeping the typed error so callers can read the positions it covers.
+    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxturboError>> {
+        if self.ready.is_empty() {
+            let window = self.pipeline.window(self.next, &self.mailbox);
+            self.next = window.last().map_or(self.next, |last| last.end);
+            self.mailbox
+                .prefetch(self.next..self.next.saturating_add(self.pipeline.batch_size));
+            let extracted: Vec<_> = window
+                .into_par_iter()
+                .map(|positions| self.pipeline.extract(&self.mailbox, positions))
+                .collect();
+            self.ready.extend(extracted);
+        }
+        self.ready.pop_front()
     }
+}
 
-    /// Parses `raw` just deeply enough for the selected columns, after stripping the mbox separator
-    /// line. Returns `None` when no column needs parsing, or when the parser fails or panics on
-    /// this message.
-    fn parse<'raw>(&self, raw: &'raw [u8]) -> Option<Mail<'raw>> {
-        let message = strip_separator(raw);
-        match &self.depth {
-            Depth::Nothing => None,
-            Depth::Headers(parser) => contain_parser_panic(|| parser.parse_headers(message)),
-            Depth::Whole(parser) => contain_parser_panic(|| parser.parse(message)),
+impl Iterator for BatchReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch()
+            .map(|batch| batch.map_err(|error| ArrowError::ExternalError(Box::new(error))))
+    }
+}
+
+impl RecordBatchReader for BatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.pipeline.schema()
+    }
+}
+
+#[derive(Debug)]
+/// Typed column builder for one selected column; each message appends exactly one entry per slot.
+enum Slot {
+    /// Email addresses of one address header; an absent header gives an empty list.
+    Addresses(AddressHeader, ListBuilder<StringBuilder>),
+    /// One of the attachment list columns.
+    Attachments(AttachmentSlot),
+    /// Date as UTC microseconds, null when absent or invalid.
+    Date(TimestampMicrosecondBuilder),
+    /// Minutes east of UTC from the Date header, null when absent or invalid.
+    DateOffset(Int32Builder),
+    /// First value of the named header (lowercase name), null when absent.
+    FirstHeaderValue(String, StringBuilder),
+    /// Every value of the named header (lowercase name); empty list when absent.
+    HeaderValues(String, ListBuilder<StringBuilder>),
+    /// HTML bodies joined by newlines, null when the message is unparsed.
+    Html(StringBuilder),
+    /// First Message-ID, null when absent.
+    MessageId(StringBuilder),
+    /// Byte offset of the message start.
+    Offset(UInt64Builder),
+    /// Message index.
+    Position(UInt64Builder),
+    /// Message length in bytes.
+    Size(UInt64Builder),
+    /// Decoded subject, null when absent.
+    Subject(StringBuilder),
+    /// Plain-text bodies joined by newlines, null when the message is unparsed.
+    Text(StringBuilder),
+}
+
+#[derive(Debug)]
+/// Builder for one per-attachment list column; each message contributes one list, which is
+/// empty when it has no attachments.
+enum AttachmentSlot {
+    /// Attachment file names; a nameless attachment is null.
+    Names(ListBuilder<StringBuilder>),
+    /// Lowercase hex SHA-256 of each decoded attachment.
+    Sha256(ListBuilder<StringBuilder>),
+    /// Decoded attachment sizes in bytes.
+    Sizes(ListBuilder<UInt64Builder>),
+    /// Attachment content types.
+    Types(ListBuilder<StringBuilder>),
+}
+
+impl AttachmentSlot {
+    /// Appends this message's attachment list; an unparsed message (`None`) appends an empty list.
+    fn append(&mut self, mail: Option<&Mail<'_>>) {
+        let attachments = mail.into_iter().flat_map(fields::attachments);
+        match self {
+            Self::Names(builder) => {
+                builder
+                    .values()
+                    .extend(attachments.map(|attachment| attachment.filename));
+                builder.append(true);
+            },
+            Self::Types(builder) => {
+                builder
+                    .values()
+                    .extend(attachments.map(|attachment| attachment.content_type()));
+                builder.append(true);
+            },
+            Self::Sizes(builder) => {
+                let sizes = attachments.map(|attachment| Some(widen(attachment.data.len())));
+                builder.values().extend(sizes);
+                builder.append(true);
+            },
+            Self::Sha256(builder) => {
+                let digests = attachments.map(|attachment| Some(sha256_hex(&attachment.data)));
+                builder.values().extend(digests);
+                builder.append(true);
+            },
         }
     }
 
-    /// Splits the span of messages from `from` onward that all threads can work on at once (two
-    /// batches per thread) into batch-sized position ranges. Empty when `from` is at or past
-    /// the end of `mailbox`; the last range may be shorter than the batch size.
-    fn window(&self, from: usize, mailbox: &Mailbox) -> Vec<Range<usize>> {
-        let span = self
-            .batch_size
-            .saturating_mul(rayon::current_num_threads().saturating_mul(2));
-        let end = from.saturating_add(span).min(mailbox.len());
-        (from..end)
-            .step_by(self.batch_size)
-            .map(|start| start..start.saturating_add(self.batch_size).min(end))
-            .collect()
+    /// Finishes the builder into an Arrow list array and resets it for reuse.
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Names(builder) | Self::Types(builder) | Self::Sha256(builder) => {
+                Arc::new(builder.finish())
+            },
+            Self::Sizes(builder) => Arc::new(builder.finish()),
+        }
     }
+
+    /// Empty builder for the per-message list of attachment sizes.
+    fn sizes() -> Self {
+        Self::Sizes(ListBuilder::new(UInt64Builder::new()))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Which address header an address column reads.
+enum AddressHeader {
+    /// The Cc header.
+    Cc,
+    /// The From header.
+    From,
+    /// The Reply-To header.
+    ReplyTo,
+    /// The To header.
+    To,
+}
+
+impl AddressHeader {
+    /// Reads this header from `mail`, or `None` when the message lacks it.
+    fn of<'mail>(self, mail: &'mail Mail<'mail>) -> Option<AddressList<'mail>> {
+        match self {
+            Self::From => mail.from(),
+            Self::To => mail.to(),
+            Self::Cc => mail.cc(),
+            Self::ReplyTo => mail.reply_to(),
+        }
+    }
+}
+
+impl Slot {
+    /// Appends this slot's value for `record`; absent or unparsed data becomes null or an empty
+    /// list, never an error.
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail;
+        match self {
+            Self::Position(builder) => builder.append_value(widen(record.position)),
+            Self::Offset(builder) => builder.append_value(widen(record.span.start)),
+            Self::Size(builder) => builder.append_value(widen(record.span.len())),
+            Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
+            Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
+            Self::Date(builder) => builder.append_option(date_micros(mail)),
+            Self::DateOffset(builder) => builder.append_option(date_offset_minutes(mail)),
+            Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
+            Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
+            Self::FirstHeaderValue(name, builder) => {
+                builder.append_option(first_header_value(name, mail));
+            },
+            Self::Text(builder) => builder.append_option(mail.map(text_body)),
+            Self::Html(builder) => builder.append_option(mail.map(html_body)),
+            Self::Attachments(slot) => slot.append(mail),
+        }
+    }
+
+    /// Finishes the builder into an Arrow array and resets it for reuse.
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
+                Arc::new(builder.finish())
+            },
+            Self::Addresses(_, builder) | Self::HeaderValues(_, builder) => {
+                Arc::new(builder.finish())
+            },
+            Self::Subject(builder)
+            | Self::MessageId(builder)
+            | Self::FirstHeaderValue(_, builder)
+            | Self::Text(builder)
+            | Self::Html(builder) => Arc::new(builder.finish()),
+            Self::Date(builder) => Arc::new(builder.finish()),
+            Self::DateOffset(builder) => Arc::new(builder.finish()),
+            Self::Attachments(slot) => slot.finish(),
+        }
+    }
+
+    /// A slot collecting only the first value of the header `name` (lowercase) per message.
+    fn first_header_value(name: &str) -> Self {
+        Self::FirstHeaderValue(name.to_owned(), StringBuilder::new())
+    }
+
+    /// A slot collecting every value of the header `name` (lowercase) as a list per message.
+    fn header_values(name: &str) -> Self {
+        Self::HeaderValues(name.to_owned(), text_list())
+    }
+
+    /// Builds the slot matching `column`, preallocating `rows` entries where the builder
+    /// supports it.
+    fn new(column: &Column, rows: usize) -> Self {
+        let addresses = |header| Self::Addresses(header, text_list());
+        let attachments = |slot| Self::Attachments(slot);
+        match column {
+            Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
+            Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
+            Column::Size => Self::Size(UInt64Builder::with_capacity(rows)),
+            Column::From => addresses(AddressHeader::From),
+            Column::To => addresses(AddressHeader::To),
+            Column::Cc => addresses(AddressHeader::Cc),
+            Column::ReplyTo => addresses(AddressHeader::ReplyTo),
+            Column::Subject => Self::Subject(StringBuilder::new()),
+            Column::Date => Self::Date(utc_timestamps(rows)),
+            Column::DateOffsetMinutes => Self::DateOffset(Int32Builder::with_capacity(rows)),
+            Column::MessageId => Self::MessageId(StringBuilder::new()),
+            Column::Received => Self::header_values("received"),
+            Column::AuthenticationResults => Self::header_values("authentication-results"),
+            Column::ReceivedSpf => Self::header_values("received-spf"),
+            Column::DkimSignature => Self::header_values("dkim-signature"),
+            Column::ReturnPath => Self::first_header_value("return-path"),
+            Column::Text => Self::Text(StringBuilder::new()),
+            Column::Html => Self::Html(StringBuilder::new()),
+            Column::AttachmentNames => attachments(AttachmentSlot::Names(text_list())),
+            Column::AttachmentTypes => attachments(AttachmentSlot::Types(text_list())),
+            Column::AttachmentSizes => attachments(AttachmentSlot::sizes()),
+            Column::AttachmentSha256 => attachments(AttachmentSlot::Sha256(text_list())),
+            Column::Header(name) => Self::header_values(name),
+        }
+    }
+}
+
+/// Empty builder for a list of nullable strings.
+fn text_list() -> ListBuilder<StringBuilder> {
+    ListBuilder::new(StringBuilder::new())
 }
 
 /// Narrows `positions` to the messages that exist in a mailbox of `len` messages. A range that
@@ -332,260 +586,6 @@ fn parquet_compression(compression: Compression) -> ParquetCompression {
         Compression::Zstd => ParquetCompression::ZSTD(ZstdLevel::default()),
         Compression::Snappy => ParquetCompression::SNAPPY,
         Compression::Uncompressed => ParquetCompression::UNCOMPRESSED,
-    }
-}
-
-/// Batches over a whole mailbox, produced a window at a time on all rayon threads.
-#[derive(Debug)]
-pub struct BatchReader {
-    /// Plan that decides columns, schema and batch size.
-    pipeline: Arc<Pipeline>,
-    /// Mailbox being read.
-    mailbox: Arc<Mailbox>,
-    /// Position of the first message not yet scheduled for extraction.
-    next: usize,
-    /// Extracted batches, in mailbox order, awaiting delivery.
-    ready: VecDeque<Result<RecordBatch, MboxturboError>>,
-}
-
-impl BatchReader {
-    /// The next batch, keeping the typed error so callers can read the positions it covers.
-    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxturboError>> {
-        if self.ready.is_empty() {
-            let window = self.pipeline.window(self.next, &self.mailbox);
-            self.next = window.last().map_or(self.next, |last| last.end);
-            self.mailbox
-                .prefetch(self.next..self.next.saturating_add(self.pipeline.batch_size));
-            let extracted: Vec<_> = window
-                .into_par_iter()
-                .map(|positions| self.pipeline.extract(&self.mailbox, positions))
-                .collect();
-            self.ready.extend(extracted);
-        }
-        self.ready.pop_front()
-    }
-}
-
-impl Iterator for BatchReader {
-    type Item = Result<RecordBatch, ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_batch()
-            .map(|batch| batch.map_err(|error| ArrowError::ExternalError(Box::new(error))))
-    }
-}
-
-impl RecordBatchReader for BatchReader {
-    fn schema(&self) -> SchemaRef {
-        self.pipeline.schema()
-    }
-}
-
-#[derive(Debug)]
-/// Typed column builder for one selected column; each message appends exactly one entry per slot.
-enum Slot {
-    /// Message index.
-    Position(UInt64Builder),
-    /// Byte offset of the message start.
-    Offset(UInt64Builder),
-    /// Message length in bytes.
-    Size(UInt64Builder),
-    /// Email addresses of one address header; an absent header gives an empty list.
-    Addresses(AddressHeader, ListBuilder<StringBuilder>),
-    /// Decoded subject, null when absent.
-    Subject(StringBuilder),
-    /// Date as UTC microseconds, null when absent or invalid.
-    Date(TimestampMicrosecondBuilder),
-    /// Minutes east of UTC from the Date header, null when absent or invalid.
-    DateOffset(Int32Builder),
-    /// First Message-ID, null when absent.
-    MessageId(StringBuilder),
-    /// Every value of the named header (lowercase name); empty list when absent.
-    HeaderValues(String, ListBuilder<StringBuilder>),
-    /// First value of the named header (lowercase name), null when absent.
-    FirstHeaderValue(String, StringBuilder),
-    /// Plain-text bodies joined by newlines, null when the message is unparsed.
-    Text(StringBuilder),
-    /// HTML bodies joined by newlines, null when the message is unparsed.
-    Html(StringBuilder),
-    /// One of the attachment list columns.
-    Attachments(AttachmentSlot),
-}
-
-#[derive(Debug)]
-/// Builder for one per-attachment list column; each message contributes one list, which is
-/// empty when it has no attachments.
-enum AttachmentSlot {
-    /// Attachment file names; a nameless attachment is null.
-    Names(ListBuilder<StringBuilder>),
-    /// Attachment content types.
-    Types(ListBuilder<StringBuilder>),
-    /// Decoded attachment sizes in bytes.
-    Sizes(ListBuilder<UInt64Builder>),
-    /// Lowercase hex SHA-256 of each decoded attachment.
-    Sha256(ListBuilder<StringBuilder>),
-}
-
-impl AttachmentSlot {
-    /// Empty builder for the per-message list of attachment sizes.
-    fn sizes() -> Self {
-        Self::Sizes(ListBuilder::new(UInt64Builder::new()))
-    }
-
-    /// Appends this message's attachment list; an unparsed message (`None`) appends an empty list.
-    fn append(&mut self, mail: Option<&Mail<'_>>) {
-        let attachments = mail.into_iter().flat_map(fields::attachments);
-        match self {
-            Self::Names(builder) => {
-                builder
-                    .values()
-                    .extend(attachments.map(|attachment| attachment.filename));
-                builder.append(true);
-            },
-            Self::Types(builder) => {
-                builder
-                    .values()
-                    .extend(attachments.map(|attachment| attachment.content_type()));
-                builder.append(true);
-            },
-            Self::Sizes(builder) => {
-                let sizes = attachments.map(|attachment| Some(widen(attachment.data.len())));
-                builder.values().extend(sizes);
-                builder.append(true);
-            },
-            Self::Sha256(builder) => {
-                let digests = attachments.map(|attachment| Some(sha256_hex(&attachment.data)));
-                builder.values().extend(digests);
-                builder.append(true);
-            },
-        }
-    }
-
-    /// Finishes the builder into an Arrow list array and resets it for reuse.
-    fn finish(&mut self) -> ArrayRef {
-        match self {
-            Self::Names(builder) | Self::Types(builder) | Self::Sha256(builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Sizes(builder) => Arc::new(builder.finish()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-/// Which address header an address column reads.
-enum AddressHeader {
-    /// The From header.
-    From,
-    /// The To header.
-    To,
-    /// The Cc header.
-    Cc,
-    /// The Reply-To header.
-    ReplyTo,
-}
-
-impl AddressHeader {
-    /// Reads this header from `mail`, or `None` when the message lacks it.
-    fn of<'mail>(self, mail: &'mail Mail<'mail>) -> Option<AddressList<'mail>> {
-        match self {
-            Self::From => mail.from(),
-            Self::To => mail.to(),
-            Self::Cc => mail.cc(),
-            Self::ReplyTo => mail.reply_to(),
-        }
-    }
-}
-
-/// Empty builder for a list of nullable strings.
-fn text_list() -> ListBuilder<StringBuilder> {
-    ListBuilder::new(StringBuilder::new())
-}
-
-impl Slot {
-    /// Builds the slot matching `column`, preallocating `rows` entries where the builder
-    /// supports it.
-    fn new(column: &Column, rows: usize) -> Self {
-        let addresses = |header| Self::Addresses(header, text_list());
-        let attachments = |slot| Self::Attachments(slot);
-        match column {
-            Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
-            Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
-            Column::Size => Self::Size(UInt64Builder::with_capacity(rows)),
-            Column::From => addresses(AddressHeader::From),
-            Column::To => addresses(AddressHeader::To),
-            Column::Cc => addresses(AddressHeader::Cc),
-            Column::ReplyTo => addresses(AddressHeader::ReplyTo),
-            Column::Subject => Self::Subject(StringBuilder::new()),
-            Column::Date => Self::Date(utc_timestamps(rows)),
-            Column::DateOffsetMinutes => Self::DateOffset(Int32Builder::with_capacity(rows)),
-            Column::MessageId => Self::MessageId(StringBuilder::new()),
-            Column::Received => Self::header_values("received"),
-            Column::AuthenticationResults => Self::header_values("authentication-results"),
-            Column::ReceivedSpf => Self::header_values("received-spf"),
-            Column::DkimSignature => Self::header_values("dkim-signature"),
-            Column::ReturnPath => Self::first_header_value("return-path"),
-            Column::Text => Self::Text(StringBuilder::new()),
-            Column::Html => Self::Html(StringBuilder::new()),
-            Column::AttachmentNames => attachments(AttachmentSlot::Names(text_list())),
-            Column::AttachmentTypes => attachments(AttachmentSlot::Types(text_list())),
-            Column::AttachmentSizes => attachments(AttachmentSlot::sizes()),
-            Column::AttachmentSha256 => attachments(AttachmentSlot::Sha256(text_list())),
-            Column::Header(name) => Self::header_values(name),
-        }
-    }
-
-    /// A slot collecting every value of the header `name` (lowercase) as a list per message.
-    fn header_values(name: &str) -> Self {
-        Self::HeaderValues(name.to_owned(), text_list())
-    }
-
-    /// A slot collecting only the first value of the header `name` (lowercase) per message.
-    fn first_header_value(name: &str) -> Self {
-        Self::FirstHeaderValue(name.to_owned(), StringBuilder::new())
-    }
-
-    /// Appends this slot's value for `record`; absent or unparsed data becomes null or an empty
-    /// list, never an error.
-    fn append(&mut self, record: &Record<'_>) {
-        let mail = record.mail;
-        match self {
-            Self::Position(builder) => builder.append_value(widen(record.position)),
-            Self::Offset(builder) => builder.append_value(widen(record.span.start)),
-            Self::Size(builder) => builder.append_value(widen(record.span.len())),
-            Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
-            Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
-            Self::Date(builder) => builder.append_option(date_micros(mail)),
-            Self::DateOffset(builder) => builder.append_option(date_offset_minutes(mail)),
-            Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
-            Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
-            Self::FirstHeaderValue(name, builder) => {
-                builder.append_option(first_header_value(name, mail));
-            },
-            Self::Text(builder) => builder.append_option(mail.map(text_body)),
-            Self::Html(builder) => builder.append_option(mail.map(html_body)),
-            Self::Attachments(slot) => slot.append(mail),
-        }
-    }
-
-    /// Finishes the builder into an Arrow array and resets it for reuse.
-    fn finish(&mut self) -> ArrayRef {
-        match self {
-            Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Addresses(_, builder) | Self::HeaderValues(_, builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Subject(builder)
-            | Self::MessageId(builder)
-            | Self::FirstHeaderValue(_, builder)
-            | Self::Text(builder)
-            | Self::Html(builder) => Arc::new(builder.finish()),
-            Self::Date(builder) => Arc::new(builder.finish()),
-            Self::DateOffset(builder) => Arc::new(builder.finish()),
-            Self::Attachments(slot) => slot.finish(),
-        }
     }
 }
 
