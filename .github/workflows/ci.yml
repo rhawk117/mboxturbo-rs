@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read # default for every job: checkout
+  contents: read # fallback for any job without its own permissions block (every current job declares one)
 
 concurrency:
   group: mboxturbo-ci-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}

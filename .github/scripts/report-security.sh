@@ -117,14 +117,13 @@ publish_security_issue() {
 resolve_security_issue() {
   log::step "Resolve Security Issue"
 
-  : "${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
-
   if [[ -n "${existing_issue}" ]]; then
     gh issue close "${existing_issue}" \
       --reason completed \
       --comment "Weekly audit passed: ${WORKFLOW_URL}"
   fi
 
+  : "${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
   printf 'Weekly security audit passed: %s\n' "${WORKFLOW_URL}" >>"${GITHUB_STEP_SUMMARY}"
   log::step_end
 }
