@@ -208,11 +208,11 @@ mod tests {
     fn defaults_never_need_the_body() {
         assert!(
             Column::defaults().iter().all(|column| !column.needs_body()),
-            "headers only"
+            "no default column needs the message body"
         );
         assert!(
             Column::defaults().contains(&Column::Received),
-            "forensics headers included"
+            "the defaults include the Received forensics column"
         );
     }
 }

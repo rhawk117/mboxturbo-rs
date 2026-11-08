@@ -253,6 +253,7 @@ mod tests {
     use std::borrow::Cow;
     use std::fs;
 
+    use super::Parsed;
     use crate::Mailbox;
     use crate::fields::unfold;
 
@@ -278,22 +279,25 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
         assert_eq!(
             message.subject(),
             Some("lazy"),
-            "subject from the header tier"
+            "the subject is read from the header-only parse"
         );
         assert_eq!(
             message.header("message-id").as_deref(),
             Some("<m@example.com>"),
-            "raw"
+            "the message id is read raw from the header-only parse"
         );
-        assert!(message.whole.get().is_none(), "bodies were not decoded");
+        assert!(
+            message.whole.get().is_none(),
+            "header access leaves the bodies undecoded"
+        );
         assert_eq!(
             message.attachments().count(),
             1,
-            "attachment access parses the rest"
+            "attachment access runs the full parse and finds the one attachment"
         );
         assert!(
             message.whole.get().is_some(),
-            "full parse happened on demand"
+            "attachment access filled the full-parse cell"
         );
     }
 
@@ -306,27 +310,54 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
         let parsed_fully = mailbox
             .message(0)
             .expect("the fixture holds a first message");
-        assert!(parsed_fully.parse(), "full parse succeeds");
-        assert_eq!(headers_only.subject(), parsed_fully.subject(), "subject");
+        assert!(parsed_fully.parse(), "the fixture parses fully");
+        assert_eq!(
+            headers_only.subject(),
+            parsed_fully.subject(),
+            "both tiers read the same subject"
+        );
         assert_eq!(
             headers_only.message_id(),
             parsed_fully.message_id(),
-            "message id"
+            "both tiers read the same message id"
         );
         assert!(
             headers_only.from().eq(parsed_fully.from()),
-            "from addresses"
+            "both tiers read the same from addresses"
         );
         assert!(
             headers_only
                 .header_values("from")
                 .eq(parsed_fully.header_values("from")),
-            "raw header values"
+            "both tiers read the same raw From values"
         );
     }
 
-    // The failed-parse fallback is reachable only through a contained body-stage panic,
-    // for which no input is known, so this pins the successful-parse case alone.
+    #[test]
+    fn a_failed_full_parse_falls_back_to_the_header_only_parse() {
+        let (_directory, mailbox) = mailbox();
+        let message = mailbox.message(0).expect("fixture has one message");
+        let seeded = message
+            .whole
+            .set(Parsed::new(message.source.clone(), |_| None))
+            .is_ok();
+        assert!(seeded, "the full-parse cell was empty before seeding");
+        assert!(
+            message.whole().is_none(),
+            "the seeded full parse yields no message"
+        );
+        assert_eq!(
+            message.subject(),
+            Some("lazy"),
+            "header accessors fall back to the header-only parse when the full parse yields none"
+        );
+        assert_eq!(
+            message.message_id(),
+            Some("m@example.com"),
+            "the message id also falls back to the header-only parse"
+        );
+    }
+
     #[test]
     fn a_successful_full_parse_leaves_the_subject_unchanged() {
         let (_directory, mailbox) = mailbox();
