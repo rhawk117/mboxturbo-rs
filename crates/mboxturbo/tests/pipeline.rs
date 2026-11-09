@@ -143,7 +143,7 @@ AAEC\n\
         assert_eq!(
             text_lists(&batch, 0),
             vec![vec!["jane@example.com"], vec!["bob@example.com"]],
-            "the display name of the first sender is dropped"
+            "each sender's display name is dropped, leaving the bare address"
         );
     }
 
