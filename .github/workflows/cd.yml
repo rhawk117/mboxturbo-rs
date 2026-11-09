@@ -47,7 +47,7 @@ jobs:
     uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] remove once actionlint supports '$/' (rhysd/actionlint#711)
     permissions:
       contents: read # called ci.yml checks out the repository
-      actions: read # called ci.yml jobs read workflow run data (narrator, code scanning upload)
+      actions: read # called ci.yml jobs read workflow run data (narrator)
       pull-requests: write # called ci.yml labeler and narrator write PR labels and comments
       security-events: write # called ci.yml supply chain audit uploads SARIF to code scanning
 
