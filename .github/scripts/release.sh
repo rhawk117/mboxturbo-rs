@@ -54,9 +54,13 @@ validate_release_context() {
 }
 
 cargo_workspace_version() {
-  awk '/^\[workspace\.package\]$/ { in_package = 1; next }
+  local version
+  version=$(awk '/^\[workspace\.package\]$/ { in_package = 1; next }
     /^\[/ { in_package = 0 }
-    in_package && /^version = / { gsub(/"/, "", $3); print $3; exit }' "${CARGO_MANIFEST}"
+    in_package && /^version = / { gsub(/"/, "", $3); print $3; exit }' "${CARGO_MANIFEST}") ||
+    panic "Cargo workspace version could not be read from ${CARGO_MANIFEST}."
+  [[ -n "${version}" ]] || panic "No workspace version found in ${CARGO_MANIFEST}."
+  printf '%s\n' "${version}"
 }
 
 validate_current_release() {
