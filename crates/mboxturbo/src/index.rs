@@ -1,5 +1,11 @@
 //! Message boundary index and its versioned, checksummed on-disk format.
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the v2 index format by T4")
+)]
+mod codec;
+
 use std::fs;
 use std::io::Write as _;
 use std::ops::Range;
