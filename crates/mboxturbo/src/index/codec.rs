@@ -10,6 +10,9 @@ use xxhash_rust::xxh3::xxh3_64;
 pub(crate) const MISSING: u8 = 1;
 /// Widest code a block can hold, in bits.
 const MAX_WIDTH: u8 = 64;
+/// Widest code width at which one 8-byte load holds two adjacent codes, whatever bit of its first
+/// byte they start at.
+const PAIR_WIDTH: u8 = 28;
 /// Widest code an 8-byte load holds at any bit shift within its first byte.
 const WORD_WIDTH: u8 = 57;
 /// Bytes a single code can touch: up to 64 bits starting at a bit offset of up to 7.
@@ -98,6 +101,25 @@ impl Frame {
         self.base.checked_add(self.code(payload, index)?)
     }
 
+    /// Start at `index` of a starts block whose payload begins at byte `payload` of `bytes`,
+    /// read with one unaligned 8-byte load. The caller guarantees that `index` lies inside the
+    /// block, whose payload was checked to cover it; the load may run past the payload into the
+    /// bytes that follow it, whose bits the mask drops. `None`, for the caller to read the
+    /// start the long way, for a flagged block, a width a single load cannot hold, or a load
+    /// past the end of `bytes`.
+    #[inline]
+    pub(crate) fn start_at(&self, bytes: &[u8], payload: usize, index: usize) -> Option<u64> {
+        if self.flags != 0 || self.width > WORD_WIDTH {
+            return None;
+        }
+        let (byte, shift) = split_bit(index.checked_mul(usize::from(self.width))?)?;
+        let word = bytes
+            .get(payload.checked_add(byte)?..)?
+            .first_chunk::<8>()?;
+        let code = u64::from_le_bytes(*word).checked_shr(shift)? & mask(self.width);
+        self.base.checked_add(code)
+    }
+
     /// Starts at `index` and `index + 1` of a starts block, each as [`Frame::start`] answers it,
     /// `None` when either is `None`.
     #[inline]
@@ -109,6 +131,31 @@ impl Frame {
         Some((
             self.base.checked_add(first)?,
             self.base.checked_add(second)?,
+        ))
+    }
+
+    /// Starts at `index` and `index + 1` of a starts block whose payload begins at byte
+    /// `payload` of `bytes`, both read from one unaligned 16-byte load under the precondition of
+    /// [`Frame::start_at`] for `index + 1`, and refused as it refuses.
+    #[inline]
+    pub(crate) fn start_pair_at(
+        &self,
+        bytes: &[u8],
+        payload: usize,
+        index: usize,
+    ) -> Option<(u64, u64)> {
+        if self.flags != 0 || self.width > WORD_WIDTH {
+            return None;
+        }
+        let (byte, shift) = split_bit(index.checked_mul(usize::from(self.width))?)?;
+        let chunk = bytes
+            .get(payload.checked_add(byte)?..)?
+            .first_chunk::<16>()?;
+        let low = mask(self.width);
+        let (first, second) = adjacent(chunk, shift, self.width)?;
+        Some((
+            self.base.checked_add(first & low)?,
+            self.base.checked_add(second & low)?,
         ))
     }
 }
@@ -127,6 +174,21 @@ fn loaded_pair(payload: &[u8], bit: usize, width: u8) -> Option<(u64, u64)> {
     Some((
         low_word(wide) & mask(width),
         low_word(following) & mask(width),
+    ))
+}
+
+/// The bits of the two adjacent `width`-bit codes that start `shift` bits into `chunk`, each
+/// still to be masked to `width` bits; from its first eight bytes alone when both fit in them.
+#[inline]
+fn adjacent(chunk: &[u8; 16], shift: u32, width: u8) -> Option<(u64, u64)> {
+    if width <= PAIR_WIDTH {
+        let word = u64::from_le_bytes(*chunk.first_chunk::<8>()?).checked_shr(shift)?;
+        return Some((word, word.checked_shr(u32::from(width))?));
+    }
+    let wide = u128::from_le_bytes(*chunk).checked_shr(shift)?;
+    Some((
+        low_word(wide),
+        low_word(wide.checked_shr(u32::from(width))?),
     ))
 }
 
@@ -375,28 +437,37 @@ pub(crate) fn starts(
     }
     into.clear();
     into.resize(count, 0);
-    let width = usize::from(frame.width);
+    if frame.width > WORD_WIDTH {
+        return wide_starts(frame, payload, into);
+    }
+    let step = usize::from(frame.width);
+    let low = mask(frame.width);
     let mut bit = 0_usize;
     for slot in into.iter_mut() {
-        *slot = frame
-            .base
-            .checked_add(word_code(payload, bit, frame.width)?)?;
-        bit = bit.checked_add(width)?;
+        let (byte, shift) = split_bit(bit)?;
+        let code = match payload.get(byte..).and_then(<[u8]>::first_chunk::<8>) {
+            Some(word) => u64::from_le_bytes(*word).checked_shr(shift)? & low,
+            None => read_code(payload, bit, frame.width)?,
+        };
+        *slot = frame.base.checked_add(code)?;
+        bit = bit.checked_add(step)?;
     }
     Some(())
 }
 
-/// The `width`-bit code at bit offset `bit`, from one 8-byte load when the code fits in it and
-/// the load stays inside `payload`, else as [`read_code`] reads it.
-#[inline]
-fn word_code(payload: &[u8], bit: usize, width: u8) -> Option<u64> {
-    let (byte, shift) = split_bit(bit)?;
-    match payload.get(byte..).and_then(<[u8]>::first_chunk::<8>) {
-        Some(word) if width <= WORD_WIDTH => {
-            Some(u64::from_le_bytes(*word).checked_shr(shift)? & mask(width))
-        },
-        _ => read_code(payload, bit, width),
+/// Fills `into` with the starts of a block whose codes are too wide for one 8-byte load, one
+/// [`read_code`] at a time.
+#[cold]
+fn wide_starts(frame: &Frame, payload: &[u8], into: &mut [u64]) -> Option<()> {
+    let step = usize::from(frame.width);
+    let mut bit = 0_usize;
+    for slot in into.iter_mut() {
+        *slot = frame
+            .base
+            .checked_add(read_code(payload, bit, frame.width)?)?;
+        bit = bit.checked_add(step)?;
     }
+    Some(())
 }
 
 #[cfg(test)]

@@ -144,23 +144,24 @@ impl Eq for Index {}
 /// One decoded starts block held by a [`Cursor`].
 #[derive(Debug, Default)]
 struct Slot {
-    /// The block the starts belong to, or `None` while the slot holds nothing usable.
+    /// The block the starts belong to, or `None` while the slot holds nothing decoded.
     block: Option<usize>,
-    /// Where the block's last message ends: the next block's first start or the mailbox length.
-    end: usize,
-    /// The start of every message in the block, reused across refills.
-    starts: Vec<u64>,
+    /// The start of every message in the block, then where its last message ends: the next
+    /// block's first start or the mailbox length. Ascending and inside the mapping, or empty
+    /// when the decoded block breaks either rule; reused across refills.
+    bounds: Vec<u64>,
+    /// Position of the block's first message.
+    first: usize,
 }
 
 impl Slot {
-    /// Byte range of the message `within` the block, or `None` when it would run backwards.
-    fn span(&self, within: usize) -> Option<Range<usize>> {
-        let start = narrow(*self.starts.get(within)?)?;
-        let end = match within.checked_add(1).and_then(|next| self.starts.get(next)) {
-            Some(&next) => narrow(next)?,
-            None => self.end,
-        };
-        (start <= end).then_some(start..end)
+    /// Byte range of the message at `position`, or `None` when it is not in the slot's block or
+    /// the slot holds no usable bounds.
+    #[inline]
+    fn span(&self, position: usize) -> Option<Range<usize>> {
+        let within = position.checked_sub(self.first)?;
+        let &[start, end] = self.bounds.get(within..)?.first_chunk::<2>()?;
+        Some(narrow(start)?..narrow(end)?)
     }
 }
 
@@ -188,6 +189,19 @@ impl Parsed {
     #[inline]
     fn payload<'bytes>(&self, bytes: &'bytes [u8]) -> Option<&'bytes [u8]> {
         bytes.get(self.payload.clone())
+    }
+
+    /// Start at `index` of the block, as [`codec::Frame::start_at`] reads it from `bytes`.
+    #[inline]
+    fn start(&self, bytes: &[u8], index: usize) -> Option<u64> {
+        self.frame.start_at(bytes, self.payload.start, index)
+    }
+
+    /// Starts at `index` and `index + 1` of the block, as [`codec::Frame::start_pair_at`]
+    /// reads them from `bytes`.
+    #[inline]
+    fn start_pair(&self, bytes: &[u8], index: usize) -> Option<(u64, u64)> {
+        self.frame.start_pair_at(bytes, self.payload.start, index)
     }
 }
 
@@ -276,37 +290,47 @@ pub(crate) struct Cursor<'index> {
 }
 
 impl Cursor<'_> {
-    /// The span of `position` from the cached blocks, `None` when they cannot answer it.
+    /// The span of `position` from the newest block, else from the block holding it once it
+    /// is the newest, `None` when they cannot answer it.
+    #[inline]
     fn cached(&mut self, position: usize) -> Option<Range<usize>> {
         if self.index.replacement.get().is_some() {
             return None;
         }
-        let shift = u32::from(self.index.layout.block_shift);
-        let block = position.checked_shr(shift)?;
-        let within = position.checked_sub(block.checked_shl(shift)?)?;
-        self.promote(block)?;
-        let span = self.slots.0.span(within)?;
-        (span.end <= self.index.mailbox.len()).then_some(span)
+        self.slots
+            .0
+            .span(position)
+            .or_else(|| self.refill(position))
     }
 
-    /// Makes `block` the newest slot, decoding it unless one of the slots holds it.
-    fn promote(&mut self, block: usize) -> Option<()> {
-        if self.slots.0.block == Some(block) {
-            return Some(());
+    /// Makes the block holding `position` the newest slot, decoding it unless one of the slots
+    /// holds it, and answers the span of `position` from it.
+    #[inline(never)]
+    fn refill(&mut self, position: usize) -> Option<Range<usize>> {
+        let shift = u32::from(self.index.layout.block_shift);
+        let block = position.checked_shr(shift)?;
+        if self.slots.0.block != Some(block) {
+            mem::swap(&mut self.slots.0, &mut self.slots.1);
         }
-        mem::swap(&mut self.slots.0, &mut self.slots.1);
-        if self.slots.0.block == Some(block) {
-            return Some(());
+        if self.slots.0.block != Some(block) {
+            let slot = &mut self.slots.0;
+            slot.block = None;
+            slot.bounds.clear();
+            slot.first = block.checked_shl(shift)?;
+            if self.index.decode(block, &mut slot.bounds).is_none() {
+                slot.bounds.clear();
+                return None;
+            }
+            slot.block = Some(block);
         }
-        self.slots.0.block = None;
-        self.slots.0.end = self.index.decode(block, &mut self.slots.0.starts)?;
-        self.slots.0.block = Some(block);
-        Some(())
+        self.slots.0.span(position)
     }
 
     /// Byte range of the message at `position`, answering exactly what [`Index::span`] does.
+    #[inline]
     pub(crate) fn span(&mut self, position: usize) -> Option<Range<usize>> {
-        self.cached(position).or_else(|| self.index.span(position))
+        self.cached(position)
+            .or_else(|| self.index.checked_span(position))
     }
 }
 
@@ -340,6 +364,18 @@ impl Index {
         Self::new(contents, Backing::Owned(bytes), layout, None)
     }
 
+    /// [`Index::span`] the long way: verifying the blocks it reaches the first time, and
+    /// answering from the rebuild once one ran or when the original cannot answer.
+    #[cold]
+    #[inline(never)]
+    fn checked_span(&self, position: usize) -> Option<Range<usize>> {
+        let end = self.mailbox.len();
+        let needed = position..position.saturating_add(2);
+        self.lookup(Section::Starts, needed, |reach| {
+            reach.span(position).filter(|span| span.end <= end)
+        })
+    }
+
     /// A cursor that walks the spans of consecutive positions one block at a time.
     pub(crate) const fn cursor(&self) -> Cursor<'_> {
         Cursor {
@@ -347,13 +383,13 @@ impl Index {
             slots: (
                 Slot {
                     block: None,
-                    end: 0,
-                    starts: Vec::new(),
+                    bounds: Vec::new(),
+                    first: 0,
                 },
                 Slot {
                     block: None,
-                    end: 0,
-                    starts: Vec::new(),
+                    bounds: Vec::new(),
+                    first: 0,
                 },
             ),
         }
@@ -367,17 +403,25 @@ impl Index {
         self.lookup(Section::Dates, needed, |reach| reach.date(position))
     }
 
-    /// Decodes the starts of original `block` into `starts` after verifying it and the block
-    /// that follows, and returns where the block's last message ends. `None` when the block or
-    /// its successor is damaged or places a message outside the mapping.
-    fn decode(&self, block: usize, starts: &mut Vec<u64>) -> Option<usize> {
+    /// Decodes into `bounds` the starts of original `block`, after verifying it and the block
+    /// that follows, then where the block's last message ends. `None` when the block or its
+    /// successor is damaged. `bounds` is left empty when they run backwards or past the
+    /// mapping, so every span of the block is answered by [`Index::span`].
+    fn decode(&self, block: usize, bounds: &mut Vec<u64>) -> Option<()> {
         #[cfg(test)]
         #[expect(unused_results, reason = "the previous count is not needed")]
         self.decoded.fetch_add(1, Ordering::Relaxed);
         let entry = self.entry(Section::Starts, block)?;
         let payload = entry.payload(self.original.bytes())?;
-        codec::starts(&entry.frame, payload, self.layout.block_len(block)?, starts)?;
-        self.end_of(block)
+        codec::starts(&entry.frame, payload, self.layout.block_len(block)?, bounds)?;
+        bounds.push(widen(self.end_of(block)?));
+        let inside = bounds
+            .last()
+            .is_some_and(|&end| end <= widen(self.mailbox.len()));
+        if !(inside && bounds.is_sorted()) {
+            bounds.clear();
+        }
+        Some(())
     }
 
     /// Starts blocks decoded by cursors so far.
@@ -510,6 +554,16 @@ impl Index {
         sound.then(|| cell.get_or_init(|| Parsed::new((entry, payload))))
     }
 
+    /// The block holding `position` and the place of `position` within it.
+    #[inline]
+    fn place(&self, position: usize) -> Option<(usize, usize)> {
+        let shift = u32::from(self.layout.block_shift);
+        Some((
+            position.checked_shr(shift)?,
+            position & !usize::MAX.checked_shl(shift)?,
+        ))
+    }
+
     /// The parsed, checked entries of the blocks holding the first and the last message of
     /// `needed` that exists, `None` when either block fails its check.
     #[inline]
@@ -576,12 +630,10 @@ impl Index {
     /// Byte range of the message at `position`, from its start to the next message's start or
     /// to the end of the mailbox for the last message, or `None` past the last message.
     #[must_use]
+    #[inline]
     pub fn span(&self, position: usize) -> Option<Range<usize>> {
-        let end = self.mailbox.len();
-        let needed = position..position.saturating_add(2);
-        self.lookup(Section::Starts, needed, |reach| {
-            reach.span(position).filter(|span| span.end <= end)
-        })
+        self.verified_span(position)
+            .or_else(|| self.checked_span(position))
     }
 
     /// Byte range covering the messages at `positions`, clamped to the messages that exist.
@@ -605,6 +657,59 @@ impl Index {
             .iter()
             .filter(|cell| cell.get().is_some())
             .count()
+    }
+
+    /// [`Index::verified_span`] for the last message of a block or of the mailbox, as the start
+    /// at `within` of `entry`'s block and the start that follows it: the next block's first
+    /// start from its cached entry, or the mailbox end after the last message. `None` when the
+    /// next block has no cached entry yet or a read is refused.
+    #[inline(never)]
+    fn verified_edge(&self, entry: &Parsed, position: usize, within: usize) -> Option<(u64, u64)> {
+        let bytes = self.original.bytes();
+        let start = entry.start(bytes, within)?;
+        let following = position.checked_add(1)?;
+        if following == messages(&self.layout) {
+            return Some((start, self.layout.fingerprint.len()));
+        }
+        let next = self.starts_entries.get(self.place(following)?.0)?.get()?;
+        Some((start, next.start(bytes, 0)?))
+    }
+
+    /// [`Index::span`] from the cached entries of verified original blocks alone, both starts
+    /// from one 16-byte load unless the message ends its block: `None` once a rebuild ran, past
+    /// the last message, when a block it needs has no cached entry yet, or whenever
+    /// [`codec::Frame::start_pair_at`] or the range checks refuse, so that
+    /// [`Index::checked_span`] decides. Any span it answers is the one `checked_span` answers.
+    #[inline]
+    fn verified_span(&self, position: usize) -> Option<Range<usize>> {
+        let count = messages(&self.layout);
+        if self.replacement.get().is_some() || position >= count {
+            return None;
+        }
+        let (block, within) = self.place(position)?;
+        let entry = self.starts_entries.get(block)?.get()?;
+        let (first, next) = self.verified_starts(entry, position, within)?;
+        let (start, end) = (narrow(first)?, narrow(next)?);
+        (start <= end && end <= self.mailbox.len()).then_some(start..end)
+    }
+
+    /// The starts at `within` and after it that [`Index::verified_span`] needs: both from one
+    /// load of `entry`'s block unless the message at `position` ends its block or the mailbox.
+    #[inline]
+    fn verified_starts(
+        &self,
+        entry: &Parsed,
+        position: usize,
+        within: usize,
+    ) -> Option<(u64, u64)> {
+        let shift = u32::from(self.layout.block_shift);
+        let inner = position.checked_add(1)? < messages(&self.layout)
+            && within.checked_add(1)?.checked_shr(shift)? == 0;
+        if inner {
+            entry.start_pair(self.original.bytes(), within)
+        } else {
+            self.verified_edge(entry, position, within)
+        }
     }
 }
 
