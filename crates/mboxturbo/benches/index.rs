@@ -42,6 +42,8 @@ struct Report {
     build: Duration,
     /// Size of the saved index file.
     index_bytes: u64,
+    /// Time of the span lookups at the random-access positions, without message bytes.
+    lookup: Duration,
     /// Messages in the mailbox.
     messages: u64,
     /// Cached-open timings, sorted ascending.
@@ -52,6 +54,8 @@ struct Report {
     save: Duration,
     /// Time of the sequential pass.
     scan: Duration,
+    /// Time of one pass over the index's slices in order, without message bytes.
+    sweep: Duration,
 }
 
 /// The splitmix64 step, enough of a PRNG to pick positions reproducibly.
@@ -191,6 +195,35 @@ fn sequential(mailbox: &Mailbox) -> Outcome<Duration> {
     Ok(elapsed)
 }
 
+/// Times the span lookups at `random_access`'s positions, never reading message bytes.
+fn index_lookup(mailbox: &Mailbox, seed: u64) -> Outcome<Duration> {
+    let length = u64::try_from(mailbox.len())?;
+    let mut state = seed;
+    let (_, elapsed) = timed(|| {
+        let mut sum = 0_usize;
+        for _ in 0..RANDOM_READS {
+            let position =
+                usize::try_from(splitmix64(&mut state).checked_rem(length).unwrap_or(0))?;
+            let len = mailbox.index().span(position).map_or(0, |span| span.len());
+            sum = sum.wrapping_add(len);
+        }
+        Ok(black_box(sum))
+    })?;
+    Ok(elapsed)
+}
+
+/// Times one pass over every message's slice in order, never reading message bytes.
+fn index_sweep(mailbox: &Mailbox) -> Outcome<Duration> {
+    let (_, elapsed) = timed(|| {
+        let mut sum = 0_usize;
+        for raw in mailbox.iter() {
+            sum = sum.wrapping_add(raw.len());
+        }
+        Ok(black_box(sum))
+    })?;
+    Ok(elapsed)
+}
+
 /// Times every operation against the v1 index.
 fn measure(spec: &common::Spec) -> Outcome<Report> {
     let path = ensure_fixture(spec)?;
@@ -203,8 +236,10 @@ fn measure(spec: &common::Spec) -> Outcome<Report> {
         messages: u64::try_from(mailbox.len())?,
         opens: cached_opens(&path, &index_path)?,
         random: random_access(&mailbox, spec.seed)?,
+        lookup: index_lookup(&mailbox, spec.seed)?,
         save,
         scan: sequential(&mailbox)?,
+        sweep: index_sweep(&mailbox)?,
     })
 }
 
@@ -229,7 +264,9 @@ fn print(report: &Report) -> Outcome<()> {
         median.as_micros()
     )?;
     row(&mut out, "random-access", report.random, RANDOM_READS)?;
+    row(&mut out, "index-lookup", report.lookup, RANDOM_READS)?;
     row(&mut out, "sequential", report.scan, messages)?;
+    row(&mut out, "index-sweep", report.sweep, messages)?;
     let starts = bytes_per_message(report.index_bytes, messages);
     writeln!(out, "{:<14} {starts} B/msg", "index starts")?;
     writeln!(out, "{:<14} n/a", "index dates")?;
