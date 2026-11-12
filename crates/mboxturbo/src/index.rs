@@ -10,6 +10,11 @@ mod codec;
     expect(dead_code, reason = "wired into the v2 index build by T5 and T8")
 )]
 mod date;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the v2 index build by T5")
+)]
+mod format;
 
 use std::fs;
 use std::io::Write as _;
