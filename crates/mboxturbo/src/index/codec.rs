@@ -198,7 +198,8 @@ fn nonzero_span(values: &[i64]) -> Option<(i64, i64)> {
 }
 
 /// Chooses base, width and flags for a dates block: the "no date" sentinel is used only when zero
-/// is outside the span of the present dates and the span leaves room for the all-ones code.
+/// is outside the span of the present dates; its width holds `span + 1`, so the all-ones code
+/// exceeds every real delta.
 fn date_layout(values: &[i64]) -> Layout {
     let min = values.iter().copied().min().unwrap_or(0);
     let max = values.iter().copied().max().unwrap_or(0);
@@ -211,14 +212,19 @@ fn date_layout(values: &[i64]) -> Layout {
     let Some((low, high)) = nonzero_span(values).filter(|_| has_zero) else {
         return plain;
     };
-    let width = bit_width(high.abs_diff(low));
-    if (low <= 0 && high >= 0) || width >= MAX_WIDTH {
+    if low <= 0 && high >= 0 {
         return plain;
     }
+    // The all-ones code of a width-w block is 2^w - 1, so it sits above every real delta (at most
+    // `range`) once w holds `range + 1`. Zero lies outside the span, so the non-zero dates share a
+    // sign and `range` stays below 2^63; the sum cannot overflow, and `None` falls back anyway.
+    let Some(width) = high.abs_diff(low).checked_add(1).map(bit_width) else {
+        return plain;
+    };
     Layout {
         base: bits_of(low),
         flags: MISSING,
-        width: width.saturating_add(1),
+        width,
     }
 }
 
@@ -378,8 +384,8 @@ mod tests {
             "zero is below the present dates"
         );
         assert_eq!(
-            decoded.block.width, 10,
-            "a span of 300 is nine bits plus the sentinel"
+            decoded.block.width, 9,
+            "a span of 300 plus the all-ones sentinel code 301 fits in nine bits"
         );
         assert_eq!(decoded.values, some(&values), "zeros come back as zeros");
     }
