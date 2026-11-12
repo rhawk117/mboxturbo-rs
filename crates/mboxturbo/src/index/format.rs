@@ -188,6 +188,18 @@ impl Layout {
         section: Section,
         block: usize,
     ) -> Option<(codec::Block, &'bytes [u8])> {
+        let (entry, payload) = self.entry_at(bytes, section, block)?;
+        Some((entry, bytes.get(payload)?))
+    }
+
+    /// As [`Layout::entry`], with the payload as its byte range in `bytes`, which lies between
+    /// the header and the directories but is not checked against the length of `bytes`.
+    pub(crate) fn entry_at(
+        &self,
+        bytes: &[u8],
+        section: Section,
+        block: usize,
+    ) -> Option<(codec::Block, Range<usize>)> {
         let at = self.entry_offset(section, block)?;
         let raw = bytes.get(at..at.checked_add(ENTRY_LEN)?)?;
         let entry = codec::Block {
@@ -197,7 +209,7 @@ impl Layout {
             width: *raw.get(24)?,
         };
         let payload = self.payload_range(narrow(read_u64(raw, 8)?)?, block, entry.width)?;
-        Some((entry, bytes.get(payload)?))
+        Some((entry, payload))
     }
 
     /// Byte offset of the entry of `block` in `section`.

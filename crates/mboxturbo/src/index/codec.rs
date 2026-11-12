@@ -10,6 +10,8 @@ use xxhash_rust::xxh3::xxh3_64;
 pub(crate) const MISSING: u8 = 1;
 /// Widest code a block can hold, in bits.
 const MAX_WIDTH: u8 = 64;
+/// Widest code an 8-byte load holds at any bit shift within its first byte.
+const WORD_WIDTH: u8 = 57;
 /// Bytes a single code can touch: up to 64 bits starting at a bit offset of up to 7.
 const WINDOW: usize = 9;
 
@@ -26,15 +28,112 @@ pub(crate) struct Block {
     pub width: u8,
 }
 
-/// Base, width and flags of a block before its payload is packed.
+/// Base, width and flags of a block: everything a read needs from its entry, without the checksum
+/// that only matters until the block is verified.
 #[derive(Debug, Clone, Copy)]
-struct Layout {
+pub(crate) struct Frame {
     /// Block minimum, as `u64` bits.
-    base: u64,
+    pub base: u64,
     /// Flag bits for the entry.
-    flags: u8,
+    pub flags: u8,
     /// Bits per stored code.
-    width: u8,
+    pub width: u8,
+}
+
+impl Block {
+    /// The fields a read needs.
+    pub(crate) const fn frame(&self) -> Frame {
+        Frame {
+            base: self.base,
+            flags: self.flags,
+            width: self.width,
+        }
+    }
+}
+
+impl Frame {
+    /// Code at `index`, or `None` when the frame or the payload cannot hold it.
+    #[inline]
+    fn code(&self, payload: &[u8], index: usize) -> Option<u64> {
+        let bit = index.checked_mul(usize::from(self.width))?;
+        read_code(payload, bit, self.width)
+    }
+
+    /// Codes at `index` and `index + 1`, from one 16-byte load when both lie in it, else read
+    /// one at a time; `None` when either is past the payload or the width exceeds 64.
+    #[inline]
+    fn code_pair(&self, payload: &[u8], index: usize) -> Option<(u64, u64)> {
+        let width = usize::from(self.width);
+        let bit = index.checked_mul(width)?;
+        let next = bit.checked_add(width)?;
+        if self.width > MAX_WIDTH || next.checked_add(width)?.div_ceil(8) > payload.len() {
+            return None;
+        }
+        loaded_pair(payload, bit, self.width).or_else(|| {
+            Some((
+                read_code(payload, bit, self.width)?,
+                read_code(payload, next, self.width)?,
+            ))
+        })
+    }
+
+    /// Date at `index` of a dates block, as [`date`] answers it.
+    pub(crate) fn date(&self, payload: &[u8], index: usize) -> Option<i64> {
+        if self.flags & !MISSING != 0 || (self.flags == MISSING && self.width == 0) {
+            return None;
+        }
+        let raw = self.code(payload, index)?;
+        if self.flags == MISSING && raw == mask(self.width) {
+            return Some(0);
+        }
+        signed_of(self.base).checked_add_unsigned(raw)
+    }
+
+    /// Start at `index` of a starts block, as [`start`] answers it.
+    #[inline]
+    pub(crate) fn start(&self, payload: &[u8], index: usize) -> Option<u64> {
+        if self.flags != 0 {
+            return None;
+        }
+        self.base.checked_add(self.code(payload, index)?)
+    }
+
+    /// Starts at `index` and `index + 1` of a starts block, each as [`Frame::start`] answers it,
+    /// `None` when either is `None`.
+    #[inline]
+    pub(crate) fn start_pair(&self, payload: &[u8], index: usize) -> Option<(u64, u64)> {
+        if self.flags != 0 {
+            return None;
+        }
+        let (first, second) = self.code_pair(payload, index)?;
+        Some((
+            self.base.checked_add(first)?,
+            self.base.checked_add(second)?,
+        ))
+    }
+}
+
+/// The `width`-bit codes at bit offset `bit` and right after it, from one 16-byte load; `None`
+/// when the load would leave `payload` or the two codes do not both lie in it.
+#[inline]
+fn loaded_pair(payload: &[u8], bit: usize, width: u8) -> Option<(u64, u64)> {
+    let (byte, shift) = split_bit(bit)?;
+    if shift.checked_add(u32::from(width).checked_mul(2)?)? > u128::BITS {
+        return None;
+    }
+    let chunk = payload.get(byte..)?.first_chunk::<16>()?;
+    let wide = u128::from_le_bytes(*chunk).checked_shr(shift)?;
+    let following = wide.checked_shr(u32::from(width))?;
+    Some((
+        low_word(wide) & mask(width),
+        low_word(following) & mask(width),
+    ))
+}
+
+/// The low 64 bits of `value`.
+const fn low_word(value: u128) -> u64 {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = value.to_le_bytes();
+    u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
 }
 
 /// Bits needed to store `range`; zero for zero.
@@ -88,8 +187,10 @@ fn put(buf: &mut [u8], bit: usize, width: u8, code: u64) -> Option<()> {
     Some(())
 }
 
-/// Reads the `width`-bit code at bit offset `bit` through a zero-padded 16-byte window, touching
-/// at most nine payload bytes. `None` when `width` exceeds 64 or the bits are not all in `payload`.
+/// Reads the `width`-bit code at bit offset `bit` from a 16-byte load, or from a zero-padded
+/// window near the end of `payload`; only the code's own bits reach the answer. `None` when `width`
+/// exceeds 64 or the bits are not all in `payload`.
+#[inline]
 fn read_code(payload: &[u8], bit: usize, width: u8) -> Option<u64> {
     if width > MAX_WIDTH {
         return None;
@@ -102,17 +203,21 @@ fn read_code(payload: &[u8], bit: usize, width: u8) -> Option<u64> {
         return Some(0);
     }
     let (byte, shift) = split_bit(bit)?;
+    let rest = payload.get(byte..)?;
+    let wide = rest
+        .first_chunk::<16>()
+        .map_or_else(|| padded(rest), |chunk| u128::from_le_bytes(*chunk));
+    Some(low_word(wide.checked_shr(shift)?) & mask(width))
+}
+
+/// The first nine bytes of `bytes`, fewer when it is shorter, zero-padded to a `u128`: every
+/// byte a code starting in the first of them can touch.
+fn padded(bytes: &[u8]) -> u128 {
     let mut window = [0_u8; 16];
-    for (dst, src) in window
-        .iter_mut()
-        .zip(payload.get(byte..)?.iter().take(WINDOW))
-    {
+    for (dst, src) in window.iter_mut().zip(bytes.iter().take(WINDOW)) {
         *dst = *src;
     }
-    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = u128::from_le_bytes(window)
-        .checked_shr(shift)?
-        .to_le_bytes();
-    Some(u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]) & mask(width))
+    u128::from_le_bytes(window)
 }
 
 /// Packs `count` codes of `width` bits, little-endian bit order; empty when a code does not fit,
@@ -143,12 +248,7 @@ fn checksum(base: u64, width: u8, flags: u8, payload: &[u8]) -> u64 {
 }
 
 /// Packs the codes, appends the payload to `out` and seals the entry with its checksum.
-fn seal(
-    layout: Layout,
-    count: usize,
-    codes: impl Iterator<Item = u64>,
-    out: &mut Vec<u8>,
-) -> Block {
+fn seal(layout: Frame, count: usize, codes: impl Iterator<Item = u64>, out: &mut Vec<u8>) -> Block {
     let payload = pack(codes, count, layout.width);
     out.extend_from_slice(&payload);
     Block {
@@ -167,7 +267,7 @@ pub(crate) fn encode_starts(values: &[u64], out: &mut Vec<u8>) -> Block {
     let width = bit_width(top.saturating_sub(base));
     let codes = values.iter().map(|value| value.saturating_sub(base));
     seal(
-        Layout {
+        Frame {
             base,
             flags: 0,
             width,
@@ -200,10 +300,10 @@ fn nonzero_span(values: &[i64]) -> Option<(i64, i64)> {
 /// Chooses base, width and flags for a dates block: the "no date" sentinel is used only when zero
 /// is outside the span of the present dates; its width holds `span + 1`, so the all-ones code
 /// exceeds every real delta.
-fn date_layout(values: &[i64]) -> Layout {
+fn date_layout(values: &[i64]) -> Frame {
     let min = values.iter().copied().min().unwrap_or(0);
     let max = values.iter().copied().max().unwrap_or(0);
-    let plain = Layout {
+    let plain = Frame {
         base: bits_of(min),
         flags: 0,
         width: bit_width(max.abs_diff(min)),
@@ -221,7 +321,7 @@ fn date_layout(values: &[i64]) -> Layout {
     let Some(width) = high.abs_diff(low).checked_add(1).map(bit_width) else {
         return plain;
     };
-    Layout {
+    Frame {
         base: bits_of(low),
         flags: MISSING,
         width,
@@ -248,32 +348,55 @@ pub(crate) fn verify(block: &Block, payload: &[u8]) -> bool {
     checksum(block.base, block.width, block.flags, payload) == block.checksum
 }
 
-/// Code at `index`, or `None` when the entry or the payload cannot hold it.
-fn code(block: &Block, payload: &[u8], index: usize) -> Option<u64> {
-    let bit = index.checked_mul(usize::from(block.width))?;
-    read_code(payload, bit, block.width)
-}
-
 /// Start at `index` of a starts block, or `None` for an unknown flag, a width above 64, or an
 /// index the payload does not cover. An all-equal block (width 0) answers any index with its base.
 pub(crate) fn start(block: &Block, payload: &[u8], index: usize) -> Option<u64> {
-    if block.flags != 0 {
-        return None;
-    }
-    block.base.checked_add(code(block, payload, index)?)
+    block.frame().start(payload, index)
 }
 
 /// Date at `index` of a dates block, zero for "no date", or `None` for an unknown flag, a width
 /// above 64, a sentinel block of width 0, or an index the payload does not cover.
 pub(crate) fn date(block: &Block, payload: &[u8], index: usize) -> Option<i64> {
-    if block.flags & !MISSING != 0 || (block.flags == MISSING && block.width == 0) {
+    block.frame().date(payload, index)
+}
+
+/// Replaces the contents of `into` with the first `count` starts of a starts block, read in one
+/// pass over `payload`. `None`, with `into` unspecified, for an unknown flag, a width above 64, a
+/// payload shorter than `count` codes, or a start past `u64::MAX`; each value equals what
+/// [`start`] answers for its index.
+pub(crate) fn starts(
+    frame: &Frame,
+    payload: &[u8],
+    count: usize,
+    into: &mut Vec<u64>,
+) -> Option<()> {
+    if frame.flags != 0 || payload_len(count, frame.width)? > payload.len() {
         return None;
     }
-    let raw = code(block, payload, index)?;
-    if block.flags == MISSING && raw == mask(block.width) {
-        return Some(0);
+    into.clear();
+    into.resize(count, 0);
+    let width = usize::from(frame.width);
+    let mut bit = 0_usize;
+    for slot in into.iter_mut() {
+        *slot = frame
+            .base
+            .checked_add(word_code(payload, bit, frame.width)?)?;
+        bit = bit.checked_add(width)?;
     }
-    signed_of(block.base).checked_add_unsigned(raw)
+    Some(())
+}
+
+/// The `width`-bit code at bit offset `bit`, from one 8-byte load when the code fits in it and
+/// the load stays inside `payload`, else as [`read_code`] reads it.
+#[inline]
+fn word_code(payload: &[u8], bit: usize, width: u8) -> Option<u64> {
+    let (byte, shift) = split_bit(bit)?;
+    match payload.get(byte..).and_then(<[u8]>::first_chunk::<8>) {
+        Some(word) if width <= WORD_WIDTH => {
+            Some(u64::from_le_bytes(*word).checked_shr(shift)? & mask(width))
+        },
+        _ => read_code(payload, bit, width),
+    }
 }
 
 #[cfg(test)]
@@ -414,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn a_one_pass_decode_refuses_a_payload_short_of_its_count() {
+        let values = [10, 300, 70_000];
+        let decoded = decode_starts(&values);
+        let mut all = Vec::new();
+        assert_eq!(
+            starts(&decoded.block.frame(), &decoded.payload[..1], 3, &mut all),
+            None,
+            "three 17-bit codes need seven bytes"
+        );
+    }
+
+    #[test]
     fn zero_inside_the_dates_is_an_ordinary_value() {
         let values = [-5, 0, 7];
         let decoded = decode_dates(&values);
@@ -494,6 +629,36 @@ mod tests {
             let decoded = decode_dates(&values);
             prop_assert_eq!(decoded.values, some(&values), "decoding returns the encoded dates");
             prop_assert!(verify(&decoded.block, &decoded.payload), "a fresh block verifies");
+        }
+
+        #[test]
+        fn a_one_pass_decode_matches_every_single_read(values in vec(any::<u64>(), 0..=BLOCK)) {
+            let ordered = sorted(values);
+            let decoded = decode_starts(&ordered);
+            let mut all = vec![7];
+            let outcome = starts(&decoded.block.frame(), &decoded.payload, ordered.len(), &mut all);
+            prop_assert_eq!(outcome, Some(()), "a sound block decodes");
+            prop_assert_eq!(
+                all.into_iter().map(Some).collect::<Vec<_>>(),
+                decoded.values,
+                "the one-pass decode replaces the vector with what start reads per index"
+            );
+        }
+
+        #[test]
+        fn a_pair_read_matches_two_single_reads(
+            values in vec(any::<u64>(), 2..=BLOCK),
+            pick in any::<usize>(),
+        ) {
+            let ordered = sorted(values);
+            let decoded = decode_starts(&ordered);
+            let index = pick.checked_rem(ordered.len().saturating_sub(1)).unwrap();
+            let frame = decoded.block.frame();
+            prop_assert_eq!(
+                frame.start_pair(&decoded.payload, index),
+                Some((ordered[index], ordered[index.saturating_add(1)])),
+                "one load answers both neighbours, at every width and near the payload end"
+            );
         }
 
         #[test]
