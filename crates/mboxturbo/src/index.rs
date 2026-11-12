@@ -3,6 +3,14 @@
 
 mod codec;
 mod date;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "format::encode is the reference encoder the tests compare the streaming build \
+                  against, and nothing else calls it"
+    )
+)]
 mod format;
 
 use std::fs::File;
@@ -19,12 +27,12 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
-use self::format::{Layout, Section};
+use self::format::{Layout, Section, Writer};
 use crate::error::{Corruption, MboxTurboError};
 use crate::fingerprint::Fingerprint;
 use crate::mailbox::map_read_only;
-use crate::scan;
 use crate::width::{narrow, widen};
+use crate::{hint, scan};
 
 /// First eight bytes of every index file.
 const MAGIC: [u8; 8] = *b"MBOXTIDX";
@@ -216,14 +224,24 @@ impl Index {
         )
     }
 
-    /// Indexes every message in `contents`, scanning it and reading each Date header on all
-    /// rayon threads.
+    /// Indexes every message in `contents`, scanning it window by window and reading each Date
+    /// header on all rayon threads, in blocks of 256 messages.
     ///
     /// A message starts at a line beginning with `From `, matching Python's `mailbox.mbox`; a
     /// message without a parsable Date header is dated zero.
     #[must_use]
     pub fn build(contents: Arc<Mmap>, fingerprint: Fingerprint) -> Self {
-        let (bytes, layout) = encoded(&contents, fingerprint);
+        Self::build_with(contents, fingerprint, format::DEFAULT_BLOCK_SHIFT)
+    }
+
+    /// As [`Index::build`], with blocks of `2^block_shift` messages.
+    ///
+    /// # Panics
+    ///
+    /// When `block_shift` is outside `1..=16`, the range the file header allows.
+    #[must_use]
+    pub fn build_with(contents: Arc<Mmap>, fingerprint: Fingerprint, block_shift: u8) -> Self {
+        let (bytes, layout) = encoded(&contents, fingerprint, block_shift);
         Self::new(contents, Backing::Owned(bytes), layout, None)
     }
 
@@ -384,7 +402,7 @@ impl Index {
     /// Rescans the mailbox and, when the index was loaded from a file, rewrites that file with
     /// the result and keeps the outcome for [`Index::rewrite_outcome`].
     fn rebuild(&self) -> (Vec<u8>, Layout) {
-        let (bytes, layout) = encoded(&self.mailbox, self.fingerprint);
+        let (bytes, layout) = encoded(&self.mailbox, self.fingerprint, self.layout.block_shift);
         if let Some(origin) = &self.origin {
             #[expect(
                 unused_results,
@@ -488,6 +506,68 @@ impl Index {
     }
 }
 
+/// Encodes the messages whose starts arrive window by window, keeping only one block of starts
+/// and dates in memory beside the window in hand.
+///
+/// A window's last message has no successor yet, so it waits in `carry` until the next window
+/// supplies the start its slice runs to.
+struct Streamer<'sink> {
+    /// The start of the newest message, whose end is not known yet.
+    carry: Option<usize>,
+    /// The mailbox the starts point into.
+    contents: &'sink [u8],
+    /// Dates of the messages in `starts`.
+    dates: Vec<i64>,
+    /// Messages in a full block.
+    per_block: usize,
+    /// Starts of the messages not yet pushed to `writer`.
+    starts: Vec<u64>,
+    /// The index file being written.
+    writer: Writer<&'sink mut io::Cursor<Vec<u8>>>,
+}
+
+impl Streamer<'_> {
+    /// Takes the next window of ascending starts, dating every message whose successor is now
+    /// known and pushing each block that fills.
+    fn feed(&mut self, window: Vec<usize>) -> io::Result<()> {
+        let run: Vec<usize> = self.carry.take().into_iter().chain(window).collect();
+        let Some((&last, head)) = run.split_last() else {
+            return Ok(());
+        };
+        self.dates.extend(dates_before_last(self.contents, &run)?);
+        self.starts.extend(head.iter().map(|&start| widen(start)));
+        self.carry = Some(last);
+        self.flush_full()
+    }
+
+    /// Dates the newest message to the end of the mailbox and pushes the final block.
+    fn finish(mut self) -> io::Result<()> {
+        if let Some(last) = self.carry.take() {
+            self.dates
+                .push(message_date(self.contents, last, self.contents.len())?);
+            self.starts.push(widen(last));
+        }
+        self.flush_full()?;
+        if !self.starts.is_empty() {
+            self.writer.push(&self.starts, &self.dates)?;
+        }
+        self.writer.finish().map(|_count| ())
+    }
+
+    /// Pushes every full block of `starts` and `dates` and keeps the remainder.
+    fn flush_full(&mut self) -> io::Result<()> {
+        let starts = self.starts.chunks_exact(self.per_block);
+        let dates = self.dates.chunks_exact(self.per_block);
+        let full = self.starts.len().saturating_sub(starts.remainder().len());
+        for (block_starts, block_dates) in starts.zip(dates) {
+            self.writer.push(block_starts, block_dates)?;
+        }
+        self.starts.drain(..full).for_each(drop);
+        self.dates.drain(..full).for_each(drop);
+        Ok(())
+    }
+}
+
 /// A bitmap of `blocks` clear bits.
 fn bitmap(blocks: usize) -> Box<[AtomicU64]> {
     iter::repeat_with(|| AtomicU64::new(0))
@@ -506,38 +586,37 @@ fn bit(bits: &[AtomicU64], block: usize) -> Option<(&AtomicU64, u64)> {
     Some((word, 1_u64.checked_shl(place)?))
 }
 
-/// Dates in unix seconds of the messages starting at `starts`, zero for a message without a
-/// parsable Date header.
-fn dates(contents: &[u8], starts: &[usize]) -> Vec<i64> {
-    starts
-        .par_iter()
-        .enumerate()
-        .map(|(position, &start)| {
-            let end = position
-                .checked_add(1)
-                .and_then(|next| starts.get(next))
-                .map_or(contents.len(), |&next| next);
-            // The scanner emits ascending starts below `contents.len()`, so the range exists.
-            contents.get(start..end).map_or(0, date::extract)
-        })
+/// Dates in unix seconds of every message of `run` but the last, each running to the next start,
+/// zero for a message without a parsable Date header.
+fn dates_before_last(contents: &[u8], run: &[usize]) -> io::Result<Vec<i64>> {
+    run.par_iter()
+        .zip(run.par_iter().skip(1))
+        .map(|(&start, &end)| message_date(contents, start, end))
         .collect()
 }
 
-/// The index file for `contents` at the default block shift, with its header.
+/// The index file for `contents` with blocks of `2^block_shift` messages, with its header.
 #[expect(
     clippy::expect_used,
-    reason = "the starts and dates have equal lengths and are cut into full blocks by \
-              format::encode itself, which is all it refuses, and a file it wrote for \
-              `fingerprint` has a header that parses for `fingerprint`"
+    reason = "the scanner's starts ascend below the mailbox length, the block shift is the \
+              caller's documented 1..=16, and a file the writer finished for `fingerprint` \
+              has a header that parses for `fingerprint`; each is all the writer refuses"
 )]
-fn encoded(contents: &[u8], fingerprint: Fingerprint) -> (Vec<u8>, Layout) {
-    let starts = scan::find_message_starts(contents);
-    let dates = dates(contents, &starts);
-    let wide: Vec<u64> = starts.iter().map(|&start| widen(start)).collect();
-    let bytes = format::encode(&wide, &dates, fingerprint, format::DEFAULT_BLOCK_SHIFT)
-        .expect("starts and dates of equal length encode");
+fn encoded(contents: &Mmap, fingerprint: Fingerprint, block_shift: u8) -> (Vec<u8>, Layout) {
+    hint::sequential(contents);
+    let streamed = stream(contents, scan::windows(contents), fingerprint, block_shift);
+    hint::normal(contents);
+    let bytes = streamed.expect("scanned starts and a valid block shift encode");
     let layout = Layout::parse(&bytes, fingerprint).expect("a freshly encoded header parses");
     (bytes, layout)
+}
+
+/// Date of the message at `start..end` of `contents`, an error when the range is not inside it.
+fn message_date(contents: &[u8], start: usize, end: usize) -> io::Result<i64> {
+    contents
+        .get(start..end)
+        .map(date::extract)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a message starts past the end"))
 }
 
 /// Whether `block`'s bit is set in `bits`.
@@ -559,6 +638,40 @@ fn set(bits: &[AtomicU64], block: usize) {
         #[expect(unused_results, reason = "the previous bits are not needed")]
         word.fetch_or(mask, Ordering::Relaxed);
     }
+}
+
+/// The index file for the messages whose starts `windows` yields in order, as bytes.
+///
+/// # Errors
+///
+/// An error when `block_shift` is outside `1..=16` or a start lies past the end of `contents`.
+fn stream<I>(
+    contents: &[u8],
+    windows: I,
+    fingerprint: Fingerprint,
+    block_shift: u8,
+) -> io::Result<Vec<u8>>
+where
+    I: IntoIterator<Item = Vec<usize>>,
+{
+    let mut sink = io::Cursor::new(Vec::new());
+    let writer = Writer::new(&mut sink, fingerprint, block_shift)?;
+    let per_block = 1_usize
+        .checked_shl(u32::from(block_shift))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "block shift is too large"))?;
+    let mut streamer = Streamer {
+        carry: None,
+        contents,
+        dates: Vec::new(),
+        per_block,
+        starts: Vec::new(),
+        writer,
+    };
+    for window in windows {
+        streamer.feed(window)?;
+    }
+    streamer.finish()?;
+    Ok(sink.into_inner())
 }
 
 /// Writes `bytes` to a temporary file beside `path`, syncs it and renames it over `path`.
@@ -1090,6 +1203,112 @@ mod tests {
             fixture.loaded().span(598),
             Some(fixture.expected()[598].clone()),
             "a span ending past the mailbox is answered from the rebuild"
+        );
+    }
+
+    /// A mailbox of `messages` messages dated every other message, with varying body lengths so
+    /// message starts do not line up with segment boundaries.
+    fn dated_mailbox(messages: usize) -> Vec<u8> {
+        (0..messages)
+            .flat_map(|number| {
+                let date = if number.rem_euclid(2) == 0 {
+                    let second = number.rem_euclid(60);
+                    format!("Date: Mon, 01 Jan 2024 12:00:{second:02} +0000\n")
+                } else {
+                    String::new()
+                };
+                let body = "y".repeat(number.rem_euclid(97));
+                format!("From a@b\n{date}Subject: {number}\n\n{body}\n").into_bytes()
+            })
+            .collect()
+    }
+
+    /// `format::encode` over the whole scan, the reference the streaming build must match.
+    fn reference(contents: &[u8], fingerprint: Fingerprint, shift: u8) -> Vec<u8> {
+        let starts = scan::find_message_starts(contents);
+        let dates: Vec<i64> = starts
+            .iter()
+            .enumerate()
+            .map(|(position, &start)| {
+                let end = starts
+                    .get(position.saturating_add(1))
+                    .copied()
+                    .unwrap_or(contents.len());
+                super::date::extract(&contents[start..end])
+            })
+            .collect();
+        let wide: Vec<u64> = starts.iter().map(|&start| widen(start)).collect();
+        format::encode(&wide, &dates, fingerprint, shift).expect("the reference encodes")
+    }
+
+    #[test]
+    fn a_build_over_forced_small_windows_matches_the_whole_vector_encoding() {
+        let contents = dated_mailbox(10_000);
+        let fingerprint = Fingerprint::new(&contents, None);
+        for (segment, per_window, shift) in [(4096, 1, 8), (999, 3, 8), (50_000, 2, 5), (1, 7, 1)] {
+            let windows = scan::windows_with(&contents, segment, per_window);
+            let streamed = super::stream(&contents, windows, fingerprint, shift)
+                .expect("the streaming build encodes");
+            assert_eq!(
+                streamed,
+                reference(&contents, fingerprint, shift),
+                "segment {segment} x {per_window} windows at shift {shift} equals the reference"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_straddling_a_window_boundary_decodes_to_the_per_position_spans() {
+        let contents = dated_mailbox(10_000);
+        let fingerprint = Fingerprint::new(&contents, None);
+        let windows = scan::windows_with(&contents, 3000, 1);
+        let bytes = super::stream(&contents, windows, fingerprint, 8).expect("the build encodes");
+        let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
+        let starts = scan::find_message_starts(&contents);
+        for position in 0..starts.len() {
+            let span = layout
+                .span(&bytes, position)
+                .expect("every position has a span");
+            let end = starts
+                .get(position.saturating_add(1))
+                .copied()
+                .unwrap_or(contents.len());
+            assert_eq!(
+                span,
+                starts[position]..end,
+                "position {position} decodes its span"
+            );
+        }
+    }
+
+    #[test]
+    fn every_streamed_date_equals_the_extractor_including_the_last_message_of_each_window() {
+        let contents = dated_mailbox(10_000);
+        let fingerprint = Fingerprint::new(&contents, None);
+        let windows: Vec<Vec<usize>> = scan::windows_with(&contents, 3000, 1).collect();
+        let bytes = super::stream(&contents, windows, fingerprint, 8).expect("the build encodes");
+        let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
+        let starts = scan::find_message_starts(&contents);
+        for position in 0..starts.len() {
+            let end = starts.get(position.saturating_add(1)).copied();
+            let message = &contents[starts[position]..end.unwrap_or(contents.len())];
+            assert_eq!(
+                layout.date(&bytes, position),
+                Some(super::date::extract(message)),
+                "position {position} carries the extractor's date"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_mailbox_streams_to_the_reference_empty_index() {
+        let fingerprint = Fingerprint::new(b"", None);
+        let streamed = super::stream(b"", scan::windows(b""), fingerprint, 8)
+            .expect("an empty mailbox encodes");
+        assert_eq!(
+            streamed,
+            reference(b"", fingerprint, 8),
+            "no messages yield the reference empty file"
         );
     }
 }

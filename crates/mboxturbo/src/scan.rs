@@ -56,6 +56,7 @@ impl Iterator for Windows<'_> {
 /// Byte offsets of every line in `contents` that begins with `From `, in ascending order.
 ///
 /// Never panics, whatever bytes `contents` holds; empty input yields no offsets.
+#[cfg(test)]
 pub(crate) fn find_message_starts(contents: &[u8]) -> Vec<usize> {
     windows(contents).flatten().collect()
 }
@@ -89,9 +90,10 @@ pub(crate) fn windows_with(
 ///
 /// A `segment_len` of zero is treated as one; `len == 0` yields no ranges.
 fn segment_ranges(len: usize, segment_len: usize) -> Vec<Range<usize>> {
+    let step = segment_len.max(1);
     (0..len)
-        .step_by(segment_len.max(1))
-        .map(|start| start..start.saturating_add(segment_len).min(len))
+        .step_by(step)
+        .map(|start| start..start.saturating_add(step).min(len))
         .collect()
 }
 
@@ -243,6 +245,19 @@ mod tests {
             windows,
             vec![vec![0, 10], vec![22]],
             "the first window holds the first two starts, the second the last"
+        );
+    }
+
+    #[test]
+    fn a_zero_segment_length_scans_one_byte_segments_like_a_length_of_one() {
+        let contents = b"From a\nx\nFrom b\ny\n";
+        let zero: Vec<Vec<usize>> = windows_with(contents, 0, 4).collect();
+        let one: Vec<Vec<usize>> = windows_with(contents, 1, 4).collect();
+        assert_eq!(zero, one, "zero is clamped to one, not read as no segments");
+        assert_eq!(
+            zero.concat(),
+            vec![0, 9],
+            "the clamped scan still finds both starts"
         );
     }
 
