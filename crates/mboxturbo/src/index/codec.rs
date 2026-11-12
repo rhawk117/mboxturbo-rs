@@ -385,9 +385,32 @@ mod tests {
         );
         assert_eq!(
             decoded.block.width, 9,
-            "a span of 300 plus the all-ones sentinel code 301 fits in nine bits"
+            "a span of 300 needs 301 codes, one more than the span, and that fits in nine bits"
         );
         assert_eq!(decoded.values, some(&values), "zeros come back as zeros");
+    }
+
+    #[test]
+    fn zero_outside_a_full_width_span_uses_the_sentinel_at_width_64() {
+        let values = [i64::MIN, -1, 0];
+        let decoded = decode_dates(&values);
+        assert_eq!(
+            decoded.block.flags, MISSING,
+            "zero lies above the non-zero dates"
+        );
+        assert_eq!(
+            decoded.block.width, 64,
+            "a span of 2^63 - 1 needs 2^63 codes, which takes 64 bits"
+        );
+        assert!(
+            verify(&decoded.block, &decoded.payload),
+            "the checksum matches the width-64 payload"
+        );
+        assert_eq!(
+            decoded.values,
+            some(&values),
+            "all three dates come back, zero included"
+        );
     }
 
     #[test]
