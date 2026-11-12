@@ -81,15 +81,29 @@ where
 
 /// The `Date:` header as an instant plus the offset it was written in; `None` when the header
 /// is absent or not a valid date.
-///
-/// A numeric zone in the raw header wins over the parser's own, which cannot hold offsets past
-/// twelve hours.
 pub(crate) fn date(mail: &Mail<'_>) -> Option<Timestamp> {
     let date = mail.date().filter(DateTime::is_valid)?;
-    let offset_minutes = header_values(mail, "date")
+    let raw = header_values(mail, "date")
         .last()
-        .and_then(|raw| raw.split_whitespace().rev().find_map(numeric_zone_minutes))
-        .unwrap_or_else(|| parsed_zone_minutes(&date));
+        .unwrap_or(Cow::Borrowed(""));
+    timestamp(&date, &raw)
+}
+
+/// The instant `date` names, given the unfolded `Date:` header text `raw` it was parsed from;
+/// `None` when `date` fails `DateTime::is_valid`.
+///
+/// A numeric zone in `raw` wins over the parser's own, which cannot hold offsets past twelve
+/// hours; without one, the parsed zone applies. Shared by the message accessor and the index's
+/// header-only extractor so both compute the same seconds.
+pub(crate) fn timestamp(date: &DateTime, raw: &str) -> Option<Timestamp> {
+    if !date.is_valid() {
+        return None;
+    }
+    let offset_minutes = raw
+        .split_whitespace()
+        .rev()
+        .find_map(numeric_zone_minutes)
+        .unwrap_or_else(|| parsed_zone_minutes(date));
     #[expect(
         clippy::disallowed_methods,
         reason = "offset_minutes is at most 23 * 60 + 59 in magnitude: numeric_zone_minutes \
