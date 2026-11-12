@@ -163,6 +163,17 @@ mod tests {
     }
 
     #[test]
+    fn a_crlf_blank_line_ends_the_head_so_a_body_date_is_ignored() {
+        const CRLF_BODY_ONLY: &[u8] =
+            b"From a\r\nSubject: s\r\n\r\nDate: Mon, 01 Jan 2024 12:00:00 +0000\r\n";
+        assert_eq!(
+            assert_agrees(CRLF_BODY_ONLY),
+            0,
+            "a Date line after the CRLF blank line is body text"
+        );
+    }
+
+    #[test]
     fn nothing_past_the_first_blank_line_is_read() {
         let mut message = b"From a\nSubject: s\n\n".to_vec();
         message.extend(repeat_n(b'x', 1 << 20));
