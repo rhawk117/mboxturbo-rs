@@ -121,6 +121,15 @@ impl Mailbox {
         self.bounded(cursor.span(position))
     }
 
+    /// Unix seconds of the Date header of the message at `position`, as the index recorded it,
+    /// or `None` when the message has no parsable Date or `position` is past the last message.
+    /// A Date of exactly the epoch reads as missing, because the index stores 0 for a message
+    /// with no Date header.
+    #[must_use]
+    pub fn date(&self, position: usize) -> Option<i64> {
+        self.index.date(position).filter(|&seconds| seconds != 0)
+    }
+
     /// The message index.
     #[must_use]
     pub const fn index(&self) -> &Index {
@@ -416,5 +425,39 @@ From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
             "the phantom position yields an empty message"
         );
         assert_eq!(mailbox.len(), 3, "the rebuilt index reports the true count");
+    }
+
+    #[test]
+    fn the_indexed_date_equals_the_parsed_date_and_is_none_when_missing() {
+        const DATED: &[u8] =
+            b"From a@x Mon Jan  1 00:00:00 2024\nDate: Mon, 1 Jan 2024 10:00:00 +0100\n\
+Subject: one\n\nfirst\n\
+From b@x Mon Jan  1 00:00:01 2024\nDate: Mon, 1 Jan 2024 10:00:00 -0500\n\
+Subject: two\n\nsecond\n\
+From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        file.write_all(DATED).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(file.path()).expect("fixture mbox opens");
+        for position in 0..mailbox.len() {
+            let parsed = mailbox
+                .message(position)
+                .and_then(|message| message.date())
+                .map(|date| date.unix_seconds);
+            assert_eq!(
+                mailbox.date(position),
+                parsed,
+                "the indexed date is the parsed Date at position {position}"
+            );
+        }
+        assert_eq!(
+            mailbox.date(2),
+            None,
+            "a message without a Date header has no indexed date"
+        );
+        assert_eq!(
+            mailbox.date(mailbox.len()),
+            None,
+            "a position past the last message has no indexed date"
+        );
     }
 }
