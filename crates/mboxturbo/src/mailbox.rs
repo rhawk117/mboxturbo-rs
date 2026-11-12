@@ -18,7 +18,8 @@ use crate::message::Message;
 /// An mbox file mapped read-only, with the byte offset of every message.
 ///
 /// The file must not be modified or truncated while the mailbox, or any [`Message`] taken
-/// from it, is alive.
+/// from it, is alive. The same holds for an index file passed to [`Mailbox::open_cached`], which
+/// this crate only ever replaces by renaming a new file over it.
 #[derive(Debug)]
 pub struct Mailbox {
     /// The read-only mapping, shared with every [`Message`] taken from this mailbox.
@@ -42,8 +43,8 @@ pub struct ParsedBatch {
 /// A mapped file with its fingerprint, before an index is attached.
 #[derive(Debug)]
 struct Mapped {
-    /// The read-only mapping of the whole file.
-    contents: Mmap,
+    /// The read-only mapping of the whole file, shared with the index for a rebuild.
+    contents: Arc<Mmap>,
     /// Identity of the mapped bytes, which a cached index must match to be reused.
     fingerprint: Fingerprint,
 }
@@ -51,9 +52,9 @@ struct Mapped {
 impl Mapped {
     /// Builds a fresh index over the mapping.
     fn into_indexed(self) -> Mailbox {
-        let index = Index::build(&self.contents, self.fingerprint);
+        let index = Index::build(Arc::clone(&self.contents), self.fingerprint);
         Mailbox {
-            contents: Arc::new(self.contents),
+            contents: self.contents,
             index,
         }
     }
@@ -73,7 +74,8 @@ impl Mapped {
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
-        let contents = map_read_only(&file).map_err(|source| MboxTurboError::io(path, source))?;
+        let contents =
+            Arc::new(map_read_only(&file).map_err(|source| MboxTurboError::io(path, source))?);
         let fingerprint = Fingerprint::new(&contents, modified);
         Ok(Self {
             contents,
@@ -84,7 +86,7 @@ impl Mapped {
     /// Attaches an index that was already validated against this mapping's fingerprint.
     fn with_index(self, index: Index) -> Mailbox {
         Mailbox {
-            contents: Arc::new(self.contents),
+            contents: self.contents,
             index,
         }
     }
@@ -106,7 +108,7 @@ impl Mailbox {
 
     /// Whether the mailbox holds no messages.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
 
@@ -118,7 +120,7 @@ impl Mailbox {
 
     /// Number of messages.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.index.len()
     }
 
@@ -149,8 +151,10 @@ impl Mailbox {
     /// # Errors
     ///
     /// [`MboxTurboError::Io`] when either file cannot be read or the new index cannot be written,
-    /// and [`MboxTurboError::CorruptIndex`] when `index_path` exists but fails validation; a
-    /// corrupt file is left in place for inspection rather than overwritten.
+    /// and [`MboxTurboError::CorruptIndex`] when the header of `index_path` is damaged; that file
+    /// is left in place for inspection rather than overwritten. Only the header is checked here:
+    /// a damaged block is found by the first lookup that reaches it, which rescans the mailbox
+    /// and rewrites `index_path` with the repaired index when its directory is writable.
     pub fn open_cached<P, Q>(path: P, index_path: Q) -> Result<Self, MboxTurboError>
     where
         P: AsRef<Path>,
@@ -158,7 +162,7 @@ impl Mailbox {
     {
         let cache_file = index_path.as_ref();
         let mapped = Mapped::open(path.as_ref())?;
-        match Index::load(cache_file, mapped.fingerprint) {
+        match Index::load(cache_file, Arc::clone(&mapped.contents), mapped.fingerprint) {
             Ok(index) => Ok(mapped.with_index(index)),
             Err(error) if error.calls_for_rebuild() => {
                 let mailbox = mapped.into_indexed();
@@ -222,11 +226,11 @@ impl Mailbox {
     /// The span and raw bytes of the message at `position`, which must be below `len()`.
     #[expect(
         clippy::expect_used,
-        reason = "`position` is below `len()`, so the index has a span for it, and every index in \
-                  use keeps its spans inside the mapping: `Index::build` takes `end` from \
-                  `contents.len()` and emits ascending starts below it, and `Index::decode` \
-                  accepts a cached index only on a matching fingerprint and after \
-                  `validate_starts` checked its starts"
+        reason = "`position` is below `len()`, and the index answers every position below its \
+                  count with a span inside the mapping: a span that fails its block checksum or \
+                  runs past the mapping is answered from a rescan instead. The count itself sits \
+                  in the checksummed header written for this mailbox's fingerprint, so only a \
+                  forged header can claim more messages than the rescan finds"
     )]
     fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
         let span = self
@@ -244,12 +248,12 @@ impl Mailbox {
     /// exist, as `(position, span, raw)`.
     ///
     /// Yields one item for every clamped position and never skips one. This rests on one
-    /// invariant: every index in use has starts that ascend, each below its end. A freshly
-    /// built index takes `end` from `contents.len()` in `Index::build`, and its starts come
-    /// from the scanner, which emits them ascending and each below that length. A cached index
-    /// is accepted by `Index::decode` only when its fingerprint, which includes the length,
-    /// matches the mapping's, and `validate_starts` has checked that its starts ascend with the
-    /// last one below `end`.
+    /// invariant: the index answers every position below its count with a span inside the
+    /// mapping. A built index takes its starts from the scanner, which emits them ascending and
+    /// each below the mapping's length. A cached index is accepted only when its fingerprint,
+    /// which includes the length, matches the mapping's; each of its blocks is checked on first
+    /// use, and a block that fails its checksum or places a message outside the mapping makes
+    /// the index answer from a rescan instead.
     pub(crate) fn rows(
         &self,
         positions: Range<usize>,
@@ -266,8 +270,9 @@ impl Mailbox {
     reason = "a read-only map is sound while the file is neither written nor truncated, which \
               is the documented contract of Mailbox and of every Message borrowed from it"
 )]
-/// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`].
-fn map_read_only(file: &File) -> io::Result<Mmap> {
+/// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`],
+/// which covers both the mbox and a cached index file.
+pub(crate) fn map_read_only(file: &File) -> io::Result<Mmap> {
     // SAFETY: a read-only map is sound while the file is neither written nor truncated, which
     // is the documented contract of `Mailbox` and of every `Message` borrowed from it.
     unsafe { Mmap::map(file) }

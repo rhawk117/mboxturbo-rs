@@ -490,7 +490,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::index::Index;
+    use crate::scan;
 
     /// `left + right` for test positions that cannot overflow.
     fn plus(left: usize, right: usize) -> usize {
@@ -841,10 +841,9 @@ mod tests {
             })
             .collect();
         let mailbox = Fingerprint::new(&contents, None);
-        let starts: Vec<u64> = Index::build(&contents, mailbox)
-            .starts()
-            .iter()
-            .map(|start| widen(*start))
+        let starts: Vec<u64> = scan::find_message_starts(&contents)
+            .into_iter()
+            .map(widen)
             .collect();
         assert_eq!(starts.len(), 1_000, "every message is found");
         let dates = vec![0_i64; starts.len()];

@@ -1,52 +1,69 @@
-//! Message boundary index and its versioned, checksummed on-disk format.
+//! Message boundary index over the v2 block-directory file, verified one block at a time and
+//! rebuilt from the mailbox when a block turns out to be damaged.
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the v2 index format by T4")
-)]
 mod codec;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the v2 index build by T5 and T8")
-)]
 mod date;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the v2 index build by T5")
-)]
 mod format;
 
-use std::fs;
-use std::io::Write as _;
+use std::fs::File;
+use std::io::{self, Write as _};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::{fmt, iter};
 
+use memmap2::Mmap;
+use rayon::prelude::*;
 use tempfile::NamedTempFile;
-use xxhash_rust::xxh3::xxh3_64;
 
+use self::format::{Layout, Section};
 use crate::error::{Corruption, MboxTurboError};
 use crate::fingerprint::Fingerprint;
+use crate::mailbox::map_read_only;
 use crate::scan;
 use crate::width::{narrow, widen};
 
 /// First eight bytes of every index file.
 const MAGIC: [u8; 8] = *b"MBOXTIDX";
-/// Format version this build writes and reads; older files count as stale, newer as corrupt.
-const VERSION: u32 = 1;
-/// Bytes before the first offset: magic, version, reserved word, fingerprint, offset count.
-const HEADER_LEN: usize = 56;
-/// Size in bytes of one stored offset, count or checksum.
-const WORD: usize = 8;
+/// Blocks tracked by one word of a verified bitmap.
+const WORD_BITS: usize = 64;
 
-/// Byte offset of every message in one mailbox, tied to that mailbox by its [`Fingerprint`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where the bytes of an index file live.
+#[derive(Debug)]
+enum Backing {
+    /// An index file mapped read-only; it is only ever replaced by a rename, never rewritten.
+    Mapped(Mmap),
+    /// An index encoded in memory by [`Index::build`].
+    Owned(Vec<u8>),
+}
+
+/// Start offset and date of every message in one mailbox, tied to it by its [`Fingerprint`].
+///
+/// Opening a saved index reads only its header. Each block is checked against its checksum the
+/// first time a lookup reaches it. A block that fails that check, or that places a message
+/// outside the mailbox, makes the index rescan the mailbox once; every later lookup is answered
+/// from that rebuild, and the file the index was loaded from is rewritten with it when its
+/// directory allows. Lookups therefore never fail: they answer `None` only past the last message.
 pub struct Index {
-    /// Mailbox length in bytes, where the last message stops.
-    end: usize,
-    /// Identity of the mailbox the offsets were computed from.
+    /// One bit per dates block, set once the block passed its checksum.
+    dates_verified: Box<[AtomicU64]>,
+    /// Identity of the mailbox the index describes.
     fingerprint: Fingerprint,
-    /// Offset where each message starts, strictly increasing and all below `end`.
-    starts: Box<[usize]>,
+    /// Header of `original`.
+    layout: Layout,
+    /// The mapped mailbox, rescanned when a block is damaged.
+    mailbox: Arc<Mmap>,
+    /// The file the index was loaded from, which a rebuild rewrites.
+    origin: Option<PathBuf>,
+    /// The index bytes as loaded or built, read until a rebuild replaces them.
+    original: Backing,
+    /// The bytes and header of the rebuild, once a damaged block forced one; never re-verified.
+    replacement: OnceLock<(Vec<u8>, Layout)>,
+    /// What rewriting `origin` with the rebuild produced, once a rebuild ran with an origin.
+    rewrite: OnceLock<io::Result<()>>,
+    /// One bit per starts block, set once the block passed its checksum.
+    starts_verified: Box<[AtomicU64]>,
 }
 
 /// Why a stored index was not accepted; [`Rejection::at`] attaches the file path.
@@ -78,68 +95,70 @@ impl Rejection {
     }
 }
 
+impl Backing {
+    /// The whole index file.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mapped) => mapped,
+            Self::Owned(owned) => owned,
+        }
+    }
+}
+
+impl fmt::Debug for Index {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "the trait calls it `f`, a one-letter name the min_ident_chars lint bans"
+    )]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Index")
+            .field("fingerprint", &self.fingerprint)
+            .field("layout", self.active().1)
+            .field("origin", &self.origin)
+            .field("rebuilt", &self.replacement.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Index {
+    /// Two indexes are equal when they describe the same mailbox with the same bytes, whether
+    /// mapped from a file, built in memory or rebuilt.
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint && self.active().0 == other.active().0
+    }
+}
+
+impl Eq for Index {}
+
 impl Index {
-    /// Indexes every message in `contents`, scanning segments of it on all rayon threads.
+    /// The bytes and header lookups read now: the rebuild once one ran, else the original.
+    fn active(&self) -> (&[u8], &Layout) {
+        self.replacement.get().map_or_else(
+            || (self.original.bytes(), &self.layout),
+            |(bytes, layout)| (bytes.as_slice(), layout),
+        )
+    }
+
+    /// Indexes every message in `contents`, scanning it and reading each Date header on all
+    /// rayon threads.
     ///
-    /// A message starts at a line beginning with `From `, matching Python's `mailbox.mbox`.
+    /// A message starts at a line beginning with `From `, matching Python's `mailbox.mbox`; a
+    /// message without a parsable Date header is dated zero.
     #[must_use]
-    pub fn build(contents: &[u8], fingerprint: Fingerprint) -> Self {
-        Self {
-            starts: scan::find_message_starts(contents).into_boxed_slice(),
-            end: contents.len(),
-            fingerprint,
-        }
+    pub fn build(contents: Arc<Mmap>, fingerprint: Fingerprint) -> Self {
+        let (bytes, layout) = encoded(&contents, fingerprint);
+        Self::new(contents, Backing::Owned(bytes), layout, None)
     }
 
-    /// Parses and validates `bytes`, accepting it only for the mailbox `expected` identifies.
-    ///
-    /// Every length and offset comes from the file, so each is checked before use; nothing here
-    /// panics on malformed input.
-    fn decode(bytes: &[u8], expected: Fingerprint) -> Result<Self, Rejection> {
-        let (body, checksum) = bytes
-            .split_last_chunk::<WORD>()
-            .ok_or_else(|| truncated(WORD, bytes.len()))?;
-        let after_version = check_signature_and_version(body)?;
-        if xxh3_64(body) != u64::from_le_bytes(*checksum) {
-            return Err(Corruption::Checksum.into());
-        }
-        let (stored, after_fingerprint) = take_fingerprint(after_version)?;
-        if stored != expected {
-            return Err(Rejection::Stale);
-        }
-        let (count, offsets) = take_u64(after_fingerprint)?;
-        let starts = decode_starts(offsets, count)?;
-        let end = narrow(stored.len()).ok_or(Corruption::MailboxTooLarge {
-            length: stored.len(),
-        })?;
-        validate_starts(&starts, end)?;
-        Ok(Self {
-            starts,
-            end,
-            fingerprint: stored,
+    /// Date of the message at `position` in unix seconds, `Some(0)` when it has no parsable
+    /// Date header, or `None` past the last message.
+    #[must_use]
+    pub fn date(&self, position: usize) -> Option<i64> {
+        let needed = position..position.saturating_add(1);
+        self.lookup(Section::Dates, needed, |bytes, layout| {
+            layout.date(bytes, position)
         })
-    }
-
-    /// The on-disk form: header, little-endian offsets, then an xxh3 checksum of all before it.
-    fn encode(&self) -> Vec<u8> {
-        let offsets_len = self.starts.len().saturating_mul(WORD);
-        let mut out =
-            Vec::with_capacity(HEADER_LEN.saturating_add(offsets_len).saturating_add(WORD));
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.len().to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.modified_nanos().to_le_bytes());
-        out.extend_from_slice(&self.fingerprint.sample_hash().to_le_bytes());
-        out.extend_from_slice(&widen(self.starts.len()).to_le_bytes());
-        out.extend(
-            self.starts
-                .iter()
-                .flat_map(|&start| widen(start).to_le_bytes()),
-        );
-        let checksum = xxh3_64(&out);
-        out.extend_from_slice(&checksum.to_le_bytes());
-        out
     }
 
     /// Identity of the mailbox this index describes.
@@ -150,61 +169,134 @@ impl Index {
 
     /// Whether the mailbox holds no messages.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.starts.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
-    /// Number of messages.
+    /// Number of messages, as counted by the rebuild once one ran.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        self.starts.len()
+    pub fn len(&self) -> usize {
+        messages(self.active().1)
     }
 
-    /// Reads an index from `path` and checks it was built for the mailbox `expected` identifies.
+    /// Maps the index file at `path` and checks its header against the mailbox `expected`
+    /// identifies, whose mapping `mailbox` is kept for a rebuild. Only the header is read here;
+    /// blocks are checked when lookups reach them.
     ///
     /// # Errors
     ///
-    /// [`MboxTurboError::Io`] when the file cannot be read, [`MboxTurboError::CorruptIndex`] when
-    /// it fails validation, and [`MboxTurboError::StaleIndex`] when it belongs to a different
+    /// [`MboxTurboError::Io`] when the file cannot be opened or mapped,
+    /// [`MboxTurboError::CorruptIndex`] when its header or length fails validation, and
+    /// [`MboxTurboError::StaleIndex`] when it was written by an older format or for a different
     /// mailbox than `expected`.
-    pub fn load(path: &Path, expected: Fingerprint) -> Result<Self, MboxTurboError> {
-        let bytes = fs::read(path).map_err(|source| MboxTurboError::io(path, source))?;
-        Self::decode(&bytes, expected).map_err(|rejection| rejection.at(path))
+    pub fn load(
+        path: &Path,
+        mailbox: Arc<Mmap>,
+        expected: Fingerprint,
+    ) -> Result<Self, MboxTurboError> {
+        let file = File::open(path).map_err(|source| MboxTurboError::io(path, source))?;
+        let mapped = map_read_only(&file).map_err(|source| MboxTurboError::io(path, source))?;
+        let layout = Layout::parse(&mapped, expected).map_err(|rejection| rejection.at(path))?;
+        let origin = Some(path.to_path_buf());
+        Ok(Self::new(mailbox, Backing::Mapped(mapped), layout, origin))
     }
 
-    /// Writes the index to `path` atomically: readers see the old file or the new one, never a
-    /// partial write.
+    /// Answers `read` from the original bytes when the `section` blocks of every message in
+    /// `needed` that exists pass their checksums, and from the rebuild otherwise, or when the
+    /// original answers `None` for a message it claims to hold. `None` when `needed` starts past
+    /// the last message.
+    fn lookup<T, F>(&self, section: Section, needed: Range<usize>, read: F) -> Option<T>
+    where
+        F: Fn(&[u8], &Layout) -> Option<T>,
+    {
+        if let Some((bytes, layout)) = self.replacement.get() {
+            return read(bytes, layout);
+        }
+        let count = messages(&self.layout);
+        if needed.start >= count {
+            return None;
+        }
+        let mut positions = needed.start..needed.end.min(count);
+        let sound = positions.all(|position| self.verify(section, position));
+        let found = if sound {
+            read(self.original.bytes(), &self.layout)
+        } else {
+            None
+        };
+        found.or_else(|| {
+            let (bytes, layout) = self.rebuilt();
+            read(bytes, layout)
+        })
+    }
+
+    /// An index over `original`, whose header is `layout`, with no block verified yet.
+    fn new(mailbox: Arc<Mmap>, original: Backing, layout: Layout, origin: Option<PathBuf>) -> Self {
+        Self {
+            dates_verified: bitmap(layout.blocks()),
+            fingerprint: layout.fingerprint,
+            layout,
+            mailbox,
+            origin,
+            original,
+            replacement: OnceLock::new(),
+            rewrite: OnceLock::new(),
+            starts_verified: bitmap(layout.blocks()),
+        }
+    }
+
+    /// Rescans the mailbox and, when the index was loaded from a file, rewrites that file with
+    /// the result and keeps the outcome for [`Index::rewrite_outcome`].
+    fn rebuild(&self) -> (Vec<u8>, Layout) {
+        let (bytes, layout) = encoded(&self.mailbox, self.fingerprint);
+        if let Some(origin) = &self.origin {
+            #[expect(
+                unused_results,
+                reason = "the outcome is kept in `rewrite` for rewrite_outcome; a failed rewrite \
+                          leaves lookups answered from memory, which is still correct"
+            )]
+            self.rewrite
+                .get_or_init(|| write_atomically(origin, &bytes));
+        }
+        (bytes, layout)
+    }
+
+    /// The rebuild, running it first when no lookup has; concurrent callers wait for one run.
+    fn rebuilt(&self) -> (&[u8], &Layout) {
+        let (bytes, layout) = self.replacement.get_or_init(|| self.rebuild());
+        (bytes, layout)
+    }
+
+    /// Whether a rebuild rewrote the file the index was loaded from: `None` until a rebuild of
+    /// a loaded index ran, else the outcome of the rename into place.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the Python bindings once T9 lands")
+    )]
+    pub(crate) fn rewrite_outcome(&self) -> Option<Result<(), &io::Error>> {
+        self.rewrite.get().map(|outcome| outcome.as_ref().copied())
+    }
+
+    /// Writes the index to `path` atomically, staging a temporary file beside it and renaming
+    /// it into place, so readers and existing mappings see the old file or the new one, never a
+    /// partial write. After a rebuild the rebuilt bytes are written.
     ///
     /// # Errors
     ///
     /// [`MboxTurboError::Io`] when the temporary file cannot be created, written, synced, or
     /// renamed into place.
     pub fn save(&self, path: &Path) -> Result<(), MboxTurboError> {
-        let directory = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        let mut staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))
-            .map_err(|source| MboxTurboError::io(path, source))?;
-        staged
-            .write_all(&self.encode())
-            .map_err(|source| MboxTurboError::io(path, source))?;
-        staged
-            .as_file()
-            .sync_all()
-            .map_err(|source| MboxTurboError::io(path, source))?;
-        staged
-            .persist(path)
-            .map(|_persisted| ())
-            .map_err(|failure| MboxTurboError::io(path, failure.error))?;
-        Ok(())
+        write_atomically(path, self.active().0).map_err(|source| MboxTurboError::io(path, source))
     }
 
-    /// Byte range of the message at `position`, or `None` past the last message.
+    /// Byte range of the message at `position`, from its start to the next message's start or
+    /// to the end of the mailbox for the last message, or `None` past the last message.
     #[must_use]
     pub fn span(&self, position: usize) -> Option<Range<usize>> {
-        let mut following = self.starts.get(position..)?.iter().copied();
-        let start = following.next()?;
-        Some(start..following.next().unwrap_or(self.end))
+        let end = self.mailbox.len();
+        let needed = position..position.saturating_add(2);
+        self.lookup(Section::Starts, needed, |bytes, layout| {
+            layout.span(bytes, position).filter(|span| span.end <= end)
+        })
     }
 
     /// Byte range covering the messages at `positions`, clamped to the messages that exist.
@@ -218,156 +310,343 @@ impl Index {
         (first.start < last.end).then_some(first.start..last.end)
     }
 
-    /// Byte offset where each message starts, in file order.
-    #[must_use]
-    pub const fn starts(&self) -> &[usize] {
-        &self.starts
+    /// The verified bitmap of `section`.
+    fn verified_bits(&self, section: Section) -> &[AtomicU64] {
+        match section {
+            Section::Dates => &self.dates_verified,
+            Section::Starts => &self.starts_verified,
+        }
+    }
+
+    /// Blocks of `section` whose checksum a lookup has checked and accepted.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the cache statistics once T11 lands")
+    )]
+    pub(crate) fn verified_blocks(&self, section: Section) -> usize {
+        let bits = self.verified_bits(section);
+        (0..self.layout.blocks())
+            .filter(|&block| is_set(bits, block))
+            .count()
+    }
+
+    /// Whether the original `section` block holding `position` passes its checksum, checking it
+    /// only the first time. An entry the layout refuses fails.
+    fn verify(&self, section: Section, position: usize) -> bool {
+        let bits = self.verified_bits(section);
+        let Some(block) = position.checked_shr(u32::from(self.layout.block_shift)) else {
+            return false;
+        };
+        if is_set(bits, block) {
+            return true;
+        }
+        let sound = self
+            .layout
+            .entry(self.original.bytes(), section, block)
+            .is_some_and(|(entry, payload)| codec::verify(&entry, payload));
+        if sound {
+            set(bits, block);
+        }
+        sound
     }
 }
 
-/// Bytes read from the front of a slice, and the slice that remains after them.
-type Taken<'bytes, T> = Result<(T, &'bytes [u8]), Corruption>;
-
-/// Checks the magic and version at the start of `body` and returns what follows them.
-///
-/// An older version is [`Rejection::Stale`] so caches rebuild; a newer one is corrupt.
-fn check_signature_and_version(body: &[u8]) -> Result<&[u8], Rejection> {
-    let (magic, after_magic) = body.split_first_chunk::<8>().ok_or(Corruption::Signature)?;
-    if *magic != MAGIC {
-        return Err(Corruption::Signature.into());
-    }
-    let (version, after_version) = take_u32(after_magic)?;
-    if version < VERSION {
-        return Err(Rejection::Stale);
-    }
-    if version != VERSION {
-        return Err(Corruption::Version(version).into());
-    }
-    Ok(after_version)
+/// A bitmap of `blocks` clear bits.
+fn bitmap(blocks: usize) -> Box<[AtomicU64]> {
+    iter::repeat_with(|| AtomicU64::new(0))
+        .take(blocks.div_ceil(WORD_BITS))
+        .collect()
 }
 
-/// Reads the reserved word and the stored [`Fingerprint`] fields from the front of `bytes`.
-fn take_fingerprint(bytes: &[u8]) -> Taken<'_, Fingerprint> {
-    let (_reserved, after_reserved) = take_u32(bytes)?;
-    let (len, after_len) = take_u64(after_reserved)?;
-    let (modified, after_modified) = after_len
-        .split_first_chunk::<16>()
-        .ok_or_else(|| truncated(16, after_len.len()))?;
-    let (sample_hash, after_hash) = take_u64(after_modified)?;
-    let fingerprint = Fingerprint::from_parts(len, i128::from_le_bytes(*modified), sample_hash);
-    Ok((fingerprint, after_hash))
+/// The word of `bits` holding `block`'s bit and the mask selecting it, or `None` past the end.
+fn bit(bits: &[AtomicU64], block: usize) -> Option<(&AtomicU64, u64)> {
+    let word = bits.get(block.checked_div(WORD_BITS)?)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a remainder of division by 64 always fits u32, so the conversion never fails"
+    )]
+    let place = u32::try_from(block.checked_rem(WORD_BITS)?).ok()?;
+    Some((word, 1_u64.checked_shl(place)?))
 }
 
-/// A [`Corruption::Length`] for a read of `declared` bytes with only `actual` left.
-fn truncated(declared: usize, actual: usize) -> Corruption {
-    Corruption::Length {
-        declared: widen(declared),
-        actual: widen(actual),
-    }
-}
-
-/// Reads a little-endian `u32` from the front of `bytes`, or reports how many bytes were left.
-fn take_u32(bytes: &[u8]) -> Taken<'_, u32> {
-    let (word, rest) = bytes
-        .split_first_chunk::<4>()
-        .ok_or_else(|| truncated(4, bytes.len()))?;
-    Ok((u32::from_le_bytes(*word), rest))
-}
-
-/// Reads a little-endian `u64` from the front of `bytes`, or reports how many bytes were left.
-fn take_u64(bytes: &[u8]) -> Taken<'_, u64> {
-    let (word, rest) = bytes
-        .split_first_chunk::<WORD>()
-        .ok_or_else(|| truncated(WORD, bytes.len()))?;
-    Ok((u64::from_le_bytes(*word), rest))
-}
-
-/// Reads the offset table, which must hold exactly `count` words, rejecting any that exceed
-/// `usize`.
-fn decode_starts(bytes: &[u8], count: u64) -> Result<Box<[usize]>, Corruption> {
-    let (words, remainder) = bytes.as_chunks::<WORD>();
-    if !remainder.is_empty() || widen(words.len()) != count {
-        return Err(Corruption::Length {
-            declared: count.saturating_mul(widen(WORD)),
-            actual: widen(bytes.len()),
-        });
-    }
-    words
-        .iter()
+/// Dates in unix seconds of the messages starting at `starts`, zero for a message without a
+/// parsable Date header.
+fn dates(contents: &[u8], starts: &[usize]) -> Vec<i64> {
+    starts
+        .par_iter()
         .enumerate()
-        .map(|(position, &word)| {
-            let offset = u64::from_le_bytes(word);
-            narrow(offset).ok_or(Corruption::Bounds { position, offset })
+        .map(|(position, &start)| {
+            let end = position
+                .checked_add(1)
+                .and_then(|next| starts.get(next))
+                .map_or(contents.len(), |&next| next);
+            // The scanner emits ascending starts below `contents.len()`, so the range exists.
+            contents.get(start..end).map_or(0, date::extract)
         })
         .collect()
 }
 
-/// Requires `starts` to be strictly increasing and every offset to lie below `end`.
-fn validate_starts(starts: &[usize], end: usize) -> Result<(), Corruption> {
-    let disordered = starts
-        .windows(2)
-        .enumerate()
-        .find_map(|(index, pair)| match *pair {
-            [previous, offset] if previous >= offset => Some(Corruption::Order {
-                position: index.saturating_add(1),
-                offset,
-                previous,
-            }),
-            _ => None,
-        });
-    if let Some(corruption) = disordered {
-        return Err(corruption);
+/// The index file for `contents` at the default block shift, with its header.
+#[expect(
+    clippy::expect_used,
+    reason = "the starts and dates have equal lengths and are cut into full blocks by \
+              format::encode itself, which is all it refuses, and a file it wrote for \
+              `fingerprint` has a header that parses for `fingerprint`"
+)]
+fn encoded(contents: &[u8], fingerprint: Fingerprint) -> (Vec<u8>, Layout) {
+    let starts = scan::find_message_starts(contents);
+    let dates = dates(contents, &starts);
+    let wide: Vec<u64> = starts.iter().map(|&start| widen(start)).collect();
+    let bytes = format::encode(&wide, &dates, fingerprint, format::DEFAULT_BLOCK_SHIFT)
+        .expect("starts and dates of equal length encode");
+    let layout = Layout::parse(&bytes, fingerprint).expect("a freshly encoded header parses");
+    (bytes, layout)
+}
+
+/// Whether `block`'s bit is set in `bits`.
+fn is_set(bits: &[AtomicU64], block: usize) -> bool {
+    bit(bits, block).is_some_and(|(word, mask)| word.load(Ordering::Relaxed) & mask != 0)
+}
+
+/// Messages `layout` holds. Its header passed the length check, so on a 64-bit target the count
+/// fits; a count past `usize::MAX` on a narrower target saturates, and the lookups past the
+/// messages the file can hold fail verification and are answered by the rebuild.
+fn messages(layout: &Layout) -> usize {
+    narrow(layout.count).unwrap_or(usize::MAX)
+}
+
+/// Sets `block`'s bit in `bits`. Relaxed suffices: the bytes behind it never change, and the
+/// bit only spares a recheck.
+fn set(bits: &[AtomicU64], block: usize) {
+    if let Some((word, mask)) = bit(bits, block) {
+        #[expect(unused_results, reason = "the previous bits are not needed")]
+        word.fetch_or(mask, Ordering::Relaxed);
     }
-    match starts.last() {
-        Some(&last) if last >= end => Err(Corruption::Bounds {
-            position: starts.len().saturating_sub(1),
-            offset: widen(last),
-        }),
-        _ => Ok(()),
-    }
+}
+
+/// Writes `bytes` to a temporary file beside `path`, syncs it and renames it over `path`.
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let mut staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist(path)
+        .map(|_persisted| ())
+        .map_err(|failure| failure.error)
 }
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use std::fs::{self, File};
+    use std::ops::Range;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::thread;
 
-    use super::{HEADER_LEN, Index, Rejection, xxh3_64};
-    use crate::error::Corruption;
+    use memmap2::Mmap;
+    use tempfile::TempDir;
+
+    use super::{Index, Section, format};
+    use crate::error::MboxTurboError;
     use crate::fingerprint::Fingerprint;
+    use crate::mailbox::map_read_only;
+    use crate::scan;
+    use crate::width::{narrow, widen};
 
-    const MAILBOX: &[u8] = b"From a\nSubject: one\n\nbody\n\nFrom b\nSubject: two\n\nbody\n";
+    /// Messages in the fixture: two full blocks of 256 and a short third block.
+    const MESSAGES: usize = 600;
 
-    fn built() -> Index {
-        Index::build(MAILBOX, Fingerprint::new(MAILBOX, None))
+    /// A mailbox mapped from a temporary directory that also holds its index file.
+    struct Fixture {
+        /// The bytes of the mailbox.
+        contents: Vec<u8>,
+        /// The directory holding the mailbox and its index, removed on drop.
+        dir: TempDir,
+        /// Identity of the mailbox.
+        fingerprint: Fingerprint,
+        /// The mapped mailbox.
+        mailbox: Arc<Mmap>,
     }
 
-    fn rejection(bytes: &[u8]) -> Rejection {
-        Index::decode(bytes, built().fingerprint()).expect_err("decode must reject")
+    impl Fixture {
+        fn built(&self) -> Index {
+            Index::build(Arc::clone(&self.mailbox), self.fingerprint)
+        }
+
+        /// Overwrites the index file in place with `byte` flipped.
+        fn damage(&self, byte: usize) {
+            let path = self.index_path();
+            let mut bytes = fs::read(&path).expect("the saved index reads back");
+            bytes[byte] ^= 0xFF;
+            fs::write(&path, bytes).expect("the damaged index is written back");
+        }
+
+        /// Where the entry of starts block `block` begins in the saved index.
+        fn entry_at(&self, block: usize) -> usize {
+            let bytes = fs::read(self.index_path()).expect("the saved index reads back");
+            let layout =
+                format::Layout::parse(&bytes, self.fingerprint).expect("the saved header is valid");
+            let directory = narrow(layout.dir_offset).expect("the offset fits usize");
+            let skipped = block
+                .checked_mul(format::ENTRY_LEN)
+                .expect("test blocks are few");
+            plus(directory, skipped)
+        }
+
+        /// The span of every message, from a scan of the mailbox.
+        fn expected(&self) -> Vec<Range<usize>> {
+            let starts = scan::find_message_starts(&self.contents);
+            let ends = starts.iter().skip(1).copied().chain([self.contents.len()]);
+            starts
+                .iter()
+                .copied()
+                .zip(ends)
+                .map(|(start, end)| start..end)
+                .collect()
+        }
+
+        fn index_path(&self) -> PathBuf {
+            self.dir.path().join("mbox.idx")
+        }
+
+        fn loaded(&self) -> Index {
+            Index::load(
+                &self.index_path(),
+                Arc::clone(&self.mailbox),
+                self.fingerprint,
+            )
+            .expect("the saved index loads")
+        }
+
+        fn new() -> Self {
+            let dir = TempDir::new().expect("a temporary directory is created");
+            let contents = contents();
+            let path = dir.path().join("mbox");
+            fs::write(&path, &contents).expect("the fixture mailbox is written");
+            let file = File::open(&path).expect("the fixture mailbox reopens");
+            let mailbox = Arc::new(map_read_only(&file).expect("the fixture mailbox maps"));
+            Self {
+                fingerprint: Fingerprint::new(&contents, None),
+                contents,
+                dir,
+                mailbox,
+            }
+        }
+
+        /// Saves a freshly built index and returns its bytes.
+        fn saved(&self) -> Vec<u8> {
+            self.built()
+                .save(&self.index_path())
+                .expect("the index is saved");
+            fs::read(self.index_path()).expect("the saved index reads back")
+        }
+
+        /// Every span `index` answers for the fixture's positions.
+        fn spans(index: &Index) -> Vec<Range<usize>> {
+            (0..MESSAGES)
+                .filter_map(|position| index.span(position))
+                .collect()
+        }
+    }
+
+    /// `left + right` for test offsets that cannot overflow.
+    fn plus(left: usize, right: usize) -> usize {
+        left.checked_add(right).expect("test offsets are small")
+    }
+
+    /// A mailbox of [`MESSAGES`] messages in which every seventh has no Date header.
+    fn contents() -> Vec<u8> {
+        (0..MESSAGES)
+            .flat_map(|number| {
+                let date = if number.rem_euclid(7) == 0 {
+                    String::new()
+                } else {
+                    let minute = number.rem_euclid(60);
+                    format!("Date: Mon, 01 Jan 2024 12:{minute:02}:00 +0000\n")
+                };
+                let body = "x".repeat(number.rem_euclid(40));
+                format!("From a@b\n{date}Subject: {number}\n\n{body}\n").into_bytes()
+            })
+            .collect()
+    }
+
+    /// Where the payload of starts block `block` begins, read from its directory entry.
+    fn payload_at(fixture: &Fixture, block: usize) -> usize {
+        let bytes = fs::read(fixture.index_path()).expect("the saved index reads back");
+        let field = plus(fixture.entry_at(block), 8);
+        let word: [u8; 8] = bytes[field..plus(field, 8)]
+            .try_into()
+            .expect("an entry field is eight bytes");
+        narrow(u64::from_le_bytes(word)).expect("the payload offset fits usize")
+    }
+
+    /// The inode of the fixture's index file, which a rename into place changes.
+    #[cfg(unix)]
+    fn inode(fixture: &Fixture) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+
+        fs::metadata(fixture.index_path())
+            .expect("the index file exists")
+            .ino()
+    }
+
+    /// Damages the saved index at `byte`, then checks that the first lookup into the damaged
+    /// block rebuilds the index, renames the rebuilt file into place and answers correctly, and
+    /// that no later lookup renames another file into place.
+    #[cfg(unix)]
+    fn assert_one_rebuild(fixture: &Fixture, byte: usize) {
+        fixture.damage(byte);
+        let index = fixture.loaded();
+        let damaged = inode(fixture);
+        let expected = fixture.expected();
+        assert_eq!(
+            index.span(300),
+            Some(expected[300].clone()),
+            "the damaged block is rebuilt"
+        );
+        assert!(
+            matches!(index.rewrite_outcome(), Some(Ok(()))),
+            "the rebuild rewrote the file it was loaded from"
+        );
+        let rewritten = inode(fixture);
+        assert_ne!(
+            rewritten, damaged,
+            "the rewrite renamed a new file into place"
+        );
+        assert_eq!(
+            Fixture::spans(&index),
+            expected,
+            "every span comes from the rebuild"
+        );
+        assert_eq!(
+            inode(fixture),
+            rewritten,
+            "later lookups do not rebuild again"
+        );
     }
 
     #[test]
-    fn round_trips_through_its_encoding() {
-        let index = built();
-        let decoded = Index::decode(&index.encode(), index.fingerprint())
-            .expect("an index decodes its own encoding");
-        assert_eq!(decoded, index, "decode(encode(x)) == x");
+    fn a_loaded_index_equals_the_index_it_was_saved_from() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        assert_eq!(fixture.loaded(), fixture.built(), "load(save(x)) == x");
     }
 
     #[test]
     fn spans_cover_each_message_and_the_last_runs_to_the_end() {
-        let index = built();
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        let index = fixture.loaded();
         assert_eq!(
-            index.span(0),
-            Some(0..27),
-            "the first message spans from its start to the second's start"
+            Fixture::spans(&index),
+            fixture.expected(),
+            "each span runs to the next start or to the end of the mailbox"
         );
         assert_eq!(
-            index.span(1),
-            Some(27..MAILBOX.len()),
-            "the last message runs to the end of the mailbox"
-        );
-        assert_eq!(
-            index.span(2),
+            index.span(MESSAGES),
             None,
             "a position past the last message has no span"
         );
@@ -375,167 +654,234 @@ mod tests {
 
     #[test]
     fn ranges_of_messages_span_from_the_first_start_to_the_last_end() {
-        let index = built();
+        let fixture = Fixture::new();
+        let index = fixture.built();
+        let expected = fixture.expected();
         assert_eq!(
-            index.span_of(0..2),
-            Some(0..MAILBOX.len()),
+            index.span_of(0..MESSAGES),
+            Some(0..fixture.contents.len()),
             "a range over every message spans the whole mailbox"
         );
         assert_eq!(
-            index.span_of(1..9),
-            Some(27..MAILBOX.len()),
+            index.span_of(599..900),
+            Some(expected[599].clone()),
             "a range running past the last message is clamped to the mailbox end"
         );
+        assert_eq!(index.span_of(3..3), None, "an empty range covers no bytes");
+    }
+
+    #[test]
+    fn a_message_without_a_date_is_dated_zero() {
+        let index = Fixture::new().built();
+        assert_eq!(index.date(7), Some(0), "message 7 has no Date header");
+    }
+
+    #[test]
+    fn a_date_header_is_read_as_unix_seconds() {
+        let index = Fixture::new().built();
         assert_eq!(
-            index.span_of(1..1),
-            None,
-            "an empty range covers no bytes, so it has no span"
+            index.date(1),
+            Some(1_704_110_460),
+            "Mon, 01 Jan 2024 12:01:00 +0000 in unix seconds"
         );
     }
 
     #[test]
-    fn rejects_an_index_built_for_a_different_mailbox() {
+    fn a_position_past_the_last_message_has_no_date() {
+        let index = Fixture::new().built();
+        assert_eq!(index.date(MESSAGES), None, "only 600 messages exist");
+    }
+
+    #[test]
+    fn an_index_for_a_different_mailbox_is_stale() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
         let other = Fingerprint::new(b"From z\n", None);
-        let result = Index::decode(&built().encode(), other);
+        let result = Index::load(&fixture.index_path(), Arc::clone(&fixture.mailbox), other);
         assert!(
-            matches!(result, Err(Rejection::Stale)),
-            "fingerprint mismatch is stale"
+            matches!(result, Err(MboxTurboError::StaleIndex { .. })),
+            "a fingerprint mismatch is stale"
         );
     }
 
     #[test]
-    fn rejects_a_file_without_the_signature() {
-        let mut bytes = built().encode();
-        bytes[0] = b'X';
-        assert!(
-            matches!(rejection(&bytes), Rejection::Corrupt(Corruption::Signature)),
-            "a corrupted first byte fails the signature check"
+    fn saving_replaces_the_target_and_leaves_no_temporary_file() {
+        let fixture = Fixture::new();
+        let first = fixture.saved();
+        let second = fixture.saved();
+        let mut names: Vec<_> = fs::read_dir(fixture.dir.path())
+            .expect("the fixture directory lists")
+            .map(|entry| entry.expect("a directory entry reads").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["mbox", "mbox.idx"],
+            "the staged file was renamed into place"
+        );
+        assert_eq!(
+            first, second,
+            "saving the same index twice writes the same bytes"
         );
     }
 
     #[test]
-    fn rejects_a_future_format_version() {
-        let mut bytes = built().encode();
-        bytes[8] = 2;
-        assert!(
-            matches!(
-                rejection(&bytes),
-                Rejection::Corrupt(Corruption::Version(2))
+    fn a_lookup_verifies_its_block_once() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        let index = fixture.loaded();
+        assert_eq!(
+            index.verified_blocks(Section::Starts),
+            0,
+            "loading checks no block"
+        );
+        let _first = index.span(0);
+        assert_eq!(
+            index.verified_blocks(Section::Starts),
+            1,
+            "the first lookup checks block 0"
+        );
+        let _second = index.span(1);
+        assert_eq!(
+            index.verified_blocks(Section::Starts),
+            1,
+            "a second lookup into block 0 checks nothing new"
+        );
+    }
+
+    #[test]
+    fn a_date_lookup_verifies_only_its_dates_block() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        let index = fixture.loaded();
+        let _date = index.date(300);
+        assert_eq!(
+            (
+                index.verified_blocks(Section::Dates),
+                index.verified_blocks(Section::Starts)
             ),
-            "a version newer than the format supports is rejected as corrupt"
+            (1, 0),
+            "a date reads the dates directory alone"
         );
     }
 
     #[test]
-    fn treats_an_older_format_version_as_stale_so_caches_rebuild() {
-        let mut bytes = built().encode();
-        bytes[8] = 0;
+    fn a_clean_lookup_does_not_rewrite_the_file() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        let index = fixture.loaded();
+        let _span = index.span(300);
         assert!(
-            matches!(rejection(&bytes), Rejection::Stale),
-            "older formats rebuild"
+            index.rewrite_outcome().is_none(),
+            "a sound block needs no rebuild"
         );
     }
 
-    fn resealed(mut body: Vec<u8>) -> Vec<u8> {
-        let checksum = xxh3_64(&body);
-        body.extend_from_slice(&checksum.to_le_bytes());
-        body
+    #[cfg(unix)]
+    #[test]
+    fn a_payload_corruption_triggers_exactly_one_rebuild() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        assert_one_rebuild(&fixture, payload_at(&fixture, 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_entry_corruption_triggers_exactly_one_rebuild() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        assert_one_rebuild(&fixture, plus(fixture.entry_at(1), 16));
     }
 
     #[test]
-    fn a_file_shorter_than_its_checksum_reports_the_bytes_it_has() {
-        assert!(
-            matches!(
-                rejection(&[0; 3]),
-                Rejection::Corrupt(Corruption::Length {
-                    declared: 8,
-                    actual: 3
-                })
-            ),
-            "three bytes cannot hold a checksum word"
+    fn a_rebuild_rewrites_the_file_a_clean_build_would_save() {
+        let fixture = Fixture::new();
+        let clean = fixture.saved();
+        fixture.damage(payload_at(&fixture, 1));
+        let _span = fixture.loaded().span(300);
+        assert_eq!(
+            fs::read(fixture.index_path()).expect("the rewritten index reads back"),
+            clean,
+            "the rewrite holds the bytes of a fresh build"
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn an_offset_table_shorter_than_the_declared_count_reports_both_sizes() {
-        let mut body = built().encode();
-        body.truncate(body.len() - 16);
-        let bytes = resealed(body);
-        assert!(
-            matches!(
-                rejection(&bytes),
-                Rejection::Corrupt(Corruption::Length {
-                    declared: 16,
-                    actual: 8
-                })
-            ),
-            "two offsets are declared and one word is present"
+    fn a_read_only_directory_rebuilds_in_memory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        fixture.damage(plus(fixture.entry_at(1), 16));
+        let index = fixture.loaded();
+        let directory = fixture.dir.path();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o500))
+            .expect("the directory is made read-only");
+        let spans = Fixture::spans(&index);
+        let failed = index.rewrite_outcome().map(|outcome| outcome.is_err());
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("the directory is made writable again for cleanup");
+        assert_eq!(
+            spans,
+            fixture.expected(),
+            "lookups are answered from the rebuild in memory"
+        );
+        assert_eq!(
+            failed,
+            Some(true),
+            "the rewrite into a read-only directory failed"
         );
     }
 
-    #[test]
-    fn a_start_at_or_past_the_end_names_its_position_and_offset() {
-        let mut body = built().encode();
-        body.truncate(body.len() - 8);
-        let second = HEADER_LEN + 8;
-        let past = u64::try_from(MAILBOX.len()).expect("fixture length fits u64");
-        body[second..second + 8].copy_from_slice(&past.to_le_bytes());
-        let bytes = resealed(body);
-        assert!(
-            matches!(
-                rejection(&bytes),
-                Rejection::Corrupt(Corruption::Bounds {
-                    position: 1,
-                    offset
-                }) if offset == past
-            ),
-            "the second start equals the mailbox length"
-        );
-    }
-
-    #[test]
-    fn rejects_offsets_that_are_out_of_order_even_with_a_valid_checksum() {
-        let index = built();
-        let mut body = index.encode();
-        body.truncate(body.len() - 8);
-        let first = HEADER_LEN;
-        let second = HEADER_LEN + 8;
-        let (head, tail) = body.split_at_mut(second);
-        head[first..second].swap_with_slice(&mut tail[..8]);
-        let bytes = resealed(body);
-        assert!(
-            matches!(
-                rejection(&bytes),
-                Rejection::Corrupt(Corruption::Order {
-                    position: 1,
-                    offset: 0,
-                    previous: 27,
-                })
-            ),
-            "the swapped second start is not after the first"
-        );
-    }
-
-    proptest! {
-        #[test]
-        fn rejects_any_single_flipped_bit(byte in 0_usize..96, bit in 0_u8..8) {
-            let mut bytes = built().encode();
-            let position = byte.checked_rem(bytes.len()).expect("the encoding is never empty");
-            bytes[position] ^= 1 << bit;
-            prop_assert!(
-                Index::decode(&bytes, built().fingerprint()).is_err(),
-                "a flipped bit breaks the checksum or a header field"
+    /// Looks up every position from `first` onwards, wrapping around, against `expected`.
+    fn walk(index: &Index, expected: &[Range<usize>], first: usize) {
+        for step in 0..MESSAGES {
+            let position = plus(step, first).rem_euclid(MESSAGES);
+            assert_eq!(
+                index.span(position),
+                expected.get(position).cloned(),
+                "span {position} starting from {first}"
             );
         }
+    }
 
-        #[test]
-        fn rejects_any_truncation(cut in 0_usize..96) {
-            let bytes = built().encode();
-            let kept = cut.checked_rem(bytes.len()).expect("the encoding is never empty");
-            prop_assert!(
-                Index::decode(&bytes[..kept], built().fingerprint()).is_err(),
-                "a truncated file never decodes"
-            );
-        }
+    #[test]
+    fn lookups_from_many_threads_during_a_rebuild_return_correct_spans() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        fixture.damage(payload_at(&fixture, 1));
+        let index = fixture.loaded();
+        let expected = fixture.expected();
+        thread::scope(|scope| {
+            for first in (0..MESSAGES).step_by(75) {
+                let (shared, spans) = (&index, &expected);
+                let _worker = scope.spawn(move || walk(shared, spans, first));
+            }
+        });
+    }
+
+    #[test]
+    fn a_checksummed_span_past_the_mailbox_triggers_a_rebuild() {
+        let fixture = Fixture::new();
+        let mut starts: Vec<u64> = scan::find_message_starts(&fixture.contents)
+            .into_iter()
+            .map(widen)
+            .collect();
+        starts[599] = widen(plus(fixture.contents.len(), 10));
+        let dates = vec![0_i64; starts.len()];
+        let bytes = format::encode(
+            &starts,
+            &dates,
+            fixture.fingerprint,
+            format::DEFAULT_BLOCK_SHIFT,
+        )
+        .expect("the forged starts encode with valid checksums");
+        fs::write(fixture.index_path(), bytes).expect("the forged index is written");
+        assert_eq!(
+            fixture.loaded().span(598),
+            Some(fixture.expected()[598].clone()),
+            "a span ending past the mailbox is answered from the rebuild"
+        );
     }
 }
