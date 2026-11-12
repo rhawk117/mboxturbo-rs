@@ -9,6 +9,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
+use crate::builder::{BlockSize, IndexPolicy, IndexSource, MailboxBuilder};
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
@@ -26,6 +27,8 @@ pub struct Mailbox {
     contents: Arc<Mmap>,
     /// Start offsets of the messages within `contents`.
     index: Index,
+    /// Where `index` came from, as reported by [`Mailbox::index_source`].
+    source: IndexSource,
 }
 
 /// The result of [`Mailbox::parse_batch`]: the parsed messages and the positions that failed.
@@ -42,7 +45,7 @@ pub struct ParsedBatch {
 
 /// A mapped file with its fingerprint, before an index is attached.
 #[derive(Debug)]
-struct Mapped {
+pub(crate) struct Mapped {
     /// The read-only mapping of the whole file, shared with the index for a rebuild.
     contents: Arc<Mmap>,
     /// Identity of the mapped bytes, which a cached index must match to be reused.
@@ -50,19 +53,24 @@ struct Mapped {
 }
 
 impl Mapped {
-    /// Builds a fresh index over the mapping.
-    fn into_indexed(self) -> Mailbox {
-        let index = Index::build(Arc::clone(&self.contents), self.fingerprint);
-        Mailbox {
-            contents: self.contents,
-            index,
+    /// Builds a fresh index over the mapping, with blocks of `block_size` messages when given.
+    pub(crate) fn build(&self, block_size: Option<BlockSize>) -> Index {
+        let contents = Arc::clone(&self.contents);
+        match block_size {
+            Some(size) => Index::build_with(contents, self.fingerprint, size.shift()),
+            None => Index::build(contents, self.fingerprint),
         }
+    }
+
+    /// Loads the index saved at `index_path`, which must match this mapping's fingerprint.
+    pub(crate) fn load(&self, index_path: &Path) -> Result<Index, MboxTurboError> {
+        Index::load(index_path, Arc::clone(&self.contents), self.fingerprint)
     }
 
     /// Opens and maps `path`, fingerprinting what was mapped.
     ///
     /// Fails with [`MboxTurboError::Io`] when the file cannot be opened or mapped.
-    fn open(path: &Path) -> Result<Self, MboxTurboError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, MboxTurboError> {
         let file = File::open(path).map_err(|source| MboxTurboError::io(path, source))?;
         #[expect(
             clippy::disallowed_methods,
@@ -84,10 +92,11 @@ impl Mapped {
     }
 
     /// Attaches an index that was already validated against this mapping's fingerprint.
-    fn with_index(self, index: Index) -> Mailbox {
+    pub(crate) fn with_index(self, index: Index, source: IndexSource) -> Mailbox {
         Mailbox {
             contents: self.contents,
             index,
+            source,
         }
     }
 }
@@ -118,6 +127,20 @@ impl Mailbox {
         &self.index
     }
 
+    /// Where the index being served came from: the file it was read from or written to, or
+    /// memory. A file is reported only while it matches what is served: after a lookup rebuilt
+    /// the index and rewriting the file failed, the file no longer matches what is served
+    /// and this reports [`IndexSource::Memory`].
+    #[must_use]
+    pub fn index_source(&self) -> IndexSource {
+        match &self.source {
+            IndexSource::File(path) if !matches!(self.index.rewrite_outcome(), Some(Err(_))) => {
+                IndexSource::File(path.clone())
+            },
+            IndexSource::File(_) | IndexSource::Memory => IndexSource::Memory,
+        }
+    }
+
     /// Whether the mailbox holds no messages.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -146,16 +169,20 @@ impl Mailbox {
         ))
     }
 
-    /// Maps the mbox at `path` and indexes it on all rayon threads.
+    /// Maps the mbox at `path` and serves its index from the sidecar file `<path>.mbxidx`
+    /// beside it, so a later open of the same mbox skips the scan. A missing, stale or damaged
+    /// sidecar is rebuilt on all rayon threads and written back. When it cannot be written, for
+    /// example in a read-only directory, the open still succeeds with an index held in memory
+    /// and leaves nothing behind; [`Mailbox::index_source`] tells which happened.
     ///
     /// # Errors
     ///
-    /// [`MboxTurboError::Io`] when the file cannot be opened or mapped.
+    /// [`MboxTurboError::Io`] when the mbox cannot be opened or mapped.
     pub fn open<P>(path: P) -> Result<Self, MboxTurboError>
     where
         P: AsRef<Path>,
     {
-        Ok(Mapped::open(path.as_ref())?.into_indexed())
+        MailboxBuilder::new().open(path)
     }
 
     /// Maps the mbox at `path`, reusing the index saved at `index_path` when it still matches
@@ -173,17 +200,9 @@ impl Mailbox {
         P: AsRef<Path>,
         Q: AsRef<Path>,
     {
-        let cache_file = index_path.as_ref();
-        let mapped = Mapped::open(path.as_ref())?;
-        match Index::load(cache_file, Arc::clone(&mapped.contents), mapped.fingerprint) {
-            Ok(index) => Ok(mapped.with_index(index)),
-            Err(error) if error.calls_for_rebuild() => {
-                let mailbox = mapped.into_indexed();
-                mailbox.index.save(cache_file)?;
-                Ok(mailbox)
-            },
-            Err(error) => Err(error),
-        }
+        MailboxBuilder::new()
+            .index(IndexPolicy::Path(index_path.as_ref().to_path_buf()))
+            .open(path)
     }
 
     /// Raw bytes of every message, split across rayon threads.

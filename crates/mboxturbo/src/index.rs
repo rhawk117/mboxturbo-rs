@@ -607,10 +607,6 @@ impl Index {
 
     /// Whether a rebuild rewrote the file the index was loaded from: `None` until a rebuild of
     /// a loaded index ran, else the outcome of the rename into place.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the Python bindings once T9 lands")
-    )]
     pub(crate) fn rewrite_outcome(&self) -> Option<Result<(), &io::Error>> {
         self.rewrite.get().map(|outcome| outcome.as_ref().copied())
     }

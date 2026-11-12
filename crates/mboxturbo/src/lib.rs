@@ -17,6 +17,7 @@
               uses syn 3"
 )]
 
+mod builder;
 mod columns;
 mod error;
 mod fields;
@@ -29,6 +30,7 @@ mod pipeline;
 mod scan;
 mod width;
 
+pub use builder::{BlockSize, IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
 pub use error::{Corruption, MboxTurboError};
 pub use fingerprint::Fingerprint;
