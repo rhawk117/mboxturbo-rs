@@ -5,10 +5,11 @@ mod common;
 
 #[cfg(test)]
 mod fixture {
-    use std::fs;
     use std::path::PathBuf;
+    use std::{fs, ptr};
 
     use mboxturbo::Mailbox;
+    use rayon::iter::ParallelIterator as _;
     use tempfile::TempDir;
 
     use crate::common::{Spec, Summary, file_name, generate};
@@ -30,6 +31,26 @@ mod fixture {
                     .is_some()
             })
             .count()
+    }
+
+    #[test]
+    fn iteration_yields_each_message_of_the_fixture_in_both_directions_and_in_parallel() {
+        let (_directory, path, _) = generated(&Spec::default());
+        let mailbox = Mailbox::open(path).expect("the fixture opens");
+        let forward: Vec<&[u8]> = mailbox.iter().collect();
+        assert_eq!(forward.len(), mailbox.len(), "one item per message");
+        for (position, item) in forward.iter().enumerate() {
+            let raw = mailbox.raw(position).expect("the position exists");
+            assert!(
+                ptr::eq(item.as_ptr(), raw.as_ptr()) && item.len() == raw.len(),
+                "item {position} is the span raw({position}) reports"
+            );
+        }
+        let mut backward: Vec<&[u8]> = mailbox.iter().rev().collect();
+        backward.reverse();
+        assert_eq!(backward, forward, "reverse iteration visits the same items");
+        let parallel: Vec<&[u8]> = mailbox.par_iter().collect();
+        assert_eq!(parallel, forward, "par_iter matches iter");
     }
 
     #[test]

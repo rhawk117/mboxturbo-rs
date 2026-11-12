@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
-use crate::index::Index;
+use crate::index::{Cursor, Index};
 use crate::message::Message;
 
 /// An mbox file mapped read-only, with the byte offset of every message.
@@ -93,11 +93,23 @@ impl Mapped {
 }
 
 impl Mailbox {
+    /// The bytes of `span`, or an empty span and slice when the index has no span inside the
+    /// file contents.
+    fn bounded(&self, span: Option<Range<usize>>) -> (Range<usize>, &[u8]) {
+        span.and_then(|inside| Some((inside.clone(), self.contents.get(inside)?)))
+            .unwrap_or((0..0, &[]))
+    }
+
     /// Narrows `positions` to the messages that exist. A range that starts past the end becomes
     /// empty and sits at the end, never inverted.
     pub(crate) fn clamped(&self, positions: Range<usize>) -> Range<usize> {
         let end = positions.end.min(self.len());
         positions.start.min(end)..end
+    }
+
+    /// [`Mailbox::row`] with the span answered by `cursor`, which must walk this mailbox's index.
+    fn cursor_row(&self, cursor: &mut Cursor<'_>, position: usize) -> (Range<usize>, &[u8]) {
+        self.bounded(cursor.span(position))
     }
 
     /// The message index.
@@ -115,7 +127,8 @@ impl Mailbox {
     /// Raw bytes of every message, in file order.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
-        (0..self.len()).map(|position| self.row(position).1)
+        let mut cursor = self.index.cursor();
+        (0..self.len()).map(move |position| self.cursor_row(&mut cursor, position).1)
     }
 
     /// Number of messages.
@@ -176,9 +189,10 @@ impl Mailbox {
     /// Raw bytes of every message, split across rayon threads.
     #[must_use]
     pub fn par_iter(&self) -> impl IndexedParallelIterator<Item = &[u8]> {
-        (0..self.len())
-            .into_par_iter()
-            .map(|position| self.row(position).1)
+        (0..self.len()).into_par_iter().map_init(
+            || self.index.cursor(),
+            |cursor, position| self.cursor_row(cursor, position).1,
+        )
     }
 
     /// The messages at `positions` (clamped to those that exist), all parsed in parallel.
@@ -231,10 +245,7 @@ impl Mailbox {
     /// mailbox holds. Such a position yields an empty span at 0 and an empty slice, so iterators
     /// sized from the claimed count still end without a panic.
     fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
-        self.index
-            .span(position)
-            .and_then(|span| Some((span.clone(), self.contents.get(span)?)))
-            .unwrap_or((0..0, &[]))
+        self.bounded(self.index.span(position))
     }
 
     /// The span and raw bytes of every message in `positions`, clamped to the messages that
@@ -252,8 +263,9 @@ impl Mailbox {
         &self,
         positions: Range<usize>,
     ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
-        self.clamped(positions).map(|position| {
-            let (span, raw) = self.row(position);
+        let mut cursor = self.index.cursor();
+        self.clamped(positions).map(move |position| {
+            let (span, raw) = self.cursor_row(&mut cursor, position);
             (position, span, raw)
         })
     }

@@ -9,9 +9,11 @@ use std::fs::File;
 use std::io::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::{fmt, iter};
+use std::{fmt, iter, mem};
 
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -48,6 +50,9 @@ enum Backing {
 pub struct Index {
     /// One bit per dates block, set once the block passed its checksum.
     dates_verified: Box<[AtomicU64]>,
+    /// Starts blocks decoded by cursors, counted so tests can see each block read once.
+    #[cfg(test)]
+    decoded: AtomicUsize,
     /// Identity of the mailbox the index describes.
     fingerprint: Fingerprint,
     /// Header of `original`.
@@ -131,6 +136,77 @@ impl PartialEq for Index {
 
 impl Eq for Index {}
 
+/// One decoded starts block held by a [`Cursor`].
+#[derive(Debug, Default)]
+struct Slot {
+    /// The block the starts belong to, or `None` while the slot holds nothing usable.
+    block: Option<usize>,
+    /// Where the block's last message ends: the next block's first start or the mailbox length.
+    end: usize,
+    /// The start of every message in the block, reused across refills.
+    starts: Vec<usize>,
+}
+
+impl Slot {
+    /// Byte range of the message `within` the block, or `None` when it would run backwards.
+    fn span(&self, within: usize) -> Option<Range<usize>> {
+        let start = *self.starts.get(within)?;
+        let end = within
+            .checked_add(1)
+            .and_then(|next| self.starts.get(next))
+            .map_or(self.end, |&next| next);
+        (start <= end).then_some(start..end)
+    }
+}
+
+/// Answers [`Index::span`] for positions walked in order, decoding each starts block once.
+///
+/// The cursor keeps the two blocks it read last, so a pass from either end, or from both ends
+/// at once, decodes each block once or twice at most. Anything it cannot answer from a verified
+/// block, and every answer once the index has been rebuilt, goes through [`Index::span`].
+#[derive(Debug)]
+pub(crate) struct Cursor<'index> {
+    /// The index being walked.
+    index: &'index Index,
+    /// The newest block, then the one before it.
+    slots: (Slot, Slot),
+}
+
+impl Cursor<'_> {
+    /// The span of `position` from the cached blocks, `None` when they cannot answer it.
+    fn cached(&mut self, position: usize) -> Option<Range<usize>> {
+        if self.index.replacement.get().is_some() {
+            return None;
+        }
+        let shift = u32::from(self.index.layout.block_shift);
+        let block = position.checked_shr(shift)?;
+        let within = position.checked_sub(block.checked_shl(shift)?)?;
+        self.promote(block)?;
+        let span = self.slots.0.span(within)?;
+        (span.end <= self.index.mailbox.len()).then_some(span)
+    }
+
+    /// Makes `block` the newest slot, decoding it unless one of the slots holds it.
+    fn promote(&mut self, block: usize) -> Option<()> {
+        if self.slots.0.block == Some(block) {
+            return Some(());
+        }
+        mem::swap(&mut self.slots.0, &mut self.slots.1);
+        if self.slots.0.block == Some(block) {
+            return Some(());
+        }
+        self.slots.0.block = None;
+        self.slots.0.end = self.index.decode(block, &mut self.slots.0.starts)?;
+        self.slots.0.block = Some(block);
+        Some(())
+    }
+
+    /// Byte range of the message at `position`, answering exactly what [`Index::span`] does.
+    pub(crate) fn span(&mut self, position: usize) -> Option<Range<usize>> {
+        self.cached(position).or_else(|| self.index.span(position))
+    }
+}
+
 impl Index {
     /// The bytes and header lookups read now: the rebuild once one ran, else the original.
     fn active(&self) -> (&[u8], &Layout) {
@@ -151,6 +227,25 @@ impl Index {
         Self::new(contents, Backing::Owned(bytes), layout, None)
     }
 
+    /// A cursor that walks the spans of consecutive positions one block at a time.
+    pub(crate) const fn cursor(&self) -> Cursor<'_> {
+        Cursor {
+            index: self,
+            slots: (
+                Slot {
+                    block: None,
+                    end: 0,
+                    starts: Vec::new(),
+                },
+                Slot {
+                    block: None,
+                    end: 0,
+                    starts: Vec::new(),
+                },
+            ),
+        }
+    }
+
     /// Date of the message at `position` in unix seconds, `Some(0)` when it has no parsable
     /// Date header, or `None` past the last message.
     #[must_use]
@@ -159,6 +254,46 @@ impl Index {
         self.lookup(Section::Dates, needed, |bytes, layout| {
             layout.date(bytes, position)
         })
+    }
+
+    /// Decodes the starts of original `block` into `starts` after verifying it and the block
+    /// that follows, and returns where the block's last message ends. `None` when the block or
+    /// its successor is damaged or places a message outside the mapping.
+    fn decode(&self, block: usize, starts: &mut Vec<usize>) -> Option<usize> {
+        #[cfg(test)]
+        #[expect(unused_results, reason = "the previous count is not needed")]
+        self.decoded.fetch_add(1, Ordering::Relaxed);
+        let first = block.checked_shl(u32::from(self.layout.block_shift))?;
+        if !self.verify(Section::Starts, first) {
+            return None;
+        }
+        let (entry, payload) = self
+            .layout
+            .entry(self.original.bytes(), Section::Starts, block)?;
+        starts.clear();
+        for within in 0..self.layout.block_len(block)? {
+            starts.push(narrow(codec::start(&entry, payload, within)?)?);
+        }
+        self.end_of(block)
+    }
+
+    /// Starts blocks decoded by cursors so far.
+    #[cfg(test)]
+    pub(crate) fn decoded_blocks(&self) -> usize {
+        self.decoded.load(Ordering::Relaxed)
+    }
+
+    /// The first start of the block after `block`, or the mailbox length after the last block.
+    fn end_of(&self, block: usize) -> Option<usize> {
+        let next = block.checked_add(1)?;
+        if next >= self.layout.blocks() {
+            return narrow(self.layout.fingerprint.len());
+        }
+        let first = next.checked_shl(u32::from(self.layout.block_shift))?;
+        if !self.verify(Section::Starts, first) {
+            return None;
+        }
+        narrow(self.layout.start(self.original.bytes(), first)?)
     }
 
     /// Identity of the mailbox this index describes.
@@ -232,6 +367,8 @@ impl Index {
     /// An index over `original`, whose header is `layout`, with no block verified yet.
     fn new(mailbox: Arc<Mmap>, original: Backing, layout: Layout, origin: Option<PathBuf>) -> Self {
         Self {
+            #[cfg(test)]
+            decoded: AtomicUsize::new(0),
             dates_verified: bitmap(layout.blocks()),
             fingerprint: layout.fingerprint,
             layout,
@@ -633,6 +770,77 @@ mod tests {
         let fixture = Fixture::new();
         let _bytes = fixture.saved();
         assert_eq!(fixture.loaded(), fixture.built(), "load(save(x)) == x");
+    }
+
+    #[test]
+    fn a_cursor_walking_forward_decodes_each_starts_block_once() {
+        let fixture = Fixture::new();
+        let index = fixture.built();
+        let mut cursor = index.cursor();
+        let walked: Vec<_> = (0..MESSAGES)
+            .filter_map(|position| cursor.span(position))
+            .collect();
+        assert_eq!(walked, fixture.expected(), "the cursor answers every span");
+        assert_eq!(index.decoded_blocks(), 3, "600 messages fill three blocks");
+    }
+
+    #[test]
+    fn a_cursor_walking_backward_decodes_each_starts_block_once() {
+        let fixture = Fixture::new();
+        let index = fixture.built();
+        let mut cursor = index.cursor();
+        let walked: Vec<_> = (0..MESSAGES)
+            .rev()
+            .filter_map(|position| cursor.span(position))
+            .collect();
+        let mut expected = fixture.expected();
+        expected.reverse();
+        assert_eq!(walked, expected, "the cursor answers every span in reverse");
+        assert_eq!(index.decoded_blocks(), 3, "each block is decoded once");
+    }
+
+    #[test]
+    fn a_cursor_alternating_between_two_blocks_decodes_each_of_them_once() {
+        let fixture = Fixture::new();
+        let index = fixture.built();
+        let mut cursor = index.cursor();
+        for position in 0..10 {
+            let _front = cursor.span(position);
+            let _back = cursor.span(MESSAGES - 1 - position);
+        }
+        assert_eq!(
+            index.decoded_blocks(),
+            2,
+            "the two cached blocks serve both ends"
+        );
+    }
+
+    #[test]
+    fn a_cursor_answers_none_past_the_last_message() {
+        let fixture = Fixture::new();
+        let index = fixture.built();
+        assert_eq!(
+            index.cursor().span(MESSAGES),
+            None,
+            "no message sits past the end"
+        );
+    }
+
+    #[test]
+    fn a_cursor_over_a_damaged_block_answers_from_the_rebuild() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        fixture.damage(payload_at(&fixture, 1));
+        let index = fixture.loaded();
+        let mut cursor = index.cursor();
+        let walked: Vec<_> = (0..MESSAGES)
+            .filter_map(|position| cursor.span(position))
+            .collect();
+        assert_eq!(
+            walked,
+            fixture.expected(),
+            "the damaged block is answered by the rescan"
+        );
     }
 
     #[test]
