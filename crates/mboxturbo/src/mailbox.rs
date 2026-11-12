@@ -224,35 +224,29 @@ impl Mailbox {
     }
 
     /// The span and raw bytes of the message at `position`, which must be below `len()`.
-    #[expect(
-        clippy::expect_used,
-        reason = "`position` is below `len()`, and the index answers every position below its \
-                  count with a span inside the mapping: a span that fails its block checksum or \
-                  runs past the mapping is answered from a rescan instead. The count itself sits \
-                  in the checksummed header written for this mailbox's fingerprint, so only a \
-                  forged header can claim more messages than the rescan finds"
-    )]
+    ///
+    /// The index answers every position below its count with a span inside the mapping, except
+    /// one that a forged index file claimed and the rescan it triggered then disowned: a header
+    /// with a valid checksum and this mailbox's fingerprint can claim more messages than the
+    /// mailbox holds. Such a position yields an empty span at 0 and an empty slice, so iterators
+    /// sized from the claimed count still end without a panic.
     fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
-        let span = self
-            .index
+        self.index
             .span(position)
-            .expect("a position below len() has a span");
-        let raw = self
-            .contents
-            .get(span.clone())
-            .expect("a validated index spans bytes inside the mapping");
-        (span, raw)
+            .and_then(|span| Some((span.clone(), self.contents.get(span)?)))
+            .unwrap_or((0..0, &[]))
     }
 
     /// The span and raw bytes of every message in `positions`, clamped to the messages that
     /// exist, as `(position, span, raw)`.
     ///
-    /// Yields one item for every clamped position and never skips one. This rests on one
-    /// invariant: the index answers every position below its count with a span inside the
-    /// mapping. A built index takes its starts from the scanner, which emits them ascending and
-    /// each below the mapping's length. A cached index is accepted only when its fingerprint,
-    /// which includes the length, matches the mapping's; each of its blocks is checked on first
-    /// use, and a block that fails its checksum or places a message outside the mapping makes
+    /// Yields one item for every clamped position and never skips one. The index answers every
+    /// position below its count with a span inside the mapping, apart from a position a forged
+    /// index claimed and its rescan disowned, which yields an empty span and slice. A built index
+    /// takes its starts from the scanner, which emits them ascending and each below the
+    /// mapping's length. A cached index is accepted only when its fingerprint, which includes
+    /// the length, matches the mapping's; each of its blocks is checked on first use, and a
+    /// block that fails its checksum or places a message outside the mapping makes
     /// the index answer from a rescan instead.
     pub(crate) fn rows(
         &self,
@@ -280,9 +274,11 @@ pub(crate) fn map_read_only(file: &File) -> io::Result<Mmap> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write as _;
 
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
+    use xxhash_rust::xxh3::xxh3_64;
 
     use super::Mailbox;
 
@@ -360,5 +356,34 @@ From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
             0,
             "a range wholly beyond the last message has no rows",
         );
+    }
+
+    #[test]
+    fn a_position_a_forged_index_claims_yields_an_empty_message() {
+        let dir = TempDir::new().expect("a temporary directory is created");
+        let mbox = dir.path().join("mbox");
+        let cache = dir.path().join("mbox.idx");
+        fs::write(&mbox, MBOX).expect("fixture mbox is written");
+        drop(Mailbox::open_cached(&mbox, &cache).expect("the first open builds the cache"));
+        let mut bytes = fs::read(&cache).expect("the saved index reads back");
+        let count: [u8; 8] = bytes[48..56]
+            .try_into()
+            .expect("the count field is eight bytes");
+        bytes[48..56].copy_from_slice(&(u64::from_le_bytes(count) + 1).to_le_bytes());
+        let checksum = xxh3_64(&bytes[..64]);
+        bytes[64..72].copy_from_slice(&checksum.to_le_bytes());
+        fs::write(&cache, bytes).expect("the forged index is written");
+        let mailbox = Mailbox::open_cached(&mbox, &cache).expect("the forged header is accepted");
+        let raws: Vec<&[u8]> = mailbox.iter().collect();
+        assert_eq!(
+            raws.len(),
+            4,
+            "iteration covers the claimed count without a panic"
+        );
+        assert!(
+            raws[3].is_empty(),
+            "the phantom position yields an empty message"
+        );
+        assert_eq!(mailbox.len(), 3, "the rebuilt index reports the true count");
     }
 }
