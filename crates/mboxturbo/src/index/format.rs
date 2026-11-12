@@ -249,13 +249,15 @@ impl Layout {
     }
 
     /// Byte range of message `position`: its start to the next start, or to the mailbox end for
-    /// the last message. `None` past the end, for an unreadable block, or for a range that
-    /// would run backwards.
+    /// the last message. `None` past the end, for an unreadable block of the message or of its
+    /// successor, or for a range that would run backwards.
     pub(crate) fn span(&self, bytes: &[u8], position: usize) -> Option<Range<usize>> {
         let start = narrow(self.start(bytes, position)?)?;
-        let end = match self.start(bytes, position.checked_add(1)?) {
+        let following = position.checked_add(1)?;
+        let end = match self.start(bytes, following) {
             Some(next) => narrow(next)?,
-            None => narrow(self.fingerprint.len())?,
+            None if widen(following) == self.count => narrow(self.fingerprint.len())?,
+            None => return None,
         };
         (start <= end).then_some(start..end)
     }
@@ -736,6 +738,18 @@ mod tests {
             open(&bytes).start(&bytes, 0),
             None,
             "the payload lies outside the file"
+        );
+    }
+
+    #[test]
+    fn a_span_before_a_refused_block_entry_answers_none() {
+        let clean = file(600, 8);
+        let at = plus(plus(first_entry(&clean), ENTRY_LEN), 8);
+        let bytes = patched(clean, at, &u64::MAX.to_le_bytes());
+        assert_eq!(
+            open(&bytes).span(&bytes, 255),
+            None,
+            "the successor's block is refused, so the end is unknown and not the mailbox end"
         );
     }
 
