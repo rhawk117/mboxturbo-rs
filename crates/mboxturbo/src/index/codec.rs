@@ -72,7 +72,7 @@ impl Frame {
         if self.width > MAX_WIDTH || next.checked_add(width)?.div_ceil(8) > payload.len() {
             return None;
         }
-        loaded_pair(payload, bit, self.width).or_else(|| {
+        load_pair(payload, 0, bit, self.width).or_else(|| {
             Some((
                 read_code(payload, bit, self.width)?,
                 read_code(payload, next, self.width)?,
@@ -147,43 +147,40 @@ impl Frame {
         if self.flags != 0 || self.width > WORD_WIDTH {
             return None;
         }
-        let (byte, shift) = split_bit(index.checked_mul(usize::from(self.width))?)?;
-        let chunk = bytes
-            .get(payload.checked_add(byte)?..)?
-            .first_chunk::<16>()?;
-        let low = mask(self.width);
-        let (first, second) = adjacent(chunk, shift, self.width)?;
+        let bit = index.checked_mul(usize::from(self.width))?;
+        let (first, second) = load_pair(bytes, payload, bit, self.width)?;
         Some((
-            self.base.checked_add(first & low)?,
-            self.base.checked_add(second & low)?,
+            self.base.checked_add(first)?,
+            self.base.checked_add(second)?,
         ))
     }
 }
 
-/// The `width`-bit codes at bit offset `bit` and right after it, from one 16-byte load; `None`
-/// when the load would leave `payload` or the two codes do not both lie in it.
+/// The `width`-bit codes at bit offset `bit` of the payload that begins at byte `payload` of
+/// `bytes`, and right after it, from one unaligned 16-byte load; `None` when the load would
+/// leave `bytes` or the two codes do not both lie in it. Both start `bit % 8` bits into the load.
 #[inline]
-fn loaded_pair(payload: &[u8], bit: usize, width: u8) -> Option<(u64, u64)> {
+fn load_pair(bytes: &[u8], payload: usize, bit: usize, width: u8) -> Option<(u64, u64)> {
     let (byte, shift) = split_bit(bit)?;
-    if shift.checked_add(u32::from(width).checked_mul(2)?)? > u128::BITS {
-        return None;
-    }
-    let chunk = payload.get(byte..)?.first_chunk::<16>()?;
-    let wide = u128::from_le_bytes(*chunk).checked_shr(shift)?;
-    let following = wide.checked_shr(u32::from(width))?;
-    Some((
-        low_word(wide) & mask(width),
-        low_word(following) & mask(width),
-    ))
+    let chunk = bytes
+        .get(payload.checked_add(byte)?..)?
+        .first_chunk::<16>()?;
+    let (first, second) = adjacent(chunk, shift, width)?;
+    let low = mask(width);
+    Some((first & low, second & low))
 }
 
 /// The bits of the two adjacent `width`-bit codes that start `shift` bits into `chunk`, each
-/// still to be masked to `width` bits; from its first eight bytes alone when both fit in them.
+/// still to be masked to `width` bits; from its first eight bytes alone when both fit in them, and
+/// `None` when the two codes do not both lie in the 16 bytes.
 #[inline]
 fn adjacent(chunk: &[u8; 16], shift: u32, width: u8) -> Option<(u64, u64)> {
     if width <= PAIR_WIDTH {
         let word = u64::from_le_bytes(*chunk.first_chunk::<8>()?).checked_shr(shift)?;
         return Some((word, word.checked_shr(u32::from(width))?));
+    }
+    if shift.checked_add(u32::from(width).checked_mul(2)?)? > u128::BITS {
+        return None;
     }
     let wide = u128::from_le_bytes(*chunk).checked_shr(shift)?;
     Some((
@@ -412,12 +409,14 @@ pub(crate) fn verify(block: &Block, payload: &[u8]) -> bool {
 
 /// Start at `index` of a starts block, or `None` for an unknown flag, a width above 64, or an
 /// index the payload does not cover. An all-equal block (width 0) answers any index with its base.
+#[cfg(test)]
 pub(crate) fn start(block: &Block, payload: &[u8], index: usize) -> Option<u64> {
     block.frame().start(payload, index)
 }
 
 /// Date at `index` of a dates block, zero for "no date", or `None` for an unknown flag, a width
 /// above 64, a sentinel block of width 0, or an index the payload does not cover.
+#[cfg(test)]
 pub(crate) fn date(block: &Block, payload: &[u8], index: usize) -> Option<i64> {
     block.frame().date(payload, index)
 }

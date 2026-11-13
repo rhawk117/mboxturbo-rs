@@ -3,14 +3,6 @@
 
 mod codec;
 mod date;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "format::encode is the reference encoder the tests compare the streaming build \
-                  against, and nothing else calls it"
-    )
-)]
 mod format;
 
 use std::fs::File;
@@ -324,26 +316,27 @@ struct Reach<'lookup> {
 impl<'lookup> Reach<'lookup> {
     /// Date of the message at `position`, read from the first entry.
     fn date(&self, position: usize) -> Option<i64> {
-        self.first
-            .frame
-            .date(self.payload(&self.first, position)?, self.within(position)?)
+        self.first.frame.date(
+            self.payload(&self.first, position)?,
+            self.layout.place(position)?.1,
+        )
     }
 
     /// The payload of `entry`, the entry of the block holding `position`.
     #[inline]
     fn payload(&self, entry: &Parsed, position: usize) -> Option<&'lookup [u8]> {
-        let block = position.checked_shr(u32::from(self.layout.block_shift))?;
+        let (block, _) = self.layout.place(position)?;
         let len = codec::payload_len(self.layout.block_len(block)?, entry.frame.width)?;
         entry.payload(self.bytes, len)
     }
 
     /// Byte range of the message at `position`, read from the first entry, to the next message's
     /// start, read from the last, or to the mailbox end for the last message. `None` for a
-    /// range that would run backwards.
+    /// range that would run backwards or past the `mailbox` length.
     #[inline]
-    fn span(&self, position: usize) -> Option<Range<usize>> {
+    fn span(&self, position: usize, mailbox: usize) -> Option<Range<usize>> {
         let following = position.checked_add(1)?;
-        let (start, end) = if widen(following) == self.layout.count {
+        let (start, end) = if self.layout.is_last(position) {
             let end = narrow(self.layout.fingerprint.len())?;
             (self.start(&self.first, position)?, end)
         } else if self.same {
@@ -354,35 +347,25 @@ impl<'lookup> Reach<'lookup> {
                 self.start(&self.last, following)?,
             )
         };
-        (start <= end).then_some(start..end)
+        Layout::bounded(start, end, mailbox)
     }
 
     /// Start of the message at `position`, which lies in `entry`'s block.
     #[inline]
     fn start(&self, entry: &Parsed, position: usize) -> Option<usize> {
-        narrow(
-            entry
-                .frame
-                .start(self.payload(entry, position)?, self.within(position)?)?,
-        )
+        narrow(entry.frame.start(
+            self.payload(entry, position)?,
+            self.layout.place(position)?.1,
+        )?)
     }
 
     /// Starts of the message at `position` and of the next one, both in the first entry's block.
     #[inline]
     fn start_pair(&self, position: usize) -> Option<(usize, usize)> {
         let payload = self.payload(&self.first, position)?;
-        let (start, next) = self
-            .first
-            .frame
-            .start_pair(payload, self.within(position)?)?;
+        let (_, within) = self.layout.place(position)?;
+        let (start, next) = self.first.frame.start_pair(payload, within)?;
         Some((narrow(start)?, narrow(next)?))
-    }
-
-    /// The place of `position` within its block.
-    #[inline]
-    fn within(&self, position: usize) -> Option<usize> {
-        let high = usize::MAX.checked_shl(u32::from(self.layout.block_shift))?;
-        Some(position & !high)
     }
 }
 
@@ -417,8 +400,7 @@ impl Cursor<'_> {
     /// holds it, and answers the span of `position` from it.
     #[inline(never)]
     fn refill(&mut self, position: usize) -> Option<Range<usize>> {
-        let shift = u32::from(self.index.layout.block_shift);
-        let block = position.checked_shr(shift)?;
+        let (block, within) = self.index.layout.place(position)?;
         if self.slots.0.block != Some(block) {
             mem::swap(&mut self.slots.0, &mut self.slots.1);
         }
@@ -426,7 +408,7 @@ impl Cursor<'_> {
             let slot = &mut self.slots.0;
             slot.block = None;
             slot.bounds.clear();
-            slot.first = block.checked_shl(shift)?;
+            slot.first = position.checked_sub(within)?;
             if self.index.decode(block, &mut slot.bounds).is_none() {
                 slot.bounds.clear();
                 return None;
@@ -497,10 +479,10 @@ impl Index {
     #[cold]
     #[inline(never)]
     fn checked_span(&self, position: usize) -> Option<Range<usize>> {
-        let end = self.mailbox.len();
+        let mailbox = self.mailbox.len();
         let needed = position..position.saturating_add(2);
         self.lookup(Section::Starts, needed, |reach| {
-            reach.span(position).filter(|span| span.end <= end)
+            reach.span(position, mailbox)
         })
     }
 
@@ -546,9 +528,12 @@ impl Index {
         codec::starts(&entry.frame, payload, count, bounds)?;
         bounds.push(widen(self.end_of(block)?));
         let inside = bounds
-            .last()
-            .is_some_and(|&end| end <= widen(self.mailbox.len()));
-        if !(inside && bounds.is_sorted()) {
+            .first()
+            .zip(bounds.last())
+            .and_then(|(&first, &end)| {
+                Layout::bounded(narrow(first)?, narrow(end)?, self.mailbox.len())
+            });
+        if inside.is_none() || !bounds.is_sorted() {
             bounds.clear();
         }
         Some(())
@@ -679,16 +664,6 @@ impl Index {
         Some(parsed)
     }
 
-    /// The block holding `position` and the place of `position` within it.
-    #[inline]
-    fn place(&self, position: usize) -> Option<(usize, usize)> {
-        let shift = u32::from(self.layout.block_shift);
-        Some((
-            position.checked_shr(shift)?,
-            position & !usize::MAX.checked_shl(shift)?,
-        ))
-    }
-
     /// The parsed, checked entries of the blocks holding the first and the last message of
     /// `needed` that exists, `None` when either block fails its check.
     #[inline]
@@ -790,11 +765,12 @@ impl Index {
     fn verified_edge(&self, entry: Parsed, position: usize, within: usize) -> Option<(u64, u64)> {
         let bytes = self.original.bytes();
         let start = entry.start(bytes, within)?;
-        let following = position.checked_add(1)?;
-        if following == messages(&self.layout) {
+        if self.layout.is_last(position) {
             return Some((start, self.layout.fingerprint.len()));
         }
-        let next = self.starts_entries.get(self.place(following)?.0)?.load()?;
+        let following = position.checked_add(1)?;
+        let (block, _) = self.layout.place(following)?;
+        let next = self.starts_entries.get(block)?.load()?;
         Some((start, next.start(bytes, 0)?))
     }
 
@@ -809,24 +785,21 @@ impl Index {
         if self.replacement.get().is_some() || position >= count {
             return None;
         }
-        let (block, within) = self.place(position)?;
+        let (block, within) = self.layout.place(position)?;
         let entry = self.starts_entries.get(block)?.load()?;
         let (first, next) = self.verified_starts(entry, position, within)?;
-        let (start, end) = (narrow(first)?, narrow(next)?);
-        (start <= end && end <= self.mailbox.len()).then_some(start..end)
+        Layout::bounded(narrow(first)?, narrow(next)?, self.mailbox.len())
     }
 
     /// The starts at `within` and after it that [`Index::verified_span`] needs: both from one
     /// load of `entry`'s block unless the message at `position` ends its block or the mailbox.
     #[inline]
     fn verified_starts(&self, entry: Parsed, position: usize, within: usize) -> Option<(u64, u64)> {
-        let shift = u32::from(self.layout.block_shift);
-        let inner = position.checked_add(1)? < messages(&self.layout)
-            && within.checked_add(1)?.checked_shr(shift)? == 0;
-        if inner {
-            entry.start_pair(self.original.bytes(), within)
-        } else {
+        let ends_block = self.layout.place(position.checked_add(1)?)?.1 == 0;
+        if self.layout.is_last(position) || ends_block {
             self.verified_edge(entry, position, within)
+        } else {
+            entry.start_pair(self.original.bytes(), within)
         }
     }
 }
@@ -902,8 +875,7 @@ fn blocks_of(layout: &Layout, needed: &Range<usize>) -> Option<(usize, usize)> {
         return None;
     }
     let last = needed.end.min(count).checked_sub(1)?.max(needed.start);
-    let shift = u32::from(layout.block_shift);
-    Some((needed.start.checked_shr(shift)?, last.checked_shr(shift)?))
+    Some((layout.place(needed.start)?.0, layout.place(last)?.0))
 }
 
 /// One empty cell per block of `blocks`; nothing is parsed until a lookup reaches a block.
@@ -1042,6 +1014,8 @@ mod tests {
     use std::thread;
 
     use memmap2::Mmap;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     use super::{Cell, Index, Parsed, Section, codec, format};
@@ -1144,6 +1118,77 @@ mod tests {
             (0..MESSAGES)
                 .filter_map(|position| index.span(position))
                 .collect()
+        }
+    }
+
+    /// A mailbox on disk with its index in blocks of `2^shift` messages, from which indexes are
+    /// loaded over any bytes.
+    struct Disk {
+        /// The directory holding the files, removed on drop.
+        dir: TempDir,
+        /// The span of every message, from a scan of the mailbox.
+        expected: Vec<Range<usize>>,
+        /// Identity of the mailbox.
+        fingerprint: Fingerprint,
+        /// The index file a built index saved, valid.
+        good: Vec<u8>,
+        /// The mapped mailbox.
+        mailbox: Arc<Mmap>,
+        /// The block shift of the index.
+        shift: u8,
+    }
+
+    impl Disk {
+        /// `good` with the checksum of starts block `block` flipped, so the block fails its check.
+        fn damaged(&self, block: usize) -> Vec<u8> {
+            let layout = format::Layout::parse(&self.good, self.fingerprint)
+                .expect("the saved header is valid");
+            let entry = plus(
+                narrow(layout.dir_offset).expect("the offset fits usize"),
+                block
+                    .checked_mul(format::ENTRY_LEN)
+                    .expect("test blocks are few"),
+            );
+            let mut bytes = self.good.clone();
+            bytes[plus(entry, 16)] ^= 0xFF;
+            bytes
+        }
+
+        /// A fresh index loaded from `bytes`, with no block verified yet.
+        fn load(&self, bytes: &[u8]) -> Index {
+            let path = self.dir.path().join("mbox.idx");
+            fs::write(&path, bytes).expect("the index file is written");
+            Index::load(&path, Arc::clone(&self.mailbox), self.fingerprint)
+                .expect("the index loads")
+        }
+
+        fn new(contents: &[u8], shift: u8) -> Self {
+            let dir = TempDir::new().expect("a temporary directory is created");
+            let path = dir.path().join("mbox");
+            fs::write(&path, contents).expect("the mailbox is written");
+            let file = File::open(&path).expect("the mailbox reopens");
+            let mailbox = Arc::new(map_read_only(&file).expect("the mailbox maps"));
+            let fingerprint = Fingerprint::new(contents, None);
+            let good = Index::build_with(Arc::clone(&mailbox), fingerprint, shift)
+                .active()
+                .0
+                .to_vec();
+            let starts = scan::find_message_starts(contents);
+            let ends = starts.iter().skip(1).copied().chain([contents.len()]);
+            let expected = starts
+                .iter()
+                .copied()
+                .zip(ends)
+                .map(|(start, end)| start..end)
+                .collect();
+            Self {
+                dir,
+                expected,
+                fingerprint,
+                good,
+                mailbox,
+                shift,
+            }
         }
     }
 
@@ -1731,5 +1776,82 @@ mod tests {
             reference(b"", fingerprint, 8),
             "no messages yield the reference empty file"
         );
+    }
+
+    /// Asserts that the first and the second `Index::span` of every position of `index`, and
+    /// `Cursor::span` over them in order, answer the scanned span; `None` one past the end.
+    fn assert_readers_agree(disk: &Disk, index: &Index) -> Result<(), TestCaseError> {
+        let mut cursor = index.cursor();
+        for position in 0..=disk.expected.len() {
+            let expected = disk.expected.get(position).cloned();
+            prop_assert_eq!(
+                index.span(position),
+                expected.clone(),
+                "span {} first call",
+                position
+            );
+            prop_assert_eq!(
+                index.span(position),
+                expected.clone(),
+                "span {} second call",
+                position
+            );
+            prop_assert_eq!(cursor.span(position), expected, "cursor span {}", position);
+        }
+        Ok(())
+    }
+
+    /// A mailbox whose message `n` has a body of `bodies[n]` bytes, so starts differ in gap.
+    fn bodied_mailbox(bodies: &[usize]) -> Vec<u8> {
+        bodies
+            .iter()
+            .enumerate()
+            .flat_map(|(number, &len)| {
+                let body = "z".repeat(len);
+                format!("From a@b\nSubject: {number}\n\n{body}\n").into_bytes()
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn every_reader_answers_the_scanned_span(
+            bodies in vec(0_usize..80, 1..=48),
+            shift in prop_oneof![1_u8..=4, Just(format::DEFAULT_BLOCK_SHIFT)],
+        ) {
+            let disk = Disk::new(&bodied_mailbox(&bodies), shift);
+            for position in 0..=disk.expected.len() {
+                let cold = disk.load(&disk.good);
+                let expected = disk.expected.get(position).cloned();
+                prop_assert_eq!(cold.span(position), expected.clone(), "cold span {}", position);
+                prop_assert_eq!(cold.span(position), expected.clone(), "warm span {}", position);
+                prop_assert_eq!(
+                    disk.load(&disk.good).cursor().span(position),
+                    expected,
+                    "cursor span {} on a fresh index",
+                    position
+                );
+            }
+            assert_readers_agree(&disk, &disk.load(&disk.good))?;
+        }
+
+        #[test]
+        fn every_reader_answers_the_scanned_span_after_a_rebuild(
+            bodies in vec(0_usize..80, 1..=48),
+            shift in prop_oneof![1_u8..=4, Just(format::DEFAULT_BLOCK_SHIFT)],
+            damaged in 0_usize..64,
+        ) {
+            let disk = Disk::new(&bodied_mailbox(&bodies), shift);
+            let layout = format::Layout::parse(&disk.good, disk.fingerprint)
+                .expect("the saved header is valid");
+            let block = damaged.rem_euclid(layout.blocks());
+            let index = disk.load(&disk.damaged(block));
+            let first = block.checked_shl(u32::from(disk.shift)).expect("test shifts are small");
+            let _span = index.span(first);
+            prop_assert!(index.rewrite_outcome().is_some(), "the damaged block forced a rebuild");
+            assert_readers_agree(&disk, &index)?;
+        }
     }
 }

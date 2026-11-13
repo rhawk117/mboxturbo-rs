@@ -39,7 +39,9 @@
 //! The span of message `n` runs from its start to the next message's start, or to the
 //! fingerprint length (the mailbox end) for the last message.
 
-use std::io::{self, Cursor, Seek, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{self, Seek, Write};
 use std::ops::Range;
 
 use xxhash_rust::xxh3::xxh3_64;
@@ -142,6 +144,13 @@ impl Layout {
         narrow(self.count.div_ceil(self.per_block())).unwrap_or(0)
     }
 
+    /// The range `start..end` when it runs forward and ends no later than the `mailbox` length,
+    /// else `None`: a span the index claims must lie inside the mailbox it describes.
+    #[inline]
+    pub(crate) fn bounded(start: usize, end: usize, mailbox: usize) -> Option<Range<usize>> {
+        (start <= end && end <= mailbox).then_some(start..end)
+    }
+
     /// Checks the block shift, then that the directory offset and block count put the end of
     /// the directories exactly at `actual`, the length of the file.
     fn check_extent(&self, actual: usize) -> Result<(), Corruption> {
@@ -166,8 +175,9 @@ impl Layout {
 
     /// Date of message `position` in unix seconds, zero for none, or `None` when it does not
     /// exist or its block is unreadable.
+    #[cfg(test)]
     pub(crate) fn date(&self, bytes: &[u8], position: usize) -> Option<i64> {
-        let (block, within) = self.locate(position)?;
+        let (block, within) = self.held(position)?;
         let (entry, payload) = self.entry(bytes, Section::Dates, block)?;
         codec::date(&entry, payload, within)
     }
@@ -182,6 +192,7 @@ impl Layout {
     /// The directory entry of `block` in `section` and its payload, or `None` when the block does
     /// not exist, the entry lies outside `bytes`, or the payload does not fit before the
     /// directories. The checksum is not checked here.
+    #[cfg(test)]
     pub(crate) fn entry<'bytes>(
         &self,
         bytes: &'bytes [u8],
@@ -192,8 +203,9 @@ impl Layout {
         Some((entry, bytes.get(payload)?))
     }
 
-    /// As [`Layout::entry`], with the payload as its byte range in `bytes`, which lies between
-    /// the header and the directories but is not checked against the length of `bytes`.
+    /// The directory entry of `block` in `section` and its payload as a byte range in `bytes`,
+    /// which lies between the header and the directories but is not checked against the length
+    /// of `bytes`. `None` when the block does not exist or the entry lies outside `bytes`.
     pub(crate) fn entry_at(
         &self,
         bytes: &[u8],
@@ -222,12 +234,20 @@ impl Layout {
         narrow(self.dir_offset)?.checked_add(entries.checked_mul(ENTRY_LEN)?)
     }
 
-    /// Splits `position` into its block and its place in that block; `None` past the last message.
-    fn locate(&self, position: usize) -> Option<(usize, usize)> {
-        let per_block = narrow(self.per_block())?;
-        let block = position.checked_div(per_block)?;
-        let within = position.checked_rem(per_block)?;
+    /// As [`Layout::place`], `None` when message `position` does not exist.
+    #[cfg(test)]
+    fn held(&self, position: usize) -> Option<(usize, usize)> {
+        let (block, within) = self.place(position)?;
         (within < self.block_len(block)?).then_some((block, within))
+    }
+
+    /// Whether `position` is the last message, whose end is the mailbox end and not a
+    /// successor's start.
+    #[inline]
+    pub(crate) fn is_last(&self, position: usize) -> bool {
+        position
+            .checked_add(1)
+            .is_some_and(|following| widen(following) == self.count)
     }
 
     /// Reads and checks the header of `bytes`, and that its length matches the header.
@@ -260,24 +280,39 @@ impl Layout {
         block_size(self.block_shift).unwrap_or(1)
     }
 
+    /// The block holding `position` and the place of `position` within it, by the block shift.
+    ///
+    /// Arithmetic alone: it does not check that the message exists, which the caller proved or
+    /// [`Layout::block_len`] answers.
+    #[inline]
+    pub(crate) fn place(&self, position: usize) -> Option<(usize, usize)> {
+        let shift = u32::from(self.block_shift);
+        Some((
+            position.checked_shr(shift)?,
+            position & !usize::MAX.checked_shl(shift)?,
+        ))
+    }
+
     /// Byte range of message `position`: its start to the next start, or to the mailbox end for
     /// the last message. `None` past the end, for an unreadable block of the message or of its
-    /// successor, or for a range that would run backwards.
+    /// successor, or for a range that would run backwards or past the mailbox.
+    #[cfg(test)]
     pub(crate) fn span(&self, bytes: &[u8], position: usize) -> Option<Range<usize>> {
         let start = narrow(self.start(bytes, position)?)?;
-        let following = position.checked_add(1)?;
-        let end = match self.start(bytes, following) {
-            Some(next) => narrow(next)?,
-            None if widen(following) == self.count => narrow(self.fingerprint.len())?,
-            None => return None,
+        let mailbox = narrow(self.fingerprint.len())?;
+        let end = if self.is_last(position) {
+            mailbox
+        } else {
+            narrow(self.start(bytes, position.checked_add(1)?)?)?
         };
-        (start <= end).then_some(start..end)
+        Self::bounded(start, end, mailbox)
     }
 
     /// Start offset of message `position`, or `None` when it does not exist or its block cannot
     /// be read.
+    #[cfg(test)]
     pub(crate) fn start(&self, bytes: &[u8], position: usize) -> Option<u64> {
-        let (block, within) = self.locate(position)?;
+        let (block, within) = self.held(position)?;
         let (entry, payload) = self.entry(bytes, Section::Starts, block)?;
         codec::start(&entry, payload, within)
     }
@@ -424,6 +459,7 @@ fn decode_header(head: &[u8]) -> Option<Layout> {
 }
 
 /// The index file for `starts` and `dates` as bytes, split into blocks of `2^block_shift`.
+#[cfg(test)]
 pub(crate) fn encode(
     starts: &[u64],
     dates: &[i64],
