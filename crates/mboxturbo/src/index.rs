@@ -708,7 +708,7 @@ mod tests {
     use super::{BlockSize, Index, Section, format};
     use crate::error::MboxTurboError;
     use crate::fingerprint::Fingerprint;
-    use crate::mailbox::map_read_only;
+    use crate::mapping::map_read_only;
     use crate::scan;
     use crate::width::{narrow, widen};
 

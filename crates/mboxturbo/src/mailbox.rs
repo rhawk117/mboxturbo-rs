@@ -1,7 +1,6 @@
 //! An mbox file mapped read-only together with its message index.
 
 use std::fs::File;
-use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
 use crate::index::{BlockSize, Cursor, Index};
+use crate::mapping::map_read_only;
 use crate::message::Message;
 
 /// An mbox file mapped read-only, with the byte offset of every message.
@@ -302,19 +302,6 @@ impl Mailbox {
             (position, span, raw)
         })
     }
-}
-
-#[expect(
-    unsafe_code,
-    reason = "a read-only map is sound while the file is neither written nor truncated, which \
-              is the documented contract of Mailbox and of every Message borrowed from it"
-)]
-/// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`],
-/// which covers both the mbox and a cached index file.
-pub(crate) fn map_read_only(file: &File) -> io::Result<Mmap> {
-    // SAFETY: a read-only map is sound while the file is neither written nor truncated, which
-    // is the documented contract of `Mailbox` and of every `Message` borrowed from it.
-    unsafe { Mmap::map(file) }
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use super::format::Layout;
 use super::{Backing, Index};
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
-use crate::mailbox::map_read_only;
+use crate::mapping::map_read_only;
 
 /// Why a sidecar is not mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

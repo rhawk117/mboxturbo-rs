@@ -25,6 +25,7 @@ mod fingerprint;
 mod hint;
 mod index;
 mod mailbox;
+mod mapping;
 mod message;
 mod pipeline;
 mod scan;
