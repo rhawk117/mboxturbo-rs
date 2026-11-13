@@ -313,6 +313,7 @@ mod tests {
     use xxhash_rust::xxh3::xxh3_64;
 
     use super::Mailbox;
+    use crate::index::BlockSize;
 
     const MBOX: &[u8] = b"From a@x Mon Jan  1 00:00:00 2024\nSubject: one\n\nfirst\n\
 From b@x Mon Jan  1 00:00:01 2024\nSubject: two\n\nsecond\n\
@@ -450,6 +451,26 @@ From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
             mailbox.date(mailbox.len()),
             None,
             "a position past the last message has no indexed date"
+        );
+    }
+
+    #[test]
+    fn one_iter_pass_decodes_each_block_once() {
+        let messages = 600_usize;
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        for number in 0..messages {
+            write!(
+                file,
+                "From a@x Mon Jan  1 00:00:00 2024\nSubject: {number}\n\nbody\n"
+            )
+            .expect("fixture message is written");
+        }
+        let mailbox = Mailbox::open(file.path()).expect("fixture mbox opens");
+        assert_eq!(mailbox.iter().count(), messages, "one item per message");
+        assert_eq!(
+            mailbox.index().decoded_blocks(),
+            messages.div_ceil(BlockSize::default().entries()),
+            "a cursor pass decodes each block's starts once, not once per message"
         );
     }
 }

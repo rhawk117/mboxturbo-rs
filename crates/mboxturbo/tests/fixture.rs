@@ -21,18 +21,6 @@ mod fixture {
         (directory, path, summary)
     }
 
-    fn dated_count(mailbox: &Mailbox) -> usize {
-        (0..mailbox.len())
-            .filter(|&position| {
-                mailbox
-                    .message(position)
-                    .expect("position is within the mailbox")
-                    .date()
-                    .is_some()
-            })
-            .count()
-    }
-
     #[test]
     fn iteration_yields_each_message_of_the_fixture_in_both_directions_and_in_parallel() {
         let (_directory, path, _) = generated(&Spec::default());
@@ -94,11 +82,13 @@ mod fixture {
             summary.messages, 10_000,
             "summary reports the requested count"
         );
-        let dated = dated_count(&mailbox);
+        let seen: Vec<u64> = (0..mailbox.len())
+            .filter(|&position| mailbox.date(position).is_some())
+            .map(|position| u64::try_from(position).expect("position fits u64"))
+            .collect();
         assert_eq!(
-            u64::try_from(dated).expect("count fits u64"),
-            summary.dated,
-            "Message::date is Some exactly for the messages the generator dated"
+            seen, summary.dated_positions,
+            "Mailbox::date is Some at exactly the positions the generator dated"
         );
         let undated = summary.messages - summary.dated;
         assert!(
@@ -127,7 +117,10 @@ mod fixture {
             "mean near 10 KB, got {mean}"
         );
         let outliers = sizes.iter().filter(|&&size| size >= 256 * 1024).count();
-        assert!(outliers <= 10, "outliers are rare, got {outliers}");
+        assert!(
+            (1..=10).contains(&outliers),
+            "outliers are rare but present: between 1 and 10 expected, got {outliers}"
+        );
         assert!(
             sizes.iter().all(|&size| size <= 4 * 1024 * 1024 + 4096),
             "outliers stop at 4 MB"

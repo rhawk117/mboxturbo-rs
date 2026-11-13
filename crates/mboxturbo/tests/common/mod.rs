@@ -55,12 +55,14 @@ impl Default for Spec {
 }
 
 /// What [`generate`] wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Summary {
     /// File length in bytes.
     pub bytes: u64,
     /// Messages that carry a `Date:` header.
     pub dated: u64,
+    /// Positions of the messages that carry a `Date:` header, in file order.
+    pub dated_positions: Vec<u64>,
     /// Messages written, equal to the separator count a scan finds.
     pub messages: u64,
 }
@@ -160,6 +162,7 @@ pub(crate) fn generate(path: &Path, spec: &Spec) -> io::Result<Summary> {
         messages: 0,
         bytes: 0,
         dated: 0,
+        dated_positions: Vec::new(),
     };
     for number in 0..spec.messages {
         clock = clock.saturating_add(60 + rng.below(600));
@@ -170,6 +173,9 @@ pub(crate) fn generate(path: &Path, spec: &Spec) -> io::Result<Summary> {
         out.write_all(&message)?;
         summary.messages = summary.messages.saturating_add(1);
         summary.dated = summary.dated.saturating_add(u64::from(dated));
+        if dated {
+            summary.dated_positions.push(number);
+        }
         summary.bytes = summary
             .bytes
             .saturating_add(u64::try_from(message.len()).map_err(io::Error::other)?);
