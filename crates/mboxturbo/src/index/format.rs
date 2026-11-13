@@ -7,7 +7,7 @@
 //!    | bytes   | field                                                        |
 //!    | ------- | ------------------------------------------------------------ |
 //!    | 0..8    | magic `MBOXTIDX`                                             |
-//!    | 8..12   | version, `u32`, 2                                            |
+//!    | 8..12   | version, `u32`, 3                                            |
 //!    | 12      | block shift, `u8`, 1 to 16: a block holds `2^shift` messages |
 //!    | 13      | flags, `u8`, 0                                               |
 //!    | 14..16  | reserved, `u16`                                              |
@@ -58,7 +58,7 @@ pub(crate) const ENTRY_LEN: usize = 32;
 /// Bytes before the first block payload.
 pub(crate) const HEADER_LEN: usize = 72;
 /// Format version this build writes and reads; older files count as stale, newer as corrupt.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
 /// A directory entry and where its payload sits.
 #[derive(Debug, Clone, Copy)]
@@ -403,7 +403,16 @@ impl<W: Write + Seek> Writer<W> {
         let mut payload = Vec::new();
         let starts_block = codec::encode_starts(starts, &mut payload);
         let starts_len = widen(payload.len());
-        let dates_block = codec::encode_dates(dates, &mut payload);
+        let Some(dates_block) = codec::encode_dates(dates, &mut payload) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the dates of the block starting at message {} span the whole i64 range, \
+                     leaving no code to mark a missing date",
+                    self.count
+                ),
+            ));
+        };
         self.sink.write_all(&payload)?;
         let began = self.advance(widen(payload.len()), widen(starts.len()))?;
         self.starts.push(Entry {
@@ -695,12 +704,21 @@ mod tests {
     }
 
     #[test]
+    fn a_version_two_file_is_stale() {
+        let bytes = patched(file(10, 8), 8, &2_u32.to_le_bytes());
+        assert!(
+            matches!(rejection(&bytes), Rejection::Stale),
+            "a version-2 file may store a missing date as its block minimum, so it rebuilds"
+        );
+    }
+
+    #[test]
     fn a_newer_version_is_corrupt() {
-        let bytes = patched(file(10, 8), 8, &3_u32.to_le_bytes());
+        let bytes = patched(file(10, 8), 8, &4_u32.to_le_bytes());
         assert!(
             matches!(
                 rejection(&bytes),
-                Rejection::Corrupt(Corruption::Version(3))
+                Rejection::Corrupt(Corruption::Version(4))
             ),
             "a newer version is not understood"
         );

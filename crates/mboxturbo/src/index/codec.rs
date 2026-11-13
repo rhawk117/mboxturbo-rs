@@ -362,34 +362,33 @@ fn dated_span(values: &[Option<i64>]) -> Option<(i64, i64)> {
 
 /// Chooses base, width and flags for a dates block: the "no date" sentinel is used only when a
 /// date is missing; its width holds `span + 1`, so the all-ones code exceeds every real delta.
-/// A block with no present date keeps one bit per code, all ones.
-fn date_layout(values: &[Option<i64>]) -> Frame {
-    let span = dated_span(values);
-    let (min, max) = span.unwrap_or((0, 0));
-    let plain = Frame {
-        base: bits_of(min),
-        flags: 0,
-        width: bit_width(max.abs_diff(min)),
-    };
+/// A block with no present date keeps one bit per code, all ones. Returns `None` when a date is
+/// missing and the present dates span the whole `i64` range, which leaves no code for the sentinel.
+fn date_layout(values: &[Option<i64>]) -> Option<Frame> {
+    let (min, max) = dated_span(values).unwrap_or((0, 0));
+    let range = max.abs_diff(min);
     if !values.contains(&None) {
-        return plain;
+        return Some(Frame {
+            base: bits_of(min),
+            flags: 0,
+            width: bit_width(range),
+        });
     }
     // The all-ones code of a width-w block is 2^w - 1, so it sits above every real delta (at most
-    // `range`) once w holds `range + 1`. A span of the whole `i64` range leaves no room for the
-    // sentinel; such a block keeps the plain layout and reads each missing date as its minimum.
-    let Some(width) = max.abs_diff(min).checked_add(1).map(bit_width) else {
-        return plain;
-    };
-    Frame {
+    // `range`) once w holds `range + 1`.
+    let width = range.checked_add(1).map(bit_width)?;
+    Some(Frame {
         base: bits_of(min),
         flags: MISSING,
         width,
-    }
+    })
 }
 
-/// Appends the payload of `values` (`None` meaning "no date") to `out` and returns the entry.
-pub(crate) fn encode_dates(values: &[Option<i64>], out: &mut Vec<u8>) -> Block {
-    let layout = date_layout(values);
+/// Appends the payload of `values` (`None` meaning "no date") to `out` and returns the entry, or
+/// `None` when `values` holds a missing date and the present dates span the whole `i64` range:
+/// no code is left to mark the missing date, and `out` is untouched.
+pub(crate) fn encode_dates(values: &[Option<i64>], out: &mut Vec<u8>) -> Option<Block> {
+    let layout = date_layout(values)?;
     let origin = signed_of(layout.base);
     let sentinel = if layout.flags & MISSING != 0 {
         mask(layout.width)
@@ -399,7 +398,7 @@ pub(crate) fn encode_dates(values: &[Option<i64>], out: &mut Vec<u8>) -> Block {
     let codes = values
         .iter()
         .map(|value| value.map_or(sentinel, |date| date.abs_diff(origin)));
-    seal(layout, values.len(), codes, out)
+    Some(seal(layout, values.len(), codes, out))
 }
 
 /// Whether `payload` and the entry's fields match the entry's checksum.
@@ -510,7 +509,8 @@ mod tests {
 
     fn decode_dates(values: &[Option<i64>]) -> Decoded<Option<i64>> {
         let mut payload = Vec::new();
-        let block = encode_dates(values, &mut payload);
+        let block = encode_dates(values, &mut payload)
+            .expect("the block's present dates leave a code free for a missing date");
         let read = (0..values.len())
             .map(|index| date(&block, &payload, index))
             .collect();
@@ -538,6 +538,17 @@ mod tests {
         let width = usize::from(block.width);
         let first = index.saturating_mul(width);
         first.checked_div(8).unwrap()..first.saturating_add(width).div_ceil(8)
+    }
+
+    #[test]
+    fn a_missing_date_in_a_full_range_block_is_refused() {
+        let mut payload = Vec::new();
+        let block = encode_dates(&[None, Some(i64::MIN), Some(i64::MAX)], &mut payload);
+        assert!(
+            block.is_none(),
+            "no code is left to mark the missing date beside a full-range span"
+        );
+        assert!(payload.is_empty(), "a refused block appends nothing");
     }
 
     #[test]
@@ -751,6 +762,15 @@ mod tests {
                 0..=BLOCK,
             )
         ) {
+            let full_span = dated_span(&values)
+                .is_some_and(|(low, high)| high.abs_diff(low) == u64::MAX);
+            if values.contains(&None) && full_span {
+                prop_assert!(
+                    encode_dates(&values, &mut Vec::new()).is_none(),
+                    "a missing date in a full-range block is refused"
+                );
+                return Ok(());
+            }
             let decoded = decode_dates(&values);
             prop_assert_eq!(decoded.values, some(&values), "decoding returns the encoded dates");
             prop_assert!(verify(&decoded.block, &decoded.payload), "a fresh block verifies");
