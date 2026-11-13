@@ -548,7 +548,7 @@ impl Index {
     /// The first start of the block after `block`, or the mailbox length after the last block.
     fn end_of(&self, block: usize) -> Option<usize> {
         let next = block.checked_add(1)?;
-        if next >= self.layout.blocks() {
+        if self.layout.is_last(self.layout.last_in_block(block)?) {
             return narrow(self.layout.fingerprint.len());
         }
         let entry = self.entry(Section::Starts, next)?;

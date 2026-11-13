@@ -250,6 +250,12 @@ impl Layout {
             .is_some_and(|following| widen(following) == self.count)
     }
 
+    /// The highest position block `block` holds, or `None` when the block does not exist.
+    pub(crate) fn last_in_block(&self, block: usize) -> Option<usize> {
+        let first = block.checked_shl(u32::from(self.block_shift))?;
+        first.checked_add(self.block_len(block)?.checked_sub(1)?)
+    }
+
     /// Reads and checks the header of `bytes`, and that its length matches the header.
     ///
     /// Nothing past the header is read, and nothing is allocated, so a header that claims
@@ -811,6 +817,15 @@ mod tests {
             None,
             "no code is wider than 64 bits"
         );
+    }
+
+    #[test]
+    fn the_last_position_of_a_block_is_its_highest_held_position() {
+        let bytes = file(300, 8);
+        let layout = open(&bytes);
+        assert_eq!(layout.last_in_block(0), Some(255), "a full block");
+        assert_eq!(layout.last_in_block(1), Some(299), "the partial last block");
+        assert_eq!(layout.last_in_block(2), None, "a block past the end");
     }
 
     #[test]
