@@ -19,7 +19,7 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mboxturbo::Mailbox;
+use mboxturbo::{IndexBytes, IndexPolicy, Mailbox, MailboxBuilder};
 
 /// Messages in the fixture when `MBOXTURBO_BENCH_MESSAGES` is unset.
 const DEFAULT_MESSAGES: u64 = 1_000_000;
@@ -38,10 +38,12 @@ type Outcome<T> = Result<T, Box<dyn Error>>;
 /// Everything one run measures.
 #[derive(Debug)]
 struct Report {
-    /// Time to build the index with `Mailbox::open`.
+    /// Time to build the index in memory, writing nothing beside the fixture.
     build: Duration,
+    /// Size of the built index by section.
+    index: IndexBytes,
     /// Size of the saved index file.
-    index_bytes: u64,
+    index_file: u64,
     /// Time of the span lookups at the random-access positions, without message bytes.
     lookup: Duration,
     /// Messages in the mailbox.
@@ -228,11 +230,16 @@ fn index_sweep(mailbox: &Mailbox) -> Outcome<Duration> {
 fn measure(spec: &common::Spec) -> Outcome<Report> {
     let path = ensure_fixture(spec)?;
     let index_path = path.with_extension("index");
-    let (mailbox, build) = timed(|| Ok(Mailbox::open(&path)?))?;
+    let (mailbox, build) = timed(|| {
+        Ok(MailboxBuilder::new()
+            .index(IndexPolicy::Memory)
+            .open(&path)?)
+    })?;
     let ((), save) = timed(|| Ok(mailbox.index().save(&index_path)?))?;
     Ok(Report {
         build,
-        index_bytes: fs::metadata(&index_path)?.len(),
+        index: mailbox.index().bytes(),
+        index_file: fs::metadata(&index_path)?.len(),
         messages: u64::try_from(mailbox.len())?,
         opens: cached_opens(&path, &index_path)?,
         random: random_access(&mailbox, spec.seed)?,
@@ -267,9 +274,22 @@ fn print(report: &Report) -> Outcome<()> {
     row(&mut out, "index-lookup", report.lookup, RANDOM_READS)?;
     row(&mut out, "sequential", report.scan, messages)?;
     row(&mut out, "index-sweep", report.sweep, messages)?;
-    let starts = bytes_per_message(report.index_bytes, messages);
-    writeln!(out, "{:<14} {starts} B/msg", "index starts")?;
-    writeln!(out, "{:<14} n/a", "index dates")?;
+    print_sizes(&mut out, report)
+}
+
+/// Prints the index size rows, in bytes per message.
+fn print_sizes(out: &mut impl io::Write, report: &Report) -> Outcome<()> {
+    for (name, bytes) in [
+        ("index starts", report.index.starts),
+        ("index dates", report.index.dates),
+        ("index file", report.index_file),
+    ] {
+        writeln!(
+            out,
+            "{name:<14} {} B/msg",
+            bytes_per_message(bytes, report.messages)
+        )?;
+    }
     Ok(())
 }
 

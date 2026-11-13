@@ -76,6 +76,31 @@ pub struct Index {
     starts_entries: Box<[OnceLock<Parsed>]>,
 }
 
+/// Bytes of an index file by section, as reported by [`Index::bytes`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct IndexBytes {
+    /// Payload bytes of every dates block.
+    pub dates: u64,
+    /// Bytes of the starts and dates directories together.
+    pub directory: u64,
+    /// Bytes of the file header.
+    pub header: u64,
+    /// Payload bytes of every starts block.
+    pub starts: u64,
+}
+
+impl IndexBytes {
+    /// The four sections added up, which is the length of the index file they describe.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.dates
+            .saturating_add(self.directory)
+            .saturating_add(self.header)
+            .saturating_add(self.starts)
+    }
+}
+
 /// Why a stored index was not accepted; [`Rejection::at`] attaches the file path.
 #[derive(Debug)]
 enum Rejection {
@@ -362,6 +387,24 @@ impl Index {
     pub fn build_with(contents: Arc<Mmap>, fingerprint: Fingerprint, block_shift: u8) -> Self {
         let (bytes, layout) = encoded(&contents, fingerprint, block_shift);
         Self::new(contents, Backing::Owned(bytes), layout, None)
+    }
+
+    /// Size of the index by section, over the rebuild once one ran.
+    ///
+    /// Entries are read without checking their blocks, so this never triggers a rebuild.
+    #[must_use]
+    pub fn bytes(&self) -> IndexBytes {
+        let (bytes, layout) = self.active();
+        let directory = layout
+            .blocks()
+            .saturating_mul(2)
+            .saturating_mul(format::ENTRY_LEN);
+        IndexBytes {
+            dates: section_bytes(layout, bytes, Section::Dates),
+            directory: widen(directory),
+            header: widen(format::HEADER_LEN),
+            starts: section_bytes(layout, bytes, Section::Starts),
+        }
     }
 
     /// [`Index::span`] the long way: verifying the blocks it reaches the first time, and
@@ -827,6 +870,16 @@ fn message_date(contents: &[u8], start: usize, end: usize) -> io::Result<i64> {
 /// messages the file can hold fail verification and are answered by the rebuild.
 fn messages(layout: &Layout) -> usize {
     narrow(layout.count).unwrap_or(usize::MAX)
+}
+
+/// Payload bytes of every block of `section`, read from the directory entries alone.
+fn section_bytes(layout: &Layout, bytes: &[u8], section: Section) -> u64 {
+    (0..layout.blocks())
+        .filter_map(|block| {
+            let (entry, _) = layout.entry_at(bytes, section, block)?;
+            codec::payload_len(layout.block_len(block)?, entry.width)
+        })
+        .fold(0_u64, |total, payload| total.saturating_add(widen(payload)))
 }
 
 /// The index file for the messages whose starts `windows` yields in order, as bytes.
@@ -1441,6 +1494,32 @@ mod tests {
                 format!("From a@b\n{date}Subject: {number}\n\n{body}\n").into_bytes()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_sections_add_up_to_the_length_of_the_built_index() {
+        let contents = dated_mailbox(1_000);
+        let fingerprint = Fingerprint::new(&contents, None);
+        let dir = TempDir::new().expect("a temporary directory is created");
+        let path = dir.path().join("mbox");
+        fs::write(&path, &contents).expect("the dated mailbox is written");
+        let file = File::open(&path).expect("the dated mailbox reopens");
+        let mailbox = Arc::new(map_read_only(&file).expect("the dated mailbox maps"));
+        let index = Index::build_with(mailbox, fingerprint, 5);
+        let sections = index.bytes();
+        let served = index.active().0.len();
+        let blocks = index.active().1.blocks();
+        assert_eq!(
+            sections.total(),
+            widen(served),
+            "header, directories and both payloads cover every served byte: {sections:?}"
+        );
+        assert_eq!(sections.header, 72, "the header is 72 bytes");
+        assert_eq!(
+            sections.directory,
+            widen(blocks * 2 * 32),
+            "each block has a 32-byte entry in two directories"
+        );
     }
 
     /// `format::encode` over the whole scan, the reference the streaming build must match.

@@ -34,7 +34,7 @@ pub use builder::{BlockSize, IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
 pub use error::{Corruption, MboxTurboError};
 pub use fingerprint::Fingerprint;
-pub use index::Index;
+pub use index::{Index, IndexBytes};
 pub use mailbox::{Mailbox, ParsedBatch};
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use pipeline::{BatchReader, Compression, Pipeline};
