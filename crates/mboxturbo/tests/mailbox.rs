@@ -4,8 +4,9 @@
 mod mailbox {
     use std::fmt::Write as _;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, mpsc};
+    use std::thread;
     use std::time::Duration;
 
     use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
@@ -523,9 +524,33 @@ body of message {number} {body}\n\
         }
     }
 
+    /// Opens `mbox` and collects every message through `par_iter` on a spawned thread, so a
+    /// hang on a rayon worker fails the test after 30 seconds instead of stalling it.
+    fn par_iter_spans_within_the_timeout(mbox: &Path) -> Vec<Vec<u8>> {
+        let (sender, receiver) = mpsc::channel();
+        let owned = mbox.to_path_buf();
+        let worker = thread::spawn(move || {
+            let spans: Vec<Vec<u8>> = Mailbox::open(&owned)
+                .expect("a damaged sidecar still opens")
+                .par_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
+            sender
+                .send(spans)
+                .expect("the test still receives the spans");
+        });
+        let spans = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("par_iter answers within 30 seconds rather than hanging on a rayon worker");
+        worker.join().expect("the par_iter thread finishes without panicking");
+        spans
+    }
+
     #[test]
-    fn par_iter_over_a_damaged_sidecar_returns_the_clean_spans_and_rewrites_it() {
+    fn par_iter_over_a_freshly_damaged_sidecar_every_time_returns_the_clean_spans_and_rewrites_it()
+    {
         const MESSAGES: usize = 30_000;
+        const REPEATS: usize = 5;
         let directory = tempfile::tempdir().expect("temporary directory is created");
         let (mbox, sidecar) = large_mailbox(&directory, MESSAGES);
         let clean: Vec<Vec<u8>> = Mailbox::open(&mbox)
@@ -540,17 +565,19 @@ body of message {number} {body}\n\
         );
         let mut damaged = fs::read(&sidecar).expect("the clean sidecar is written");
         damaged[FIRST_PAYLOAD_BYTE] ^= 0xFF;
-        fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
-        let spans: Vec<Vec<u8>> = Mailbox::open(&mbox)
-            .expect("a damaged sidecar still opens")
-            .par_iter()
-            .map(<[u8]>::to_vec)
-            .collect();
-        assert_eq!(spans, clean, "the rebuilt spans match a clean build");
-        assert_ne!(
-            fs::read(&sidecar).expect("the sidecar is readable"),
-            damaged,
-            "the rebuild rewrote the damaged sidecar"
-        );
+        // Guards the rebuild-on-a-rayon-worker re-entry race, which hangs only some runs.
+        for repeat in 0..REPEATS {
+            fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
+            let spans = par_iter_spans_within_the_timeout(&mbox);
+            assert_eq!(
+                spans, clean,
+                "repeat {repeat}: the rebuilt spans match a clean build"
+            );
+            assert_ne!(
+                fs::read(&sidecar).expect("the sidecar is readable"),
+                damaged,
+                "repeat {repeat}: the rebuild rewrote the damaged sidecar"
+            );
+        }
     }
 }
