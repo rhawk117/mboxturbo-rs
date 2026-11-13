@@ -18,9 +18,10 @@ use std::io::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::{fmt, iter, mem, ptr};
+use std::{fmt, iter, mem};
 
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -54,7 +55,7 @@ enum Backing {
 /// directory allows. Lookups therefore never fail: they answer `None` only past the last message.
 pub struct Index {
     /// One cell per dates block, filled with its parsed entry once the block passed its checksum.
-    dates_entries: Box<[OnceLock<Parsed>]>,
+    dates_entries: Box<[Cell]>,
     /// Starts blocks decoded by cursors, counted so tests can see each block read once.
     #[cfg(test)]
     decoded: AtomicUsize,
@@ -73,7 +74,7 @@ pub struct Index {
     /// What rewriting `origin` with the rebuild produced, once a rebuild ran with an origin.
     rewrite: OnceLock<io::Result<()>>,
     /// One cell per starts block, filled with its parsed entry once the block passed its checksum.
-    starts_entries: Box<[OnceLock<Parsed>]>,
+    starts_entries: Box<[Cell]>,
 }
 
 /// Bytes of an index file by section, as reported by [`Index::bytes`].
@@ -193,12 +194,12 @@ impl Slot {
 /// A directory entry parsed once, kept so later reads of its block skip the parse. An entry of
 /// the original bytes is kept only after its block passed its checksum; its payload range was
 /// checked against the directories when it was parsed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct Parsed {
     /// Base, flags and width of the block.
     frame: codec::Frame,
-    /// Where the block's payload lies in the index bytes.
-    payload: Range<usize>,
+    /// Where the block's payload starts in the index bytes.
+    payload: usize,
 }
 
 impl Parsed {
@@ -206,27 +207,101 @@ impl Parsed {
     const fn new((block, payload): (codec::Block, Range<usize>)) -> Self {
         Self {
             frame: block.frame(),
-            payload,
+            payload: payload.start,
         }
     }
 
-    /// The block's payload in `bytes`, `None` when it lies past their end.
+    /// The block's payload of `len` bytes in `bytes`, `None` when it lies past their end.
     #[inline]
-    fn payload<'bytes>(&self, bytes: &'bytes [u8]) -> Option<&'bytes [u8]> {
-        bytes.get(self.payload.clone())
+    fn payload<'bytes>(&self, bytes: &'bytes [u8], len: usize) -> Option<&'bytes [u8]> {
+        bytes.get(self.payload..self.payload.checked_add(len)?)
     }
 
     /// Start at `index` of the block, as [`codec::Frame::start_at`] reads it from `bytes`.
     #[inline]
     fn start(&self, bytes: &[u8], index: usize) -> Option<u64> {
-        self.frame.start_at(bytes, self.payload.start, index)
+        self.frame.start_at(bytes, self.payload, index)
     }
 
     /// Starts at `index` and `index + 1` of the block, as [`codec::Frame::start_pair_at`]
     /// reads them from `bytes`.
     #[inline]
     fn start_pair(&self, bytes: &[u8], index: usize) -> Option<(u64, u64)> {
-        self.frame.start_pair_at(bytes, self.payload.start, index)
+        self.frame.start_pair_at(bytes, self.payload, index)
+    }
+}
+
+/// One slot of an entry cache: a [`Parsed`] packed into two atomic words, empty while both are
+/// zero so a table of them is zero-filled at open. `word` holds, from the top, a filled bit,
+/// the flags, the width and the payload start.
+#[derive(Debug)]
+struct Cell {
+    /// The block's base; meaningful once `word` has its filled bit.
+    base: AtomicU64,
+    /// Filled bit, flags, width and payload start, zero while empty.
+    word: AtomicU64,
+}
+
+impl Cell {
+    /// Bit set in `word` once the cell holds an entry.
+    const FILLED: u64 = 1 << 63;
+    /// Bit where the flags begin.
+    const FLAGS_AT: u32 = Self::START_BITS + Self::WIDTH_BITS;
+    /// Bits of the payload start.
+    const START_BITS: u32 = 48;
+    /// Mask of the payload start.
+    const START_MASK: u64 = (1 << Self::START_BITS) - 1;
+    /// Bits of the width.
+    const WIDTH_BITS: u32 = 7;
+    /// Mask of the width, once shifted down.
+    const WIDTH_MASK: u64 = (1 << Self::WIDTH_BITS) - 1;
+
+    /// A cell holding nothing.
+    const fn empty() -> Self {
+        Self {
+            base: AtomicU64::new(0),
+            word: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether an entry was stored.
+    #[inline]
+    fn is_filled(&self) -> bool {
+        self.word.load(Ordering::Relaxed) & Self::FILLED != 0
+    }
+
+    /// The stored entry, `None` while the cell is empty.
+    #[inline]
+    fn load(&self) -> Option<Parsed> {
+        let word = self.word.load(Ordering::Acquire);
+        if word & Self::FILLED == 0 {
+            return None;
+        }
+        let base = self.base.load(Ordering::Relaxed);
+        let raw_flags = u8::try_from(word.checked_shr(Self::FLAGS_AT)? & 0xFF);
+        let raw_width = u8::try_from(word.checked_shr(Self::START_BITS)? & Self::WIDTH_MASK);
+        let raw_start = usize::try_from(word & Self::START_MASK);
+        let (Ok(flags), Ok(width), Ok(payload)) = (raw_flags, raw_width, raw_start) else {
+            return None;
+        };
+        Some(Parsed {
+            frame: codec::Frame { base, flags, width },
+            payload,
+        })
+    }
+
+    /// Stores `parsed`, `None` and nothing stored when its width or payload start does not fit.
+    /// Threads filling one cell store the same bits, taken from one verified entry.
+    fn store(&self, parsed: Parsed) -> Option<()> {
+        let start = u64::try_from(parsed.payload)
+            .map_or(None, |start| (start <= Self::START_MASK).then_some(start))?;
+        let width =
+            Some(u64::from(parsed.frame.width)).filter(|width| *width <= Self::WIDTH_MASK)?;
+        let flags = u64::from(parsed.frame.flags).checked_shl(Self::FLAGS_AT)?;
+        let word = Self::FILLED | flags | width.checked_shl(Self::START_BITS)? | start;
+        self.base.store(parsed.frame.base, Ordering::Relaxed);
+        self.word.store(word, Ordering::Release);
+        Some(())
     }
 }
 
@@ -237,19 +312,29 @@ struct Reach<'lookup> {
     /// The index bytes the entries point into.
     bytes: &'lookup [u8],
     /// The entry of the block holding the first message needed.
-    first: &'lookup Parsed,
+    first: Parsed,
     /// The entry of the block holding the last message needed that exists.
-    last: &'lookup Parsed,
+    last: Parsed,
     /// The header of `bytes`.
     layout: &'lookup Layout,
+    /// Whether `first` and `last` are one entry.
+    same: bool,
 }
 
-impl Reach<'_> {
+impl<'lookup> Reach<'lookup> {
     /// Date of the message at `position`, read from the first entry.
     fn date(&self, position: usize) -> Option<i64> {
         self.first
             .frame
-            .date(self.first.payload(self.bytes)?, self.within(position)?)
+            .date(self.payload(&self.first, position)?, self.within(position)?)
+    }
+
+    /// The payload of `entry`, the entry of the block holding `position`.
+    #[inline]
+    fn payload(&self, entry: &Parsed, position: usize) -> Option<&'lookup [u8]> {
+        let block = position.checked_shr(u32::from(self.layout.block_shift))?;
+        let len = codec::payload_len(self.layout.block_len(block)?, entry.frame.width)?;
+        entry.payload(self.bytes, len)
     }
 
     /// Byte range of the message at `position`, read from the first entry, to the next message's
@@ -260,13 +345,13 @@ impl Reach<'_> {
         let following = position.checked_add(1)?;
         let (start, end) = if widen(following) == self.layout.count {
             let end = narrow(self.layout.fingerprint.len())?;
-            (self.start(self.first, position)?, end)
-        } else if ptr::eq(self.first, self.last) {
+            (self.start(&self.first, position)?, end)
+        } else if self.same {
             self.start_pair(position)?
         } else {
             (
-                self.start(self.first, position)?,
-                self.start(self.last, following)?,
+                self.start(&self.first, position)?,
+                self.start(&self.last, following)?,
             )
         };
         (start <= end).then_some(start..end)
@@ -278,14 +363,14 @@ impl Reach<'_> {
         narrow(
             entry
                 .frame
-                .start(entry.payload(self.bytes)?, self.within(position)?)?,
+                .start(self.payload(entry, position)?, self.within(position)?)?,
         )
     }
 
     /// Starts of the message at `position` and of the next one, both in the first entry's block.
     #[inline]
     fn start_pair(&self, position: usize) -> Option<(usize, usize)> {
-        let payload = self.first.payload(self.bytes)?;
+        let payload = self.payload(&self.first, position)?;
         let (start, next) = self
             .first
             .frame
@@ -455,8 +540,10 @@ impl Index {
         #[expect(unused_results, reason = "the previous count is not needed")]
         self.decoded.fetch_add(1, Ordering::Relaxed);
         let entry = self.entry(Section::Starts, block)?;
-        let payload = entry.payload(self.original.bytes())?;
-        codec::starts(&entry.frame, payload, self.layout.block_len(block)?, bounds)?;
+        let count = self.layout.block_len(block)?;
+        let len = codec::payload_len(count, entry.frame.width)?;
+        let payload = entry.payload(self.original.bytes(), len)?;
+        codec::starts(&entry.frame, payload, count, bounds)?;
         bounds.push(widen(self.end_of(block)?));
         let inside = bounds
             .last()
@@ -480,15 +567,11 @@ impl Index {
             return narrow(self.layout.fingerprint.len());
         }
         let entry = self.entry(Section::Starts, next)?;
-        narrow(
-            entry
-                .frame
-                .start(entry.payload(self.original.bytes())?, 0)?,
-        )
+        narrow(entry.start(self.original.bytes(), 0)?)
     }
 
     /// The cache of parsed entries of `section`, one cell per block.
-    fn entries(&self, section: Section) -> &[OnceLock<Parsed>] {
+    fn entries(&self, section: Section) -> &[Cell] {
         match section {
             Section::Dates => &self.dates_entries,
             Section::Starts => &self.starts_entries,
@@ -499,9 +582,9 @@ impl Index {
     /// checksum only the first time. `None`, caching nothing, when the layout refuses the entry
     /// or the check fails, so every later lookup into the block fails the same way.
     #[inline]
-    fn entry(&self, section: Section, block: usize) -> Option<&Parsed> {
+    fn entry(&self, section: Section, block: usize) -> Option<Parsed> {
         let cell = self.entries(section).get(block)?;
-        cell.get().or_else(|| self.parse(section, block, cell))
+        cell.load().or_else(|| self.parse(section, block, cell))
     }
 
     /// Identity of the mailbox this index describes.
@@ -585,16 +668,15 @@ impl Index {
     /// checksum, keeps it in `cell`. A concurrent caller may check the block too; the first to
     /// finish fills the cell and both get its entry.
     #[cold]
-    fn parse<'cell>(
-        &self,
-        section: Section,
-        block: usize,
-        cell: &'cell OnceLock<Parsed>,
-    ) -> Option<&'cell Parsed> {
+    fn parse(&self, section: Section, block: usize, cell: &Cell) -> Option<Parsed> {
         let bytes = self.original.bytes();
         let (entry, payload) = self.layout.entry_at(bytes, section, block)?;
-        let sound = codec::verify(&entry, bytes.get(payload.clone())?);
-        sound.then(|| cell.get_or_init(|| Parsed::new((entry, payload))))
+        if !codec::verify(&entry, bytes.get(payload.clone())?) {
+            return None;
+        }
+        let parsed = Parsed::new((entry, payload));
+        cell.store(parsed)?;
+        Some(parsed)
     }
 
     /// The block holding `position` and the place of `position` within it.
@@ -613,7 +695,8 @@ impl Index {
     fn reach(&self, section: Section, needed: &Range<usize>) -> Option<Reach<'_>> {
         let (first_block, last_block) = blocks_of(&self.layout, needed)?;
         let first = self.entry(section, first_block)?;
-        let last = if last_block == first_block {
+        let same = last_block == first_block;
+        let last = if same {
             first
         } else {
             self.entry(section, last_block)?
@@ -622,6 +705,7 @@ impl Index {
             bytes: self.original.bytes(),
             first,
             last,
+            same,
             layout: &self.layout,
         })
     }
@@ -694,7 +778,7 @@ impl Index {
     pub(crate) fn verified_blocks(&self, section: Section) -> usize {
         self.entries(section)
             .iter()
-            .filter(|cell| cell.get().is_some())
+            .filter(|cell| cell.is_filled())
             .count()
     }
 
@@ -703,14 +787,14 @@ impl Index {
     /// start from its cached entry, or the mailbox end after the last message. `None` when the
     /// next block has no cached entry yet or a read is refused.
     #[inline(never)]
-    fn verified_edge(&self, entry: &Parsed, position: usize, within: usize) -> Option<(u64, u64)> {
+    fn verified_edge(&self, entry: Parsed, position: usize, within: usize) -> Option<(u64, u64)> {
         let bytes = self.original.bytes();
         let start = entry.start(bytes, within)?;
         let following = position.checked_add(1)?;
         if following == messages(&self.layout) {
             return Some((start, self.layout.fingerprint.len()));
         }
-        let next = self.starts_entries.get(self.place(following)?.0)?.get()?;
+        let next = self.starts_entries.get(self.place(following)?.0)?.load()?;
         Some((start, next.start(bytes, 0)?))
     }
 
@@ -726,7 +810,7 @@ impl Index {
             return None;
         }
         let (block, within) = self.place(position)?;
-        let entry = self.starts_entries.get(block)?.get()?;
+        let entry = self.starts_entries.get(block)?.load()?;
         let (first, next) = self.verified_starts(entry, position, within)?;
         let (start, end) = (narrow(first)?, narrow(next)?);
         (start <= end && end <= self.mailbox.len()).then_some(start..end)
@@ -735,12 +819,7 @@ impl Index {
     /// The starts at `within` and after it that [`Index::verified_span`] needs: both from one
     /// load of `entry`'s block unless the message at `position` ends its block or the mailbox.
     #[inline]
-    fn verified_starts(
-        &self,
-        entry: &Parsed,
-        position: usize,
-        within: usize,
-    ) -> Option<(u64, u64)> {
+    fn verified_starts(&self, entry: Parsed, position: usize, within: usize) -> Option<(u64, u64)> {
         let shift = u32::from(self.layout.block_shift);
         let inner = position.checked_add(1)? < messages(&self.layout)
             && within.checked_add(1)?.checked_shr(shift)? == 0;
@@ -828,8 +907,8 @@ fn blocks_of(layout: &Layout, needed: &Range<usize>) -> Option<(usize, usize)> {
 }
 
 /// One empty cell per block of `blocks`; nothing is parsed until a lookup reaches a block.
-fn cells(blocks: usize) -> Box<[OnceLock<Parsed>]> {
-    iter::repeat_with(OnceLock::new).take(blocks).collect()
+fn cells(blocks: usize) -> Box<[Cell]> {
+    iter::repeat_with(Cell::empty).take(blocks).collect()
 }
 
 /// Dates in unix seconds of every message of `run` but the last, each running to the next start,
@@ -933,8 +1012,9 @@ where
     let last = Parsed::new(layout.entry_at(bytes, section, last_block)?);
     read(&Reach {
         bytes,
-        first: &first,
-        last: &last,
+        first,
+        last,
+        same: first_block == last_block,
         layout,
     })
 }
@@ -958,13 +1038,13 @@ mod tests {
     use std::fs::{self, File};
     use std::ops::Range;
     use std::path::PathBuf;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use std::thread;
 
     use memmap2::Mmap;
     use tempfile::TempDir;
 
-    use super::{Index, Parsed, Section, format};
+    use super::{Cell, Index, Parsed, Section, codec, format};
     use crate::error::MboxTurboError;
     use crate::fingerprint::Fingerprint;
     use crate::mailbox::map_read_only;
@@ -1336,11 +1416,53 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_entry_costs_at_most_forty_bytes_per_block() {
+    fn a_cached_entry_costs_at_most_sixteen_bytes_per_block() {
         assert!(
-            size_of::<OnceLock<Parsed>>() <= 40,
+            size_of::<Cell>() <= 16,
             "the open path adds one cell per block and section beside the mapping"
         );
+    }
+
+    #[test]
+    fn a_cell_round_trips_the_largest_entry() {
+        let cell = Cell::empty();
+        assert!(cell.load().is_none(), "an empty cell loads nothing");
+        let largest = (1_usize << 48_u32) - 1;
+        let parsed = Parsed {
+            frame: codec::Frame {
+                base: u64::MAX,
+                flags: 0xFF,
+                width: 64,
+            },
+            payload: largest,
+        };
+        assert!(cell.store(parsed).is_some(), "the largest start fits");
+        let loaded = cell.load().expect("a filled cell loads");
+        assert_eq!(
+            (
+                loaded.frame.base,
+                loaded.frame.flags,
+                loaded.frame.width,
+                loaded.payload
+            ),
+            (u64::MAX, 0xFF, 64, largest)
+        );
+        assert!(cell.is_filled(), "a stored cell counts as filled");
+    }
+
+    #[test]
+    fn a_cell_refuses_a_payload_start_of_two_to_the_forty_eighth() {
+        let cell = Cell::empty();
+        let parsed = Parsed {
+            frame: codec::Frame {
+                base: 0,
+                flags: 0,
+                width: 0,
+            },
+            payload: 1_usize << 48_u32,
+        };
+        assert!(cell.store(parsed).is_none(), "the start does not fit");
+        assert!(!cell.is_filled(), "a refused store leaves the cell empty");
     }
 
     #[test]
