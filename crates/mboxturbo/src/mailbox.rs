@@ -67,6 +67,17 @@ impl Mapped {
         Index::load(index_path, Arc::clone(&self.contents), self.fingerprint)
     }
 
+    /// Loads the sidecar index of the mbox at `mbox` saved at `sidecar`, which must match this
+    /// mapping's fingerprint, and refuses it, mapping nothing, unless it is a regular file owned
+    /// by the mbox's owner. See [`Index::load_trusted`].
+    pub(crate) fn load_sidecar(
+        &self,
+        sidecar: &Path,
+        mbox: &Path,
+    ) -> Result<Index, MboxTurboError> {
+        Index::load_trusted(sidecar, mbox, Arc::clone(&self.contents), self.fingerprint)
+    }
+
     /// Opens and maps `path`, fingerprinting what was mapped.
     ///
     /// Fails with [`MboxTurboError::Io`] when the file cannot be opened or mapped.

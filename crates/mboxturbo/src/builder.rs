@@ -65,8 +65,15 @@ pub enum IndexPolicy {
     Path(PathBuf),
     /// The file `<mbox path>.mbxidx` beside the mbox, so `/a/mail.mbox` is indexed by
     /// `/a/mail.mbox.mbxidx`. It is reused while it matches the mbox and rebuilt when it is
-    /// missing, stale or damaged. When it cannot be written, for example in a read-only
-    /// directory, the open still succeeds with an index held in memory only.
+    /// missing, stale or damaged.
+    ///
+    /// Anyone who can write the mbox's directory controls this path, so the file is trusted only
+    /// when it is a regular file owned by the same user as the mbox (on Unix) and the path still
+    /// names the file that was opened. A symlink, FIFO, directory, socket or foreign-owned file
+    /// is never opened for mapping: it is treated as missing and replaced by a rebuilt index,
+    /// without following the link. Windows applies the regular-file check only. When it cannot
+    /// be written, for example in a read-only directory, the open still succeeds with an index
+    /// held in memory only.
     #[default]
     Sidecar,
 }
@@ -135,7 +142,7 @@ impl MailboxBuilder {
                 Ok(mapped.with_index(index, IndexSource::Memory))
             },
             IndexPolicy::Path(index_path) => self.open_at(mapped, index_path),
-            IndexPolicy::Sidecar => self.open_sidecar(mapped, &sidecar_path(mbox)),
+            IndexPolicy::Sidecar => self.open_sidecar(mapped, mbox),
         }
     }
 
@@ -154,10 +161,13 @@ impl MailboxBuilder {
         }
     }
 
-    /// Serves the sidecar at `sidecar` when it loads, else rebuilds it. A rebuild that cannot be
-    /// written is kept in memory, because a cache the caller never named must not fail the open.
-    fn open_sidecar(&self, mapped: Mapped, sidecar: &Path) -> Result<Mailbox, MboxTurboError> {
-        if let Ok(index) = mapped.load(sidecar) {
+    /// Serves the sidecar of `mbox` when it loads and is trusted, else rebuilds it; a refused
+    /// sidecar is replaced, not followed. A rebuild that cannot be written is kept in memory,
+    /// because a cache the caller never named must not fail the open.
+    fn open_sidecar(&self, mapped: Mapped, mbox: &Path) -> Result<Mailbox, MboxTurboError> {
+        let sidecar_file = sidecar_path(mbox);
+        let sidecar = sidecar_file.as_path();
+        if let Ok(index) = mapped.load_sidecar(sidecar, mbox) {
             return Ok(mapped.with_index(index, IndexSource::File(sidecar.to_path_buf())));
         }
         let index = mapped.build(self.block_size);
@@ -262,6 +272,58 @@ From c@example.com Wed Jan  3 00:00:00 2024\nSubject: three\n\nbody\n";
             written,
             "a rewrite would rename a new file over the sidecar and change its inode"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sidecar_is_replaced_by_a_regular_file_instead_of_followed() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, path) = fixture();
+        let sidecar = sidecar_path(&path);
+        let _first = Mailbox::open(&path).expect("first open writes a valid sidecar");
+        let target = directory.path().join("elsewhere.idx");
+        fs::rename(&sidecar, &target).expect("the valid sidecar is moved aside");
+        symlink(&target, &sidecar).expect("the sidecar becomes a symlink");
+        let _second = Mailbox::open(&path).expect("a symlinked sidecar still opens");
+        assert!(
+            fs::symlink_metadata(&sidecar)
+                .expect("sidecar has metadata")
+                .is_file(),
+            "a followed symlink would stay a symlink; the rebuild replaces it with a file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_sidecar_opens_promptly_with_an_index_built_from_the_mbox() {
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (_directory, path) = fixture();
+        let sidecar = sidecar_path(&path);
+        let status = Command::new("mkfifo")
+            .arg(&sidecar)
+            .status()
+            .expect("the mkfifo command runs and reports its status");
+        assert!(status.success(), "mkfifo creates the FIFO");
+        let (sender, receiver) = mpsc::channel();
+        let owned = path;
+        let worker = thread::spawn(move || {
+            let count = Mailbox::open(&owned)
+                .expect("a FIFO sidecar still opens")
+                .len();
+            sender
+                .send(count)
+                .expect("the test still receives the count");
+        });
+        let count = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the open returns within 30 seconds rather than blocking on the FIFO");
+        worker.join().expect("the open thread finishes");
+        assert_eq!(count, 3, "the index is built from the mbox");
     }
 
     #[cfg(unix)]

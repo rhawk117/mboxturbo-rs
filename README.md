@@ -23,7 +23,7 @@ with Mailbox('inbox.mbox', index='inbox.mbxidx') as mailbox:
             payloads = [attachment.data for attachment in message.attachments]
 ```
 
-- Without `index=`, the index is saved beside the mailbox as `<mailbox path>.mbxidx` (`inbox.mbox` gets `inbox.mbox.mbxidx`) and reused while it matches; a directory that cannot be written leaves nothing behind and the index stays in memory.
+- Without `index=`, the index is saved beside the mailbox as `<mailbox path>.mbxidx` (`inbox.mbox` gets `inbox.mbox.mbxidx`) and reused while it matches. Anyone who can write the mailbox's directory controls that path, so the file is trusted only when it is a regular file owned by the mailbox's owner: a symlink, FIFO or foreign-owned file is never mapped and is replaced by a rebuilt index. A directory that cannot be written leaves nothing behind and the index stays in memory.
 - `index=` names the cache file explicitly: reused while it matches the mailbox, rebuilt and rewritten when missing or stale, and `CorruptIndexError` (file left untouched) when its header is damaged.
 - The index is mapped rather than loaded: each block is verified on first use, and a damaged block triggers a rescan and a rewrite instead of an error.
 - Header fields (`subject`, `from_`, `to`, `cc`, `date`, `message_id`, `get`, `get_all`) parse the header block only. Bodies and attachments trigger the full MIME parse.
