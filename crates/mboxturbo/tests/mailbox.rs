@@ -2,8 +2,11 @@
 
 #[cfg(test)]
 mod mailbox {
+    use std::fmt::Write as _;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
     use rayon::prelude::*;
@@ -43,6 +46,9 @@ AAEC\n\
 \n";
 
     const BARE: &str = "From nobody Wed Jan  3 00:00:00 2024\nSubject: third\n\nbody\n";
+
+    /// Offset of a byte in the first payload block of a freshly built sidecar.
+    const FIRST_PAYLOAD_BYTE: usize = 72;
 
     struct Fixture {
         _directory: TempDir,
@@ -427,6 +433,124 @@ AAEC\n\
         assert!(
             matches!(&error, MboxTurboError::Io { path, .. } if *path == missing),
             "the error carries the missing path"
+        );
+    }
+
+    /// Writes `messages` numbered messages of about 200 bytes each and returns the mailbox's path
+    /// and the path of its sidecar.
+    fn large_mailbox(directory: &TempDir, messages: usize) -> (PathBuf, PathBuf) {
+        let mbox = directory.path().join("big.mbox");
+        let body = "x".repeat(90);
+        let mut contents = String::new();
+        for number in 0..messages {
+            write!(
+                contents,
+                "From sender{number}@example.com Mon Jan  1 00:00:00 2024\n\
+Subject: message {number}\n\
+Date: Mon, 01 Jan 2024 00:00:00 +0000\n\
+\n\
+body of message {number} {body}\n\
+\n"
+            )
+            .expect("a String accepts every write");
+        }
+        fs::write(&mbox, contents).expect("mbox is written");
+        let sidecar = directory.path().join("big.mbox.mbxidx");
+        (mbox, sidecar)
+    }
+
+    /// The raw bytes of the first message of `mailbox`.
+    fn first_raw(mailbox: &Mailbox) -> Vec<u8> {
+        mailbox
+            .message(0)
+            .expect("the first message is indexed")
+            .raw()
+            .to_vec()
+    }
+
+    /// Queues a lookup of the first message of `mailbox` on the worker at index 0 of `pool`
+    /// alone, behind any work already queued for it; the lookup sends the raw bytes to `sender`.
+    fn queue_on_the_first_worker(
+        pool: &rayon::ThreadPool,
+        mailbox: &Arc<Mailbox>,
+        sender: &mpsc::Sender<Vec<u8>>,
+    ) {
+        let shared = Arc::clone(mailbox);
+        let answers = sender.clone();
+        pool.spawn_broadcast(move |context| {
+            if context.index() == 0 {
+                answers
+                    .send(first_raw(&shared))
+                    .expect("the test still receives answers");
+            }
+        });
+    }
+
+    /// Pins the race in which a lookup into a damaged block rebuilds the index on a rayon worker:
+    /// a parallel rebuild that finds a job of its own stolen runs the work queued for its thread
+    /// while it waits, and a second lookup in that work re-enters the sidecar's `OnceLock` on
+    /// the thread already initializing it, which never returns. A broadcast queues the second
+    /// lookup on the rebuilding worker alone, standing in for a lookup it would steal or take
+    /// from the pool's injector, so a parallel rebuild reaches it at its first such wait.
+    #[test]
+    fn a_lookup_queued_on_the_rebuilding_worker_answers_with_the_clean_message() {
+        const REPEATS: usize = 10;
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let (mbox, sidecar) = large_mailbox(&directory, 20_000);
+        let expected =
+            first_raw(&Mailbox::open(&mbox).expect("the mbox opens and writes its sidecar"));
+        let mut damaged = fs::read(&sidecar).expect("the clean sidecar is written");
+        damaged[FIRST_PAYLOAD_BYTE] ^= 0xFF;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("the private pool is built");
+        for repeat in 0..REPEATS {
+            fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
+            let mailbox = Arc::new(Mailbox::open(&mbox).expect("a damaged sidecar still opens"));
+            let (sender, receiver) = mpsc::channel();
+            queue_on_the_first_worker(&pool, &mailbox, &sender);
+            queue_on_the_first_worker(&pool, &mailbox, &sender);
+            for lookup in 0_usize..2 {
+                let raw = receiver
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the lookup answers within 30 seconds rather than hanging");
+                assert_eq!(
+                    raw, expected,
+                    "repeat {repeat}: lookup {lookup} answers with the clean bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn par_iter_over_a_damaged_sidecar_returns_the_clean_spans_and_rewrites_it() {
+        const MESSAGES: usize = 30_000;
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let (mbox, sidecar) = large_mailbox(&directory, MESSAGES);
+        let clean: Vec<Vec<u8>> = Mailbox::open(&mbox)
+            .expect("the mbox opens and writes its sidecar")
+            .par_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(
+            clean.len(),
+            MESSAGES,
+            "the clean build indexes every message"
+        );
+        let mut damaged = fs::read(&sidecar).expect("the clean sidecar is written");
+        damaged[FIRST_PAYLOAD_BYTE] ^= 0xFF;
+        fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
+        let spans: Vec<Vec<u8>> = Mailbox::open(&mbox)
+            .expect("a damaged sidecar still opens")
+            .par_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(spans, clean, "the rebuilt spans match a clean build");
+        assert_ne!(
+            fs::read(&sidecar).expect("the sidecar is readable"),
+            damaged,
+            "the rebuild rewrote the damaged sidecar"
         );
     }
 }

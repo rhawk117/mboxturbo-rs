@@ -23,6 +23,7 @@ use self::format::{Layout, Section, Writer};
 use crate::error::{Corruption, MboxTurboError};
 use crate::fingerprint::Fingerprint;
 use crate::mailbox::map_read_only;
+use crate::scan::Parallelism;
 use crate::width::{narrow, widen};
 use crate::{hint, scan};
 
@@ -452,7 +453,7 @@ impl Index {
     /// When `block_shift` is outside `1..=16`, the range the file header allows.
     #[must_use]
     pub fn build_with(contents: Arc<Mmap>, fingerprint: Fingerprint, block_shift: u8) -> Self {
-        let (bytes, layout) = encoded(&contents, fingerprint, block_shift);
+        let (bytes, layout) = encoded(&contents, fingerprint, block_shift, Parallelism::Parallel);
         Self::new(contents, Backing::Owned(bytes), layout, None)
     }
 
@@ -687,8 +688,23 @@ impl Index {
 
     /// Rescans the mailbox and, when the index was loaded from a file, rewrites that file with
     /// the result and keeps the outcome for [`Index::rewrite_outcome`].
+    ///
+    /// A lookup that finds a damaged block runs this inside `replacement`'s `get_or_init`, and
+    /// the lookup may be on a rayon worker, as in [`crate::Mailbox::par_iter`]. A worker that
+    /// forks here would steal lookups that wait on the same `get_or_init`, so the rebuild
+    /// encodes on the calling thread whenever it is a worker.
     fn rebuild(&self) -> (Vec<u8>, Layout) {
-        let (bytes, layout) = encoded(&self.mailbox, self.fingerprint, self.layout.block_shift);
+        let parallelism = if rayon::current_thread_index().is_some() {
+            Parallelism::Sequential
+        } else {
+            Parallelism::Parallel
+        };
+        let (bytes, layout) = encoded(
+            &self.mailbox,
+            self.fingerprint,
+            self.layout.block_shift,
+            parallelism,
+        );
         if let Some(origin) = &self.origin {
             #[expect(
                 unused_results,
@@ -816,6 +832,8 @@ struct Streamer<'sink> {
     contents: &'sink [u8],
     /// Dates of the messages in `starts`.
     dates: Vec<i64>,
+    /// Whether dating a window uses the rayon pool.
+    parallelism: Parallelism,
     /// Messages in a full block.
     per_block: usize,
     /// Starts of the messages not yet pushed to `writer`.
@@ -832,7 +850,8 @@ impl Streamer<'_> {
         let Some((&last, head)) = run.split_last() else {
             return Ok(());
         };
-        self.dates.extend(dates_before_last(self.contents, &run)?);
+        self.dates
+            .extend(dates_before_last(self.contents, &run, self.parallelism)?);
         self.starts.extend(head.iter().map(|&start| widen(start)));
         self.carry = Some(last);
         self.flush_full()
@@ -885,11 +904,20 @@ fn cells(blocks: usize) -> Box<[Cell]> {
 
 /// Dates in unix seconds of every message of `run` but the last, each running to the next start,
 /// zero for a message without a parsable Date header.
-fn dates_before_last(contents: &[u8], run: &[usize]) -> io::Result<Vec<i64>> {
-    run.par_iter()
-        .zip(run.par_iter().skip(1))
-        .map(|(&start, &end)| message_date(contents, start, end))
-        .collect()
+fn dates_before_last(
+    contents: &[u8],
+    run: &[usize],
+    parallelism: Parallelism,
+) -> io::Result<Vec<i64>> {
+    let date = |(&start, &end): (&usize, &usize)| message_date(contents, start, end);
+    match parallelism {
+        Parallelism::Parallel => run
+            .par_iter()
+            .zip(run.par_iter().skip(1))
+            .map(date)
+            .collect(),
+        Parallelism::Sequential => run.iter().zip(run.iter().skip(1)).map(date).collect(),
+    }
 }
 
 /// The index file for `contents` with blocks of `2^block_shift` messages, with its header.
@@ -899,9 +927,15 @@ fn dates_before_last(contents: &[u8], run: &[usize]) -> io::Result<Vec<i64>> {
               caller's documented 1..=16, and a file the writer finished for `fingerprint` \
               has a header that parses for `fingerprint`; each is all the writer refuses"
 )]
-fn encoded(contents: &Mmap, fingerprint: Fingerprint, block_shift: u8) -> (Vec<u8>, Layout) {
+fn encoded(
+    contents: &Mmap,
+    fingerprint: Fingerprint,
+    block_shift: u8,
+    parallelism: Parallelism,
+) -> (Vec<u8>, Layout) {
     hint::sequential(contents);
-    let streamed = stream(contents, scan::windows(contents), fingerprint, block_shift);
+    let windows = scan::windows(contents, parallelism);
+    let streamed = stream(contents, windows, fingerprint, block_shift, parallelism);
     hint::normal(contents);
     let bytes = streamed.expect("scanned starts and a valid block shift encode");
     let layout = Layout::parse(&bytes, fingerprint).expect("a freshly encoded header parses");
@@ -938,11 +972,18 @@ fn section_bytes(layout: &Layout, bytes: &[u8], section: Section) -> u64 {
 /// # Errors
 ///
 /// An error when `block_shift` is outside `1..=16` or a start lies past the end of `contents`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "five inputs against the bound of four: the writer's fingerprint and block shift, \
+              the bytes and windows it dates, and the parallelism of that dating are independent, \
+              and a struct bundling any two would exist for this private function alone"
+)]
 fn stream<I>(
     contents: &[u8],
     windows: I,
     fingerprint: Fingerprint,
     block_shift: u8,
+    parallelism: Parallelism,
 ) -> io::Result<Vec<u8>>
 where
     I: IntoIterator<Item = Vec<usize>>,
@@ -956,6 +997,7 @@ where
         carry: None,
         contents,
         dates: Vec::new(),
+        parallelism,
         per_block,
         starts: Vec::new(),
         writer,
@@ -1022,7 +1064,7 @@ mod tests {
     use crate::error::MboxTurboError;
     use crate::fingerprint::Fingerprint;
     use crate::mailbox::map_read_only;
-    use crate::scan;
+    use crate::scan::{self, Parallelism};
     use crate::width::{narrow, widen};
 
     /// Messages in the fixture: two full blocks of 256 and a short third block.
@@ -1712,9 +1754,15 @@ mod tests {
         let contents = dated_mailbox(10_000);
         let fingerprint = Fingerprint::new(&contents, None);
         for (segment, per_window, shift) in [(4096, 1, 8), (999, 3, 8), (50_000, 2, 5), (1, 7, 1)] {
-            let windows = scan::windows_with(&contents, segment, per_window);
-            let streamed = super::stream(&contents, windows, fingerprint, shift)
-                .expect("the streaming build encodes");
+            let windows = scan::windows_with(&contents, segment, per_window, Parallelism::Parallel);
+            let streamed = super::stream(
+                &contents,
+                windows,
+                fingerprint,
+                shift,
+                Parallelism::Parallel,
+            )
+            .expect("the streaming build encodes");
             assert_eq!(
                 streamed,
                 reference(&contents, fingerprint, shift),
@@ -1727,8 +1775,9 @@ mod tests {
     fn a_block_straddling_a_window_boundary_decodes_to_the_per_position_spans() {
         let contents = dated_mailbox(10_000);
         let fingerprint = Fingerprint::new(&contents, None);
-        let windows = scan::windows_with(&contents, 3000, 1);
-        let bytes = super::stream(&contents, windows, fingerprint, 8).expect("the build encodes");
+        let windows = scan::windows_with(&contents, 3000, 1, Parallelism::Parallel);
+        let bytes = super::stream(&contents, windows, fingerprint, 8, Parallelism::Parallel)
+            .expect("the build encodes");
         let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
         let starts = scan::find_message_starts(&contents);
         for position in 0..starts.len() {
@@ -1751,8 +1800,10 @@ mod tests {
     fn every_streamed_date_equals_the_extractor_including_the_last_message_of_each_window() {
         let contents = dated_mailbox(10_000);
         let fingerprint = Fingerprint::new(&contents, None);
-        let windows: Vec<Vec<usize>> = scan::windows_with(&contents, 3000, 1).collect();
-        let bytes = super::stream(&contents, windows, fingerprint, 8).expect("the build encodes");
+        let windows: Vec<Vec<usize>> =
+            scan::windows_with(&contents, 3000, 1, Parallelism::Parallel).collect();
+        let bytes = super::stream(&contents, windows, fingerprint, 8, Parallelism::Parallel)
+            .expect("the build encodes");
         let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
         let starts = scan::find_message_starts(&contents);
         for position in 0..starts.len() {
@@ -1769,8 +1820,14 @@ mod tests {
     #[test]
     fn an_empty_mailbox_streams_to_the_reference_empty_index() {
         let fingerprint = Fingerprint::new(b"", None);
-        let streamed = super::stream(b"", scan::windows(b""), fingerprint, 8)
-            .expect("an empty mailbox encodes");
+        let streamed = super::stream(
+            b"",
+            scan::windows(b"", Parallelism::Parallel),
+            fingerprint,
+            8,
+            Parallelism::Parallel,
+        )
+        .expect("an empty mailbox encodes");
         assert_eq!(
             streamed,
             reference(b"", fingerprint, 8),
