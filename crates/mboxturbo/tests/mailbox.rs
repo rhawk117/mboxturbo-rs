@@ -3,11 +3,10 @@
 #[cfg(test)]
 mod mailbox {
     use std::fmt::Write as _;
-    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, mpsc};
-    use std::thread;
     use std::time::Duration;
+    use std::{fs, thread};
 
     use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
     use rayon::prelude::*;
@@ -542,7 +541,9 @@ body of message {number} {body}\n\
         let spans = receiver
             .recv_timeout(Duration::from_secs(30))
             .expect("par_iter answers within 30 seconds rather than hanging on a rayon worker");
-        worker.join().expect("the par_iter thread finishes without panicking");
+        worker
+            .join()
+            .expect("the par_iter thread finishes without panicking");
         spans
     }
 
