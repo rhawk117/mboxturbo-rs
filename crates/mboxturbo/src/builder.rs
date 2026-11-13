@@ -125,6 +125,8 @@ impl MailboxBuilder {
     fn open_sidecar(&self, mapped: Mapped, mbox: &Path) -> Result<Mailbox, MboxTurboError> {
         let sidecar_file = sidecar_path(mbox);
         let sidecar = sidecar_file.as_path();
+        // Any load failure, a refusal included, intentionally falls back to a rebuild: the
+        // sidecar is a cache, and a refused one is replaced below.
         if let Ok(index) = mapped.load_sidecar(sidecar, mbox) {
             return Ok(mapped.with_index(index, IndexSource::File(sidecar.to_path_buf())));
         }

@@ -272,20 +272,23 @@ impl Index {
 
     /// Size of the index by section, over the rebuild once one ran.
     ///
-    /// Entries are read without checking their blocks, so this never triggers a rebuild.
+    /// Entries are read without checking their blocks, so this rebuilds only when a directory
+    /// entry is refused: a refused entry is never counted as a smaller section.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the rebuild it falls back to was just encoded, so none of its
+    /// directory entries is refused.
     #[must_use]
     pub fn bytes(&self) -> IndexBytes {
-        let (bytes, layout) = self.active();
-        let directory = layout
-            .blocks()
-            .saturating_mul(2)
-            .saturating_mul(format::ENTRY_LEN);
-        IndexBytes {
-            dates: section_bytes(layout, bytes, Section::Dates),
-            directory: widen(directory),
-            header: widen(format::HEADER_LEN),
-            starts: section_bytes(layout, bytes, Section::Starts),
-        }
+        #[expect(
+            clippy::expect_used,
+            reason = "a rebuild's entries were just written by the encoder, so none is refused"
+        )]
+        let sections = measured(self.active()).unwrap_or_else(|| {
+            measured(self.rebuilt()).expect("a rebuilt index has no refused directory entry")
+        });
+        sections
     }
 
     /// [`Index::span`] the long way: verifying the blocks it reaches the first time, and
@@ -621,14 +624,28 @@ fn messages(layout: &Layout) -> usize {
     narrow(layout.count).unwrap_or(usize::MAX)
 }
 
-/// Payload bytes of every block of `section`, read from the directory entries alone.
-fn section_bytes(layout: &Layout, bytes: &[u8], section: Section) -> u64 {
-    (0..layout.blocks())
-        .filter_map(|block| {
-            let (entry, _) = layout.entry_at(bytes, section, block)?;
-            codec::payload_len(layout.block_len(block)?, entry.width)
-        })
-        .fold(0_u64, |total, payload| total.saturating_add(widen(payload)))
+/// Size of the index in `bytes` by section, or `None` when a directory entry is refused.
+fn measured((bytes, layout): (&[u8], &Layout)) -> Option<IndexBytes> {
+    let directory = layout
+        .blocks()
+        .saturating_mul(2)
+        .saturating_mul(format::ENTRY_LEN);
+    Some(IndexBytes {
+        dates: section_bytes(layout, bytes, Section::Dates)?,
+        directory: widen(directory),
+        header: widen(format::HEADER_LEN),
+        starts: section_bytes(layout, bytes, Section::Starts)?,
+    })
+}
+
+/// Payload bytes of every block of `section`, read from the directory entries alone, or `None`
+/// on the first entry that is refused.
+fn section_bytes(layout: &Layout, bytes: &[u8], section: Section) -> Option<u64> {
+    (0..layout.blocks()).try_fold(0_u64, |total, block| {
+        let (entry, _) = layout.entry_at(bytes, section, block)?;
+        let payload = codec::payload_len(layout.block_len(block)?, entry.width)?;
+        total.checked_add(widen(payload))
+    })
 }
 
 /// Answers `read` from the rebuilt `bytes` whose header is `layout`, parsing the entries it needs
@@ -991,6 +1008,31 @@ mod tests {
             index.cursor().span(MESSAGES),
             None,
             "no message sits past the end"
+        );
+    }
+
+    #[test]
+    fn a_damaged_directory_entry_is_measured_from_the_rebuild() {
+        let fixture = Fixture::new();
+        let _bytes = fixture.saved();
+        let clean = fixture.loaded().bytes();
+        let high_byte = plus(fixture.entry_at(0), 15);
+        fixture.damage(high_byte);
+        let index = fixture.loaded();
+        let (bytes, layout) = index.active();
+        assert_eq!(
+            super::section_bytes(layout, bytes, Section::Starts),
+            None,
+            "the damaged payload offset lies outside the file, so the entry is refused"
+        );
+        assert_eq!(
+            index.bytes(),
+            clean,
+            "the refused entry is measured from the rebuild, not skipped"
+        );
+        assert!(
+            index.replacement.get().is_some(),
+            "the measurement ran the rebuild"
         );
     }
 

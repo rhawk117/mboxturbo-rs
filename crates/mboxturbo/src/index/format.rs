@@ -134,6 +134,10 @@ impl Layout {
     }
 
     /// Number of blocks in each directory.
+    ///
+    /// The fallback is unreachable for a header `parse` accepted: `check_extent` requires the
+    /// directories, two entries per block, to end exactly at the file length, so the count fits
+    /// `usize`; a layout built from a mailbox in memory holds fewer messages than `usize::MAX`.
     pub(crate) fn blocks(&self) -> usize {
         narrow(self.count.div_ceil(self.per_block())).unwrap_or(0)
     }
