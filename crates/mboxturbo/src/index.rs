@@ -1,6 +1,7 @@
 //! Message boundary index over the v2 block-directory file, verified one block at a time and
 //! rebuilt from the mailbox when a block turns out to be damaged.
 
+mod block;
 mod build;
 mod cache;
 mod codec;
@@ -20,6 +21,7 @@ use std::{fmt, iter};
 use memmap2::Mmap;
 use tempfile::NamedTempFile;
 
+pub use self::block::BlockSize;
 use self::build::encoded;
 use self::cache::{Cell, Parsed};
 pub(crate) use self::cursor::Cursor;
@@ -254,17 +256,17 @@ impl Index {
     /// message without a parsable Date header is dated zero.
     #[must_use]
     pub fn build(contents: Arc<Mmap>, fingerprint: Fingerprint) -> Self {
-        Self::build_with(contents, fingerprint, format::DEFAULT_BLOCK_SHIFT)
+        Self::build_with(contents, fingerprint, BlockSize::default())
     }
 
-    /// As [`Index::build`], with blocks of `2^block_shift` messages.
-    ///
-    /// # Panics
-    ///
-    /// When `block_shift` is outside `1..=16`, the range the file header allows.
+    /// As [`Index::build`], with blocks of `block_size.entries()` messages.
     #[must_use]
-    pub fn build_with(contents: Arc<Mmap>, fingerprint: Fingerprint, block_shift: u8) -> Self {
-        let (bytes, layout) = encoded(&contents, fingerprint, block_shift, Parallelism::Parallel);
+    pub fn build_with(
+        contents: Arc<Mmap>,
+        fingerprint: Fingerprint,
+        block_size: BlockSize,
+    ) -> Self {
+        let (bytes, layout) = encoded(&contents, fingerprint, block_size, Parallelism::Parallel);
         Self::new(contents, Backing::Owned(bytes), layout, None)
     }
 
@@ -477,7 +479,7 @@ impl Index {
         let (bytes, layout) = encoded(
             &self.mailbox,
             self.fingerprint,
-            self.layout.block_shift,
+            self.layout.block_size,
             parallelism,
         );
         if let Some(origin) = &self.origin {
@@ -680,7 +682,7 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
-    use super::{Index, Section, format};
+    use super::{BlockSize, Index, Section, format};
     use crate::error::MboxTurboError;
     use crate::fingerprint::Fingerprint;
     use crate::mailbox::map_read_only;
@@ -831,7 +833,8 @@ mod tests {
             let file = File::open(&path).expect("the mailbox reopens");
             let mailbox = Arc::new(map_read_only(&file).expect("the mailbox maps"));
             let fingerprint = Fingerprint::new(contents, None);
-            let good = Index::build_with(Arc::clone(&mailbox), fingerprint, shift)
+            let block_size = BlockSize::from_shift(shift).expect("the shift is within the range");
+            let good = Index::build_with(Arc::clone(&mailbox), fingerprint, block_size)
                 .active()
                 .0
                 .to_vec();
@@ -1243,13 +1246,8 @@ mod tests {
             .collect();
         starts[599] = widen(plus(fixture.contents.len(), 10));
         let dates = vec![0_i64; starts.len()];
-        let bytes = format::encode(
-            &starts,
-            &dates,
-            fixture.fingerprint,
-            format::DEFAULT_BLOCK_SHIFT,
-        )
-        .expect("the forged starts encode with valid checksums");
+        let bytes = format::encode(&starts, &dates, fixture.fingerprint, BlockSize::default())
+            .expect("the forged starts encode with valid checksums");
         fs::write(fixture.index_path(), bytes).expect("the forged index is written");
         assert_eq!(
             fixture.loaded().span(598),
@@ -1284,7 +1282,11 @@ mod tests {
         fs::write(&path, &contents).expect("the dated mailbox is written");
         let file = File::open(&path).expect("the dated mailbox reopens");
         let mailbox = Arc::new(map_read_only(&file).expect("the dated mailbox maps"));
-        let index = Index::build_with(mailbox, fingerprint, 5);
+        let index = Index::build_with(
+            mailbox,
+            fingerprint,
+            BlockSize::from_shift(5).expect("5 is within the range"),
+        );
         let sections = index.bytes();
         let served = index.active().0.len();
         let blocks = index.active().1.blocks();
@@ -1342,7 +1344,7 @@ mod tests {
         #[test]
         fn every_reader_answers_the_scanned_span(
             bodies in vec(0_usize..80, 1..=48),
-            shift in prop_oneof![1_u8..=4, Just(format::DEFAULT_BLOCK_SHIFT)],
+            shift in prop_oneof![1_u8..=4, Just(BlockSize::default().shift())],
         ) {
             let disk = Disk::new(&bodied_mailbox(&bodies), shift);
             for position in 0..=disk.expected.len() {
@@ -1363,7 +1365,7 @@ mod tests {
         #[test]
         fn every_reader_answers_the_scanned_span_after_a_rebuild(
             bodies in vec(0_usize..80, 1..=48),
-            shift in prop_oneof![1_u8..=4, Just(format::DEFAULT_BLOCK_SHIFT)],
+            shift in prop_oneof![1_u8..=4, Just(BlockSize::default().shift())],
             damaged in 0_usize..64,
         ) {
             let disk = Disk::new(&bodied_mailbox(&bodies), shift);

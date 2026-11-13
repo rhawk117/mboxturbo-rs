@@ -9,11 +9,11 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::builder::{BlockSize, IndexPolicy, IndexSource, MailboxBuilder};
+use crate::builder::{IndexPolicy, IndexSource, MailboxBuilder};
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
-use crate::index::{Cursor, Index};
+use crate::index::{BlockSize, Cursor, Index};
 use crate::message::Message;
 
 /// An mbox file mapped read-only, with the byte offset of every message.
@@ -53,13 +53,9 @@ pub(crate) struct Mapped {
 }
 
 impl Mapped {
-    /// Builds a fresh index over the mapping, with blocks of `block_size` messages when given.
-    pub(crate) fn build(&self, block_size: Option<BlockSize>) -> Index {
-        let contents = Arc::clone(&self.contents);
-        match block_size {
-            Some(size) => Index::build_with(contents, self.fingerprint, size.shift()),
-            None => Index::build(contents, self.fingerprint),
-        }
+    /// Builds a fresh index over the mapping, with blocks of `block_size` messages.
+    pub(crate) fn build(&self, block_size: BlockSize) -> Index {
+        Index::build_with(Arc::clone(&self.contents), self.fingerprint, block_size)
     }
 
     /// Loads the index saved at `index_path`, which must match this mapping's fingerprint.

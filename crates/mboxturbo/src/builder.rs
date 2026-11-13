@@ -4,54 +4,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::error::MboxTurboError;
+use crate::index::BlockSize;
 use crate::mailbox::{Mailbox, Mapped};
-
-/// Most entries a block may hold.
-const MAX_ENTRIES: usize = 0x1_0000;
-
-/// Fewest entries a block may hold.
-const MIN_ENTRIES: usize = 2;
 
 /// Suffix appended to the mbox path to name its sidecar index file.
 const SIDECAR_SUFFIX: &str = ".mbxidx";
-
-/// How many messages one block of the index covers: a power of two from 2 to 65536.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockSize(u8);
-
-impl BlockSize {
-    /// The number of messages in one block.
-    #[must_use]
-    pub const fn entries(self) -> usize {
-        #[expect(
-            clippy::as_conversions,
-            reason = "widening a shift of at most 16 to u32 cannot lose bits"
-        )]
-        let shift = self.0 as u32;
-        1_usize << shift
-    }
-
-    /// A block of `entries` messages, or `None` unless `entries` is a power of two between 2 and
-    /// 65536 inclusive, the range the index file header can describe.
-    #[must_use]
-    pub const fn new(entries: usize) -> Option<Self> {
-        if !entries.is_power_of_two() || entries < MIN_ENTRIES || entries > MAX_ENTRIES {
-            return None;
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::as_conversions,
-            reason = "entries is a power of two of at most 65536, so its shift is at most 16"
-        )]
-        let shift = entries.trailing_zeros() as u8;
-        Some(Self(shift))
-    }
-
-    /// The header's block shift: `entries()` is `1 << shift()`.
-    pub(crate) const fn shift(self) -> u8 {
-        self.0
-    }
-}
 
 /// Where [`MailboxBuilder::open`] keeps the message index.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -71,9 +28,10 @@ pub enum IndexPolicy {
     /// when it is a regular file owned by the same user as the mbox (on Unix) and the path still
     /// names the file that was opened. A symlink, FIFO, directory, socket or foreign-owned file
     /// is never opened for mapping: it is treated as missing and replaced by a rebuilt index,
-    /// without following the link. Windows applies the regular-file check only. When it cannot
-    /// be written, for example in a read-only directory, the open still succeeds with an index
-    /// held in memory only.
+    /// without following the link. An opener who does not own the mbox gets no cache: the
+    /// sidecar it would write is refused on every later open, so every open rebuilds. Windows
+    /// applies the regular-file check only. When it cannot be written, for example in a
+    /// read-only directory, the open still succeeds with an index held in memory only.
     #[default]
     Sidecar,
 }
@@ -94,8 +52,8 @@ pub enum IndexSource {
 /// [`Mailbox::open`] uses.
 #[derive(Clone, Debug, Default)]
 pub struct MailboxBuilder {
-    /// Block size for an index built by this open, or `None` for the default.
-    block_size: Option<BlockSize>,
+    /// Block size for an index built by this open.
+    block_size: BlockSize,
     /// Where the index is kept.
     policy: IndexPolicy,
 }
@@ -105,7 +63,7 @@ impl MailboxBuilder {
     /// block size it was written with.
     #[must_use]
     pub const fn block_size(mut self, size: BlockSize) -> Self {
-        self.block_size = Some(size);
+        self.block_size = size;
         self
     }
 

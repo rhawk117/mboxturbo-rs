@@ -30,11 +30,11 @@ mod pipeline;
 mod scan;
 mod width;
 
-pub use builder::{BlockSize, IndexPolicy, IndexSource, MailboxBuilder};
+pub use builder::{IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
 pub use error::{Corruption, MboxTurboError};
 pub use fingerprint::Fingerprint;
-pub use index::{Index, IndexBytes};
+pub use index::{BlockSize, Index, IndexBytes};
 pub use mailbox::{Mailbox, ParsedBatch};
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use pipeline::{BatchReader, Compression, Pipeline};

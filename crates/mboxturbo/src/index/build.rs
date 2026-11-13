@@ -5,8 +5,8 @@ use std::io;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use super::date;
 use super::format::{Layout, Writer};
+use super::{BlockSize, date};
 use crate::fingerprint::Fingerprint;
 use crate::hint;
 use crate::scan::{self, Parallelism};
@@ -95,24 +95,24 @@ fn dates_before_last(
     }
 }
 
-/// The index file for `contents` with blocks of `2^block_shift` messages, with its header.
+/// The index file for `contents` with blocks of `block_size.entries()` messages, with its header.
 #[expect(
     clippy::expect_used,
-    reason = "the scanner's starts ascend below the mailbox length, the block shift is the \
-              caller's documented 1..=16, and a file the writer finished for `fingerprint` \
-              has a header that parses for `fingerprint`; each is all the writer refuses"
+    reason = "the scanner's starts ascend below the mailbox length and a file the writer \
+              finished for `fingerprint` has a header that parses for `fingerprint`; that is \
+              all the writer into a `Vec` refuses"
 )]
 pub(super) fn encoded(
     contents: &Mmap,
     fingerprint: Fingerprint,
-    block_shift: u8,
+    block_size: BlockSize,
     parallelism: Parallelism,
 ) -> (Vec<u8>, Layout) {
     hint::sequential(contents);
     let windows = scan::windows(contents, parallelism);
-    let streamed = stream(contents, windows, fingerprint, block_shift, parallelism);
+    let streamed = stream(contents, windows, fingerprint, block_size, parallelism);
     hint::normal(contents);
-    let bytes = streamed.expect("scanned starts and a valid block shift encode");
+    let bytes = streamed.expect("scanned starts encode");
     let layout = Layout::parse(&bytes, fingerprint).expect("a freshly encoded header parses");
     (bytes, layout)
 }
@@ -129,7 +129,7 @@ fn message_date(contents: &[u8], start: usize, end: usize) -> io::Result<i64> {
 ///
 /// # Errors
 ///
-/// An error when `block_shift` is outside `1..=16` or a start lies past the end of `contents`.
+/// An error when a start lies past the end of `contents`.
 #[expect(
     clippy::too_many_arguments,
     reason = "five inputs against the bound of four: the writer's fingerprint and block shift, \
@@ -140,17 +140,15 @@ pub(super) fn stream<I>(
     contents: &[u8],
     windows: I,
     fingerprint: Fingerprint,
-    block_shift: u8,
+    block_size: BlockSize,
     parallelism: Parallelism,
 ) -> io::Result<Vec<u8>>
 where
     I: IntoIterator<Item = Vec<usize>>,
 {
     let mut sink = io::Cursor::new(Vec::new());
-    let writer = Writer::new(&mut sink, fingerprint, block_shift)?;
-    let per_block = 1_usize
-        .checked_shl(u32::from(block_shift))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "block shift is too large"))?;
+    let writer = Writer::new(&mut sink, fingerprint, block_size)?;
+    let per_block = block_size.entries();
     let mut streamer = Streamer {
         carry: None,
         contents,
@@ -171,13 +169,13 @@ where
 mod tests {
     use super::super::tests::dated_mailbox;
     use super::super::{date, format};
-    use super::stream;
+    use super::{BlockSize, stream};
     use crate::fingerprint::Fingerprint;
     use crate::scan::{self, Parallelism};
     use crate::width::widen;
 
     /// `format::encode` over the whole scan, the reference the streaming build must match.
-    fn reference(contents: &[u8], fingerprint: Fingerprint, shift: u8) -> Vec<u8> {
+    fn reference(contents: &[u8], fingerprint: Fingerprint, block_size: BlockSize) -> Vec<u8> {
         let starts = scan::find_message_starts(contents);
         let dates: Vec<i64> = starts
             .iter()
@@ -191,7 +189,7 @@ mod tests {
             })
             .collect();
         let wide: Vec<u64> = starts.iter().map(|&start| widen(start)).collect();
-        format::encode(&wide, &dates, fingerprint, shift).expect("the reference encodes")
+        format::encode(&wide, &dates, fingerprint, block_size).expect("the reference encodes")
     }
 
     #[test]
@@ -199,18 +197,19 @@ mod tests {
         let contents = dated_mailbox(10_000);
         let fingerprint = Fingerprint::new(&contents, None);
         for (segment, per_window, shift) in [(4096, 1, 8), (999, 3, 8), (50_000, 2, 5), (1, 7, 1)] {
+            let block_size = BlockSize::from_shift(shift).expect("shift is within the range");
             let windows = scan::windows_with(&contents, segment, per_window, Parallelism::Parallel);
             let streamed = stream(
                 &contents,
                 windows,
                 fingerprint,
-                shift,
+                block_size,
                 Parallelism::Parallel,
             )
             .expect("the streaming build encodes");
             assert_eq!(
                 streamed,
-                reference(&contents, fingerprint, shift),
+                reference(&contents, fingerprint, block_size),
                 "segment {segment} x {per_window} windows at shift {shift} equals the reference"
             );
         }
@@ -221,8 +220,14 @@ mod tests {
         let contents = dated_mailbox(10_000);
         let fingerprint = Fingerprint::new(&contents, None);
         let windows = scan::windows_with(&contents, 3000, 1, Parallelism::Parallel);
-        let bytes = stream(&contents, windows, fingerprint, 8, Parallelism::Parallel)
-            .expect("the build encodes");
+        let bytes = stream(
+            &contents,
+            windows,
+            fingerprint,
+            BlockSize::default(),
+            Parallelism::Parallel,
+        )
+        .expect("the build encodes");
         let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
         let starts = scan::find_message_starts(&contents);
         for position in 0..starts.len() {
@@ -247,8 +252,14 @@ mod tests {
         let fingerprint = Fingerprint::new(&contents, None);
         let windows: Vec<Vec<usize>> =
             scan::windows_with(&contents, 3000, 1, Parallelism::Parallel).collect();
-        let bytes = stream(&contents, windows, fingerprint, 8, Parallelism::Parallel)
-            .expect("the build encodes");
+        let bytes = stream(
+            &contents,
+            windows,
+            fingerprint,
+            BlockSize::default(),
+            Parallelism::Parallel,
+        )
+        .expect("the build encodes");
         let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
         let starts = scan::find_message_starts(&contents);
         for position in 0..starts.len() {
@@ -269,13 +280,13 @@ mod tests {
             b"",
             scan::windows(b"", Parallelism::Parallel),
             fingerprint,
-            8,
+            BlockSize::default(),
             Parallelism::Parallel,
         )
         .expect("an empty mailbox encodes");
         assert_eq!(
             streamed,
-            reference(b"", fingerprint, 8),
+            reference(b"", fingerprint, BlockSize::default()),
             "no messages yield the reference empty file"
         );
     }

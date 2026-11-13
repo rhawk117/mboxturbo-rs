@@ -46,23 +46,17 @@ use std::ops::Range;
 
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::{MAGIC, Rejection, codec};
+use super::{BlockSize, MAGIC, Rejection, codec};
 use crate::error::Corruption;
 use crate::fingerprint::Fingerprint;
 use crate::width::{narrow, widen};
 
 /// Bytes of the header covered by its checksum.
 const CHECKED_LEN: usize = 64;
-/// Block shift of a writer that has no reason to choose another: 256 messages per block.
-pub(crate) const DEFAULT_BLOCK_SHIFT: u8 = 8;
 /// Bytes in one directory entry.
 pub(crate) const ENTRY_LEN: usize = 32;
 /// Bytes before the first block payload.
 pub(crate) const HEADER_LEN: usize = 72;
-/// Largest block shift the format allows.
-const MAX_BLOCK_SHIFT: u8 = 16;
-/// Smallest block shift the format allows.
-const MIN_BLOCK_SHIFT: u8 = 1;
 /// Format version this build writes and reads; older files count as stale, newer as corrupt.
 pub(crate) const VERSION: u32 = 2;
 
@@ -78,8 +72,8 @@ struct Entry {
 /// The header of an opened file: enough to find any block without reading the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Layout {
-    /// Each block holds `2^block_shift` messages, except possibly the last.
-    pub block_shift: u8,
+    /// Each block holds this many messages, except possibly the last.
+    pub block_size: BlockSize,
     /// Number of messages.
     pub count: u64,
     /// Where the starts directory begins, from the file start.
@@ -100,8 +94,8 @@ pub(crate) enum Section {
 /// Builds an index file a block at a time, keeping only the directory entries in memory.
 #[derive(Debug)]
 pub(crate) struct Writer<W: Write + Seek> {
-    /// Each full block holds `2^block_shift` messages.
-    block_shift: u8,
+    /// Each full block holds this many messages.
+    block_size: BlockSize,
     /// Whether a block shorter than a full one was pushed, which must be the last.
     closed: bool,
     /// Messages pushed so far.
@@ -151,18 +145,18 @@ impl Layout {
         (start <= end && end <= mailbox).then_some(start..end)
     }
 
-    /// Checks the block shift, then that the directory offset and block count put the end of
-    /// the directories exactly at `actual`, the length of the file.
+    /// Checks that the directory offset and block count put the end of the directories exactly
+    /// at `actual`, the length of the file.
     fn check_extent(&self, actual: usize) -> Result<(), Corruption> {
-        let per_block =
-            block_size(self.block_shift).ok_or(Corruption::BlockShift(self.block_shift))?;
         if self.dir_offset < widen(HEADER_LEN) {
             return Err(Corruption::Bounds {
                 position: 0,
                 offset: self.dir_offset,
             });
         }
-        let declared = self.end_of_directories(per_block).unwrap_or(u64::MAX);
+        let declared = self
+            .end_of_directories(self.per_block())
+            .unwrap_or(u64::MAX);
         if declared == widen(actual) {
             Ok(())
         } else {
@@ -252,7 +246,7 @@ impl Layout {
 
     /// The highest position block `block` holds, or `None` when the block does not exist.
     pub(crate) fn last_in_block(&self, block: usize) -> Option<usize> {
-        let first = block.checked_shl(u32::from(self.block_shift))?;
+        let first = block.checked_shl(u32::from(self.block_size.shift()))?;
         first.checked_add(self.block_len(block)?.checked_sub(1)?)
     }
 
@@ -266,7 +260,7 @@ impl Layout {
             .ok_or_else(|| short_header(bytes.len()))?;
         check_signature_and_version(head)?;
         check_header_checksum(head)?;
-        let layout = decode_header(head).ok_or_else(|| short_header(bytes.len()))?;
+        let layout = decode_header(head)?;
         if layout.fingerprint != expected {
             return Err(Rejection::Stale);
         }
@@ -281,9 +275,9 @@ impl Layout {
         (first >= HEADER_LEN && last <= narrow(self.dir_offset)?).then_some(first..last)
     }
 
-    /// Messages in a full block; the header check proved the shift valid.
-    fn per_block(&self) -> u64 {
-        block_size(self.block_shift).unwrap_or(1)
+    /// Messages in a full block.
+    const fn per_block(&self) -> u64 {
+        self.block_size.messages()
     }
 
     /// The block holding `position` and the place of `position` within it, by the block shift.
@@ -292,7 +286,7 @@ impl Layout {
     /// [`Layout::block_len`] answers.
     #[inline]
     pub(crate) fn place(&self, position: usize) -> Option<(usize, usize)> {
-        let shift = u32::from(self.block_shift);
+        let shift = u32::from(self.block_size.shift());
         Some((
             position.checked_shr(shift)?,
             position & !usize::MAX.checked_shl(shift)?,
@@ -328,14 +322,14 @@ impl<W: Write + Seek> Writer<W> {
     /// Checks that a block of `starts` and `dates` values may follow the blocks pushed so far,
     /// and closes the file to further blocks when it is short.
     fn admit(&mut self, starts: usize, dates: usize) -> io::Result<()> {
-        let full = block_size(self.block_shift).and_then(narrow);
+        let full = self.block_size.entries();
         if starts != dates {
             return Err(invalid("starts and dates differ in length"));
         }
-        if self.closed || starts == 0 || Some(starts) > full {
+        if self.closed || starts == 0 || starts > full {
             return Err(invalid("a block must be full unless it is the last"));
         }
-        self.closed = Some(starts) != full;
+        self.closed = starts != full;
         Ok(())
     }
 
@@ -365,7 +359,7 @@ impl<W: Write + Seek> Writer<W> {
     /// The header fields for a directory at `dir_offset`.
     const fn layout(&self, dir_offset: u64) -> Layout {
         Layout {
-            block_shift: self.block_shift,
+            block_size: self.block_size,
             count: self.count,
             dir_offset,
             fingerprint: self.fingerprint,
@@ -374,13 +368,14 @@ impl<W: Write + Seek> Writer<W> {
 
     /// Starts a file at the front of `sink` with a provisional header whose zero checksum makes
     /// an unfinished file read as corrupt.
-    pub(crate) fn new(mut sink: W, fingerprint: Fingerprint, block_shift: u8) -> io::Result<Self> {
-        if block_size(block_shift).is_none() {
-            return Err(invalid("block shift is outside 1 to 16"));
-        }
+    pub(crate) fn new(
+        mut sink: W,
+        fingerprint: Fingerprint,
+        block_size: BlockSize,
+    ) -> io::Result<Self> {
         sink.rewind()?;
         let mut writer = Self {
-            block_shift,
+            block_size,
             closed: false,
             count: 0,
             dates: Vec::new(),
@@ -394,7 +389,7 @@ impl<W: Write + Seek> Writer<W> {
         Ok(writer)
     }
 
-    /// Appends one block: every block but the last holds exactly `2^block_shift` values.
+    /// Appends one block: every block but the last holds exactly `block_size.entries()` values.
     pub(crate) fn push(&mut self, starts: &[u64], dates: &[i64]) -> io::Result<()> {
         self.admit(starts.len(), dates.len())?;
         let mut payload = Vec::new();
@@ -413,14 +408,6 @@ impl<W: Write + Seek> Writer<W> {
         });
         Ok(())
     }
-}
-
-/// Messages in a full block of shift `shift`, or `None` outside the allowed range.
-fn block_size(shift: u8) -> Option<u64> {
-    if !(MIN_BLOCK_SHIFT..=MAX_BLOCK_SHIFT).contains(&shift) {
-        return None;
-    }
-    1_u64.checked_shl(u32::from(shift))
 }
 
 /// Checks the header checksum over its first 64 bytes.
@@ -453,30 +440,35 @@ fn check_signature_and_version(head: &[u8]) -> Result<(), Rejection> {
     Ok(())
 }
 
-/// Reads the layout fields out of a header whose checksum already held.
-fn decode_header(head: &[u8]) -> Option<Layout> {
-    let nanos = read::<16>(head, 24).map(i128::from_le_bytes)?;
-    Some(Layout {
-        block_shift: *head.get(12)?,
-        count: read_u64(head, 48)?,
-        dir_offset: read_u64(head, 56)?,
-        fingerprint: Fingerprint::from_parts(read_u64(head, 16)?, nanos, read_u64(head, 40)?),
+/// Reads the layout fields out of a header whose checksum already held, refusing a block shift
+/// outside the range the format allows.
+fn decode_header(head: &[u8]) -> Result<Layout, Rejection> {
+    let missing = || short_header(head.len());
+    let raw = *head.get(12).ok_or_else(missing)?;
+    let block_size = BlockSize::from_shift(raw).ok_or(Corruption::BlockShift(raw))?;
+    let nanos = read::<16>(head, 24)
+        .map(i128::from_le_bytes)
+        .ok_or_else(missing)?;
+    let field = |at| read_u64(head, at).ok_or_else(missing);
+    Ok(Layout {
+        block_size,
+        count: field(48)?,
+        dir_offset: field(56)?,
+        fingerprint: Fingerprint::from_parts(field(16)?, nanos, field(40)?),
     })
 }
 
-/// The index file for `starts` and `dates` as bytes, split into blocks of `2^block_shift`.
+/// The index file for `starts` and `dates` as bytes, split into blocks of `block_size.entries()`.
 #[cfg(test)]
 pub(crate) fn encode(
     starts: &[u64],
     dates: &[i64],
     fingerprint: Fingerprint,
-    block_shift: u8,
+    block_size: BlockSize,
 ) -> io::Result<Vec<u8>> {
-    let per_block = block_size(block_shift)
-        .and_then(narrow)
-        .ok_or_else(|| invalid("block shift is outside 1 to 16"))?;
+    let per_block = block_size.entries();
     let mut sink = Cursor::new(Vec::new());
-    let mut writer = Writer::new(&mut sink, fingerprint, block_shift)?;
+    let mut writer = Writer::new(&mut sink, fingerprint, block_size)?;
     for (block_starts, block_dates) in starts.chunks(per_block).zip(dates.chunks(per_block)) {
         writer.push(block_starts, block_dates)?;
     }
@@ -491,7 +483,7 @@ fn header_body(layout: &Layout) -> Vec<u8> {
     let mut head = Vec::with_capacity(HEADER_LEN);
     head.extend_from_slice(&MAGIC);
     head.extend_from_slice(&VERSION.to_le_bytes());
-    head.extend_from_slice(&[layout.block_shift, 0, 0, 0]);
+    head.extend_from_slice(&[layout.block_size.shift(), 0, 0, 0]);
     head.extend_from_slice(&layout.fingerprint.len().to_le_bytes());
     head.extend_from_slice(&layout.fingerprint.modified_nanos().to_le_bytes());
     head.extend_from_slice(&layout.fingerprint.sample_hash().to_le_bytes());
@@ -583,7 +575,9 @@ mod tests {
 
     /// An encoded file of `count` messages at `shift`.
     fn file(count: u64, shift: u8) -> Vec<u8> {
-        encode(&starts_of(count), &dates_of(count), print(), shift).expect("the writer encodes")
+        let block_size = size(shift);
+        encode(&starts_of(count), &dates_of(count), print(), block_size)
+            .expect("the writer encodes")
     }
 
     /// The layout of `bytes`, which must parse.
@@ -596,14 +590,24 @@ mod tests {
         Layout::parse(bytes, print()).expect_err("the header is invalid")
     }
 
-    /// A sealed header for a layout with these fields.
+    /// The block size of `shift`, which must be within the range.
+    fn size(shift: u8) -> BlockSize {
+        BlockSize::from_shift(shift).expect("the shift is within the range")
+    }
+
+    /// A sealed header for a layout with these fields, whose shift byte may lie outside the range
+    /// a `BlockSize` holds.
     fn sealed(count: u64, block_shift: u8, dir_offset: u64) -> Vec<u8> {
-        sealed_header(&Layout {
-            block_shift,
+        let mut head = header_body(&Layout {
+            block_size: BlockSize::default(),
             count,
             dir_offset,
             fingerprint: print(),
-        })
+        });
+        head[12] = block_shift;
+        let checksum = xxh3_64(&head);
+        head.extend_from_slice(&checksum.to_le_bytes());
+        head
     }
 
     /// `bytes` with `value` stored at `at`.
@@ -756,7 +760,7 @@ mod tests {
                     rejection(&sealed(10, shift, 72)),
                     Rejection::Corrupt(Corruption::BlockShift(found)) if found == shift
                 ),
-                "shift {shift} is outside 1 to 16"
+                "shift {shift} is outside the range the format allows"
             );
         }
     }
@@ -850,7 +854,7 @@ mod tests {
     #[test]
     fn a_push_after_a_short_block_is_refused() {
         let mut writer =
-            Writer::new(Cursor::new(Vec::new()), print(), 2).expect("the writer starts");
+            Writer::new(Cursor::new(Vec::new()), print(), size(2)).expect("the writer starts");
         writer
             .push(&[1, 2], &[1, 2])
             .expect("a short block is allowed once");
@@ -867,7 +871,7 @@ mod tests {
     #[test]
     fn a_push_of_unequal_lengths_is_refused() {
         let mut writer =
-            Writer::new(Cursor::new(Vec::new()), print(), 2).expect("the writer starts");
+            Writer::new(Cursor::new(Vec::new()), print(), size(2)).expect("the writer starts");
         let error = writer
             .push(&[1, 2], &[1])
             .expect_err("unequal lengths are refused");
@@ -881,7 +885,7 @@ mod tests {
     #[test]
     fn an_unfinished_file_reads_as_corrupt() {
         let mut sink = Cursor::new(Vec::new());
-        let mut writer = Writer::new(&mut sink, print(), 2).expect("the writer starts");
+        let mut writer = Writer::new(&mut sink, print(), size(2)).expect("the writer starts");
         writer
             .push(&[1, 2, 3, 4], &[1, 2, 3, 4])
             .expect("a full block");
@@ -910,7 +914,7 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 1_000, "every message is found");
         let dates = vec![0_i64; starts.len()];
-        let bytes = encode(&starts, &dates, mailbox, DEFAULT_BLOCK_SHIFT)
+        let bytes = encode(&starts, &dates, mailbox, BlockSize::default())
             .expect("the starts and dates encode");
         let opened = Layout::parse(&bytes, mailbox).expect("the header is valid");
         for (position, start) in starts.iter().enumerate() {

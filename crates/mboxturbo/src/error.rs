@@ -6,12 +6,18 @@ use std::path::{Path, PathBuf};
 
 use parquet::errors::ParquetError;
 
+use crate::index::BlockSize;
+
 /// Why an index file was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Corruption {
     /// The header's block shift is outside the range the format allows.
-    #[error("block shift {0} is outside 1 to 16")]
+    #[error(
+        "block shift {0} is outside {min}..={max}",
+        min = BlockSize::MIN_SHIFT,
+        max = BlockSize::MAX_SHIFT
+    )]
     BlockShift(u8),
     /// A message offset does not fit in memory or points past the end of the mailbox.
     #[error("message {position} starts at offset {offset}, outside the mailbox")]
