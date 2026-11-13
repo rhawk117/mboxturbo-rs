@@ -1,31 +1,33 @@
 //! Message boundary index over the v2 block-directory file, verified one block at a time and
 //! rebuilt from the mailbox when a block turns out to be damaged.
 
+mod build;
+mod cache;
 mod codec;
+mod cursor;
 mod date;
 mod format;
+mod trust;
 
-use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::{fmt, iter, mem};
+use std::{fmt, iter};
 
 use memmap2::Mmap;
-use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
-use self::format::{Layout, Section, Writer};
+use self::build::encoded;
+use self::cache::{Cell, Parsed};
+pub(crate) use self::cursor::Cursor;
+use self::format::{Layout, Section};
 use crate::error::{Corruption, MboxTurboError};
 use crate::fingerprint::Fingerprint;
-use crate::mailbox::map_read_only;
 use crate::scan::Parallelism;
 use crate::width::{narrow, widen};
-use crate::{hint, scan};
 
 /// First eight bytes of every index file.
 const MAGIC: [u8; 8] = *b"MBOXTIDX";
@@ -160,144 +162,6 @@ impl PartialEq for Index {
 
 impl Eq for Index {}
 
-/// One decoded starts block held by a [`Cursor`].
-#[derive(Debug, Default)]
-struct Slot {
-    /// The block the starts belong to, or `None` while the slot holds nothing decoded.
-    block: Option<usize>,
-    /// The start of every message in the block, then where its last message ends: the next
-    /// block's first start or the mailbox length. Ascending and inside the mapping, or empty
-    /// when the decoded block breaks either rule; reused across refills.
-    bounds: Vec<u64>,
-    /// Position of the block's first message.
-    first: usize,
-}
-
-impl Slot {
-    /// Byte range of the message at `position`, or `None` when it is not in the slot's block or
-    /// the slot holds no usable bounds.
-    #[inline]
-    fn span(&self, position: usize) -> Option<Range<usize>> {
-        let within = position.checked_sub(self.first)?;
-        let &[start, end] = self.bounds.get(within..)?.first_chunk::<2>()?;
-        Some(narrow(start)?..narrow(end)?)
-    }
-}
-
-/// A directory entry parsed once, kept so later reads of its block skip the parse. An entry of
-/// the original bytes is kept only after its block passed its checksum; its payload range was
-/// checked against the directories when it was parsed.
-#[derive(Debug, Clone, Copy)]
-struct Parsed {
-    /// Base, flags and width of the block.
-    frame: codec::Frame,
-    /// Where the block's payload starts in the index bytes.
-    payload: usize,
-}
-
-impl Parsed {
-    /// The entry `Layout::entry_at` read, without its checksum.
-    const fn new((block, payload): (codec::Block, Range<usize>)) -> Self {
-        Self {
-            frame: block.frame(),
-            payload: payload.start,
-        }
-    }
-
-    /// The block's payload of `len` bytes in `bytes`, `None` when it lies past their end.
-    #[inline]
-    fn payload<'bytes>(&self, bytes: &'bytes [u8], len: usize) -> Option<&'bytes [u8]> {
-        bytes.get(self.payload..self.payload.checked_add(len)?)
-    }
-
-    /// Start at `index` of the block, as [`codec::Frame::start_at`] reads it from `bytes`.
-    #[inline]
-    fn start(&self, bytes: &[u8], index: usize) -> Option<u64> {
-        self.frame.start_at(bytes, self.payload, index)
-    }
-
-    /// Starts at `index` and `index + 1` of the block, as [`codec::Frame::start_pair_at`]
-    /// reads them from `bytes`.
-    #[inline]
-    fn start_pair(&self, bytes: &[u8], index: usize) -> Option<(u64, u64)> {
-        self.frame.start_pair_at(bytes, self.payload, index)
-    }
-}
-
-/// One slot of an entry cache: a [`Parsed`] packed into two atomic words, empty while both are
-/// zero so a table of them is zero-filled at open. `word` holds, from the top, a filled bit,
-/// the flags, the width and the payload start.
-#[derive(Debug)]
-struct Cell {
-    /// The block's base; meaningful once `word` has its filled bit.
-    base: AtomicU64,
-    /// Filled bit, flags, width and payload start, zero while empty.
-    word: AtomicU64,
-}
-
-impl Cell {
-    /// Bit set in `word` once the cell holds an entry.
-    const FILLED: u64 = 1 << 63;
-    /// Bit where the flags begin.
-    const FLAGS_AT: u32 = Self::START_BITS + Self::WIDTH_BITS;
-    /// Bits of the payload start.
-    const START_BITS: u32 = 48;
-    /// Mask of the payload start.
-    const START_MASK: u64 = (1 << Self::START_BITS) - 1;
-    /// Bits of the width.
-    const WIDTH_BITS: u32 = 7;
-    /// Mask of the width, once shifted down.
-    const WIDTH_MASK: u64 = (1 << Self::WIDTH_BITS) - 1;
-
-    /// A cell holding nothing.
-    const fn empty() -> Self {
-        Self {
-            base: AtomicU64::new(0),
-            word: AtomicU64::new(0),
-        }
-    }
-
-    /// Whether an entry was stored.
-    #[inline]
-    fn is_filled(&self) -> bool {
-        self.word.load(Ordering::Relaxed) & Self::FILLED != 0
-    }
-
-    /// The stored entry, `None` while the cell is empty.
-    #[inline]
-    fn load(&self) -> Option<Parsed> {
-        let word = self.word.load(Ordering::Acquire);
-        if word & Self::FILLED == 0 {
-            return None;
-        }
-        let base = self.base.load(Ordering::Relaxed);
-        let raw_flags = u8::try_from(word.checked_shr(Self::FLAGS_AT)? & 0xFF);
-        let raw_width = u8::try_from(word.checked_shr(Self::START_BITS)? & Self::WIDTH_MASK);
-        let raw_start = usize::try_from(word & Self::START_MASK);
-        let (Ok(flags), Ok(width), Ok(payload)) = (raw_flags, raw_width, raw_start) else {
-            return None;
-        };
-        Some(Parsed {
-            frame: codec::Frame { base, flags, width },
-            payload,
-        })
-    }
-
-    /// Stores `parsed`, `None` and nothing stored when its width or payload start does not fit.
-    /// Threads filling one cell store the same bits, taken from one verified entry.
-    fn store(&self, parsed: Parsed) -> Option<()> {
-        let start = u64::try_from(parsed.payload)
-            .map_or(None, |start| (start <= Self::START_MASK).then_some(start))?;
-        let width =
-            Some(u64::from(parsed.frame.width)).filter(|width| *width <= Self::WIDTH_MASK)?;
-        let flags = u64::from(parsed.frame.flags).checked_shl(Self::FLAGS_AT)?;
-        let word = Self::FILLED | flags | width.checked_shl(Self::START_BITS)? | start;
-        self.base.store(parsed.frame.base, Ordering::Relaxed);
-        self.word.store(word, Ordering::Release);
-        Some(())
-    }
-}
-
 /// What one lookup reads: the index bytes and the parsed entries of the blocks holding the first
 /// and the last message it needs, the same entry when both lie in one block.
 #[derive(Debug)]
@@ -317,7 +181,7 @@ struct Reach<'lookup> {
 impl<'lookup> Reach<'lookup> {
     /// Date of the message at `position`, read from the first entry.
     fn date(&self, position: usize) -> Option<i64> {
-        self.first.frame.date(
+        self.first.frame().date(
             self.payload(&self.first, position)?,
             self.layout.place(position)?.1,
         )
@@ -327,7 +191,7 @@ impl<'lookup> Reach<'lookup> {
     #[inline]
     fn payload(&self, entry: &Parsed, position: usize) -> Option<&'lookup [u8]> {
         let (block, _) = self.layout.place(position)?;
-        let len = codec::payload_len(self.layout.block_len(block)?, entry.frame.width)?;
+        let len = codec::payload_len(self.layout.block_len(block)?, entry.frame().width)?;
         entry.payload(self.bytes, len)
     }
 
@@ -354,7 +218,7 @@ impl<'lookup> Reach<'lookup> {
     /// Start of the message at `position`, which lies in `entry`'s block.
     #[inline]
     fn start(&self, entry: &Parsed, position: usize) -> Option<usize> {
-        narrow(entry.frame.start(
+        narrow(entry.frame().start(
             self.payload(entry, position)?,
             self.layout.place(position)?.1,
         )?)
@@ -365,68 +229,15 @@ impl<'lookup> Reach<'lookup> {
     fn start_pair(&self, position: usize) -> Option<(usize, usize)> {
         let payload = self.payload(&self.first, position)?;
         let (_, within) = self.layout.place(position)?;
-        let (start, next) = self.first.frame.start_pair(payload, within)?;
+        let (start, next) = self.first.frame().start_pair(payload, within)?;
         Some((narrow(start)?, narrow(next)?))
     }
 }
 
-/// Answers [`Index::span`] for positions walked in order, decoding each starts block once.
-///
-/// The cursor keeps the two blocks it read last, so a pass from either end, or from both ends
-/// at once, decodes each block once or twice at most. Anything it cannot answer from a verified
-/// block, and every answer once the index has been rebuilt, goes through [`Index::span`].
-#[derive(Debug)]
-pub(crate) struct Cursor<'index> {
-    /// The index being walked.
-    index: &'index Index,
-    /// The newest block, then the one before it.
-    slots: (Slot, Slot),
-}
-
-impl Cursor<'_> {
-    /// The span of `position` from the newest block, else from the block holding it once it
-    /// is the newest, `None` when they cannot answer it.
-    #[inline]
-    fn cached(&mut self, position: usize) -> Option<Range<usize>> {
-        if self.index.replacement.get().is_some() {
-            return None;
-        }
-        self.slots
-            .0
-            .span(position)
-            .or_else(|| self.refill(position))
-    }
-
-    /// Makes the block holding `position` the newest slot, decoding it unless one of the slots
-    /// holds it, and answers the span of `position` from it.
-    #[inline(never)]
-    fn refill(&mut self, position: usize) -> Option<Range<usize>> {
-        let (block, within) = self.index.layout.place(position)?;
-        if self.slots.0.block != Some(block) {
-            mem::swap(&mut self.slots.0, &mut self.slots.1);
-        }
-        if self.slots.0.block != Some(block) {
-            let slot = &mut self.slots.0;
-            slot.block = None;
-            slot.bounds.clear();
-            slot.first = position.checked_sub(within)?;
-            if self.index.decode(block, &mut slot.bounds).is_none() {
-                slot.bounds.clear();
-                return None;
-            }
-            slot.block = Some(block);
-        }
-        self.slots.0.span(position)
-    }
-
-    /// Byte range of the message at `position`, answering exactly what [`Index::span`] does.
-    #[inline]
-    pub(crate) fn span(&mut self, position: usize) -> Option<Range<usize>> {
-        self.cached(position)
-            .or_else(|| self.index.checked_span(position))
-    }
-}
-
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "the loaders live beside the trust check they depend on in `trust`"
+)]
 impl Index {
     /// The bytes and header lookups read now: the rebuild once one ran, else the original.
     fn active(&self) -> (&[u8], &Layout) {
@@ -489,21 +300,7 @@ impl Index {
 
     /// A cursor that walks the spans of consecutive positions one block at a time.
     pub(crate) const fn cursor(&self) -> Cursor<'_> {
-        Cursor {
-            index: self,
-            slots: (
-                Slot {
-                    block: None,
-                    bounds: Vec::new(),
-                    first: 0,
-                },
-                Slot {
-                    block: None,
-                    bounds: Vec::new(),
-                    first: 0,
-                },
-            ),
-        }
+        Cursor::new(self)
     }
 
     /// Date of the message at `position` in unix seconds, `Some(0)` when it has no parsable
@@ -524,9 +321,9 @@ impl Index {
         self.decoded.fetch_add(1, Ordering::Relaxed);
         let entry = self.entry(Section::Starts, block)?;
         let count = self.layout.block_len(block)?;
-        let len = codec::payload_len(count, entry.frame.width)?;
+        let len = codec::payload_len(count, entry.frame().width)?;
         let payload = entry.payload(self.original.bytes(), len)?;
-        codec::starts(&entry.frame, payload, count, bounds)?;
+        codec::starts(entry.frame(), payload, count, bounds)?;
         bounds.push(widen(self.end_of(block)?));
         let inside = bounds
             .first()
@@ -579,19 +376,6 @@ impl Index {
         self.fingerprint
     }
 
-    /// Maps the opened index `file`, which was opened from `path`, and checks its header.
-    fn from_file(
-        file: &File,
-        path: &Path,
-        mailbox: Arc<Mmap>,
-        expected: Fingerprint,
-    ) -> Result<Self, MboxTurboError> {
-        let mapped = map_read_only(file).map_err(|source| MboxTurboError::io(path, source))?;
-        let layout = Layout::parse(&mapped, expected).map_err(|rejection| rejection.at(path))?;
-        let origin = Some(path.to_path_buf());
-        Ok(Self::new(mailbox, Backing::Mapped(mapped), layout, origin))
-    }
-
     /// Whether the mailbox holds no messages.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -602,44 +386,6 @@ impl Index {
     #[must_use]
     pub fn len(&self) -> usize {
         messages(self.active().1)
-    }
-
-    /// Maps the index file at `path` and checks its header against the mailbox `expected`
-    /// identifies, whose mapping `mailbox` is kept for a rebuild. Only the header is read here;
-    /// blocks are checked when lookups reach them.
-    ///
-    /// # Errors
-    ///
-    /// [`MboxTurboError::Io`] when the file cannot be opened or mapped,
-    /// [`MboxTurboError::CorruptIndex`] when its header or length fails validation, and
-    /// [`MboxTurboError::StaleIndex`] when it was written by an older format or for a different
-    /// mailbox than `expected`.
-    pub fn load(
-        path: &Path,
-        mailbox: Arc<Mmap>,
-        expected: Fingerprint,
-    ) -> Result<Self, MboxTurboError> {
-        let file = File::open(path).map_err(|source| MboxTurboError::io(path, source))?;
-        Self::from_file(&file, path, mailbox, expected)
-    }
-
-    /// Like [`Index::load`] for the sidecar of the mbox at `mbox`, but maps `sidecar` only when
-    /// it is a regular file, not a symlink, FIFO, directory or socket, that was not swapped for
-    /// another file while it was opened and, on Unix, is owned by the user who owns the mbox.
-    /// The checks and the mapping use the same open file.
-    ///
-    /// # Errors
-    ///
-    /// [`MboxTurboError::Io`] with [`io::ErrorKind::PermissionDenied`] when the sidecar is
-    /// refused, and the errors of [`Index::load`] otherwise.
-    pub(crate) fn load_trusted(
-        sidecar: &Path,
-        mbox: &Path,
-        mailbox: Arc<Mmap>,
-        expected: Fingerprint,
-    ) -> Result<Self, MboxTurboError> {
-        let file = open_trusted(sidecar, mbox)?;
-        Self::from_file(&file, sidecar, mailbox, expected)
     }
 
     /// Answers `read` from the original bytes when the `section` blocks of every message in
@@ -849,123 +595,6 @@ impl Index {
     }
 }
 
-/// Encodes the messages whose starts arrive window by window, keeping only one block of starts
-/// and dates in memory beside the window in hand.
-///
-/// A window's last message has no successor yet, so it waits in `carry` until the next window
-/// supplies the start its slice runs to.
-struct Streamer<'sink> {
-    /// The start of the newest message, whose end is not known yet.
-    carry: Option<usize>,
-    /// The mailbox the starts point into.
-    contents: &'sink [u8],
-    /// Dates of the messages in `starts`.
-    dates: Vec<i64>,
-    /// Whether dating a window uses the rayon pool.
-    parallelism: Parallelism,
-    /// Messages in a full block.
-    per_block: usize,
-    /// Starts of the messages not yet pushed to `writer`.
-    starts: Vec<u64>,
-    /// The index file being written.
-    writer: Writer<&'sink mut io::Cursor<Vec<u8>>>,
-}
-
-impl Streamer<'_> {
-    /// Takes the next window of ascending starts, dating every message whose successor is now
-    /// known and pushing each block that fills.
-    fn feed(&mut self, window: Vec<usize>) -> io::Result<()> {
-        let run: Vec<usize> = self.carry.take().into_iter().chain(window).collect();
-        let Some((&last, head)) = run.split_last() else {
-            return Ok(());
-        };
-        self.dates
-            .extend(dates_before_last(self.contents, &run, self.parallelism)?);
-        self.starts.extend(head.iter().map(|&start| widen(start)));
-        self.carry = Some(last);
-        self.flush_full()
-    }
-
-    /// Dates the newest message to the end of the mailbox and pushes the final block.
-    fn finish(mut self) -> io::Result<()> {
-        if let Some(last) = self.carry.take() {
-            self.dates
-                .push(message_date(self.contents, last, self.contents.len())?);
-            self.starts.push(widen(last));
-        }
-        self.flush_full()?;
-        if !self.starts.is_empty() {
-            self.writer.push(&self.starts, &self.dates)?;
-        }
-        self.writer.finish().map(|_count| ())
-    }
-
-    /// Pushes every full block of `starts` and `dates` and keeps the remainder.
-    fn flush_full(&mut self) -> io::Result<()> {
-        let starts = self.starts.chunks_exact(self.per_block);
-        let dates = self.dates.chunks_exact(self.per_block);
-        let full = self.starts.len().saturating_sub(starts.remainder().len());
-        for (block_starts, block_dates) in starts.zip(dates) {
-            self.writer.push(block_starts, block_dates)?;
-        }
-        self.starts.drain(..full).for_each(drop);
-        self.dates.drain(..full).for_each(drop);
-        Ok(())
-    }
-}
-
-/// Why a sidecar is not mapped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
-    /// The sidecar belongs to a different user than the mbox.
-    #[cfg(unix)]
-    ForeignOwner,
-    /// The sidecar is a symlink, FIFO, directory, socket or anything else but a regular file.
-    NotRegularFile,
-    /// The path named another file when it was opened than when it was inspected.
-    #[cfg(unix)]
-    Replaced,
-}
-
-impl Refusal {
-    /// The reason, as carried by the error the refusal becomes.
-    const fn reason(self) -> &'static str {
-        match self {
-            #[cfg(unix)]
-            Self::ForeignOwner => "the sidecar is owned by another user than the mbox",
-            Self::NotRegularFile => "the sidecar is not a regular file",
-            #[cfg(unix)]
-            Self::Replaced => "the sidecar was replaced while it was opened",
-        }
-    }
-}
-
-/// Device, inode and owner of a file, the values the sidecar trust rules compare.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Identity {
-    /// Device holding the file.
-    device: u64,
-    /// Inode number on that device.
-    inode: u64,
-    /// Owning user id.
-    owner: u32,
-}
-
-#[cfg(unix)]
-impl Identity {
-    /// The identity `metadata` reports.
-    fn of(metadata: &fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            owner: metadata.uid(),
-        }
-    }
-}
-
 /// The blocks holding the first message of `needed` and the last one that exists, in an index
 /// whose header is `layout`; `None` when `needed` starts past the last message.
 #[inline]
@@ -983,127 +612,11 @@ fn cells(blocks: usize) -> Box<[Cell]> {
     iter::repeat_with(Cell::empty).take(blocks).collect()
 }
 
-/// Refuses an opened sidecar that is not the file `inspected` or not owned by the mbox's owner.
-#[cfg(unix)]
-fn check_opened(
-    file: &File,
-    inspected: &fs::Metadata,
-    sidecar: &Path,
-    mbox: &Path,
-) -> Result<(), MboxTurboError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let opened = file
-        .metadata()
-        .map_err(|source| MboxTurboError::io(sidecar, source))?;
-    let owner = fs::metadata(mbox)
-        .map_err(|source| MboxTurboError::io(mbox, source))?
-        .uid();
-    judge(Identity::of(inspected), Identity::of(&opened), owner)
-        .map_err(|refusal| refused(sidecar, refusal))
-}
-
-/// Without ownership and inode data the `lstat` check alone applies.
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shares its signature with the Unix check"
-)]
-fn check_opened(
-    _file: &File,
-    _inspected: &fs::Metadata,
-    _sidecar: &Path,
-    _mbox: &Path,
-) -> Result<(), MboxTurboError> {
-    Ok(())
-}
-
-/// Dates in unix seconds of every message of `run` but the last, each running to the next start,
-/// zero for a message without a parsable Date header.
-fn dates_before_last(
-    contents: &[u8],
-    run: &[usize],
-    parallelism: Parallelism,
-) -> io::Result<Vec<i64>> {
-    let date = |(&start, &end): (&usize, &usize)| message_date(contents, start, end);
-    match parallelism {
-        Parallelism::Parallel => run
-            .par_iter()
-            .zip(run.par_iter().skip(1))
-            .map(date)
-            .collect(),
-        Parallelism::Sequential => run.iter().zip(run.iter().skip(1)).map(date).collect(),
-    }
-}
-
-/// The index file for `contents` with blocks of `2^block_shift` messages, with its header.
-#[expect(
-    clippy::expect_used,
-    reason = "the scanner's starts ascend below the mailbox length, the block shift is the \
-              caller's documented 1..=16, and a file the writer finished for `fingerprint` \
-              has a header that parses for `fingerprint`; each is all the writer refuses"
-)]
-fn encoded(
-    contents: &Mmap,
-    fingerprint: Fingerprint,
-    block_shift: u8,
-    parallelism: Parallelism,
-) -> (Vec<u8>, Layout) {
-    hint::sequential(contents);
-    let windows = scan::windows(contents, parallelism);
-    let streamed = stream(contents, windows, fingerprint, block_shift, parallelism);
-    hint::normal(contents);
-    let bytes = streamed.expect("scanned starts and a valid block shift encode");
-    let layout = Layout::parse(&bytes, fingerprint).expect("a freshly encoded header parses");
-    (bytes, layout)
-}
-
-/// Whether the sidecar `opened` is the file `inspected` earlier and is owned by `mbox_owner`.
-/// std has no `getuid`, so the mbox's owner stands for the current user.
-#[cfg(unix)]
-const fn judge(inspected: Identity, opened: Identity, mbox_owner: u32) -> Result<(), Refusal> {
-    if inspected.device != opened.device || inspected.inode != opened.inode {
-        return Err(Refusal::Replaced);
-    }
-    if opened.owner != mbox_owner {
-        return Err(Refusal::ForeignOwner);
-    }
-    Ok(())
-}
-
-/// Date of the message at `start..end` of `contents`, an error when the range is not inside it.
-fn message_date(contents: &[u8], start: usize, end: usize) -> io::Result<i64> {
-    contents
-        .get(start..end)
-        .map(date::extract)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a message starts past the end"))
-}
-
 /// Messages `layout` holds. Its header passed the length check, so on a 64-bit target the count
 /// fits; a count past `usize::MAX` on a narrower target saturates, and the lookups past the
 /// messages the file can hold fail verification and are answered by the rebuild.
 fn messages(layout: &Layout) -> usize {
     narrow(layout.count).unwrap_or(usize::MAX)
-}
-
-/// The error a refusal of `sidecar` becomes.
-fn refused(sidecar: &Path, refusal: Refusal) -> MboxTurboError {
-    let source = io::Error::new(io::ErrorKind::PermissionDenied, refusal.reason());
-    MboxTurboError::io(sidecar, source)
-}
-
-/// Opens `sidecar` for reading once it is known to be a regular file owned by the mbox's owner.
-/// The path is inspected with `lstat` before it is opened, because opening a FIFO blocks, and
-/// the opened file is inspected again to catch a swap between the two calls.
-fn open_trusted(sidecar: &Path, mbox: &Path) -> Result<File, MboxTurboError> {
-    let inspected =
-        fs::symlink_metadata(sidecar).map_err(|source| MboxTurboError::io(sidecar, source))?;
-    if !inspected.is_file() {
-        return Err(refused(sidecar, Refusal::NotRegularFile));
-    }
-    let file = File::open(sidecar).map_err(|source| MboxTurboError::io(sidecar, source))?;
-    check_opened(&file, &inspected, sidecar, mbox)?;
-    Ok(file)
 }
 
 /// Payload bytes of every block of `section`, read from the directory entries alone.
@@ -1114,48 +627,6 @@ fn section_bytes(layout: &Layout, bytes: &[u8], section: Section) -> u64 {
             codec::payload_len(layout.block_len(block)?, entry.width)
         })
         .fold(0_u64, |total, payload| total.saturating_add(widen(payload)))
-}
-
-/// The index file for the messages whose starts `windows` yields in order, as bytes.
-///
-/// # Errors
-///
-/// An error when `block_shift` is outside `1..=16` or a start lies past the end of `contents`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "five inputs against the bound of four: the writer's fingerprint and block shift, \
-              the bytes and windows it dates, and the parallelism of that dating are independent, \
-              and a struct bundling any two would exist for this private function alone"
-)]
-fn stream<I>(
-    contents: &[u8],
-    windows: I,
-    fingerprint: Fingerprint,
-    block_shift: u8,
-    parallelism: Parallelism,
-) -> io::Result<Vec<u8>>
-where
-    I: IntoIterator<Item = Vec<usize>>,
-{
-    let mut sink = io::Cursor::new(Vec::new());
-    let writer = Writer::new(&mut sink, fingerprint, block_shift)?;
-    let per_block = 1_usize
-        .checked_shl(u32::from(block_shift))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "block shift is too large"))?;
-    let mut streamer = Streamer {
-        carry: None,
-        contents,
-        dates: Vec::new(),
-        parallelism,
-        per_block,
-        starts: Vec::new(),
-        writer,
-    };
-    for window in windows {
-        streamer.feed(window)?;
-    }
-    streamer.finish()?;
-    Ok(sink.into_inner())
 }
 
 /// Answers `read` from the rebuilt `bytes` whose header is `layout`, parsing the entries it needs
@@ -1198,54 +669,6 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    mod trust {
-        use super::super::{Identity, Refusal, judge};
-
-        const OWNER: u32 = 1000;
-
-        const fn identity(inode: u64, owner: u32) -> Identity {
-            Identity {
-                device: 1,
-                inode,
-                owner,
-            }
-        }
-
-        #[test]
-        fn a_sidecar_owned_by_the_mbox_owner_is_trusted() {
-            assert_eq!(judge(identity(7, OWNER), identity(7, OWNER), OWNER), Ok(()));
-        }
-
-        #[test]
-        fn a_sidecar_owned_by_another_user_is_refused() {
-            assert_eq!(
-                judge(identity(7, 0), identity(7, 0), OWNER),
-                Err(Refusal::ForeignOwner)
-            );
-        }
-
-        #[test]
-        fn a_path_that_names_another_inode_when_opened_is_refused() {
-            assert_eq!(
-                judge(identity(7, OWNER), identity(8, OWNER), OWNER),
-                Err(Refusal::Replaced)
-            );
-        }
-
-        #[test]
-        fn a_path_that_names_another_device_when_opened_is_refused() {
-            let moved = Identity {
-                device: 2,
-                ..identity(7, OWNER)
-            };
-            assert_eq!(
-                judge(identity(7, OWNER), moved, OWNER),
-                Err(Refusal::Replaced)
-            );
-        }
-    }
-
     use std::fs::{self, File};
     use std::ops::Range;
     use std::path::PathBuf;
@@ -1257,11 +680,11 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
-    use super::{Cell, Index, Parsed, Section, codec, format};
+    use super::{Index, Section, format};
     use crate::error::MboxTurboError;
     use crate::fingerprint::Fingerprint;
     use crate::mailbox::map_read_only;
-    use crate::scan::{self, Parallelism};
+    use crate::scan;
     use crate::width::{narrow, widen};
 
     /// Messages in the fixture: two full blocks of 256 and a short third block.
@@ -1700,56 +1123,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_entry_costs_at_most_sixteen_bytes_per_block() {
-        assert!(
-            size_of::<Cell>() <= 16,
-            "the open path adds one cell per block and section beside the mapping"
-        );
-    }
-
-    #[test]
-    fn a_cell_round_trips_the_largest_entry() {
-        let cell = Cell::empty();
-        assert!(cell.load().is_none(), "an empty cell loads nothing");
-        let largest = (1_usize << 48_u32) - 1;
-        let parsed = Parsed {
-            frame: codec::Frame {
-                base: u64::MAX,
-                flags: 0xFF,
-                width: 64,
-            },
-            payload: largest,
-        };
-        assert!(cell.store(parsed).is_some(), "the largest start fits");
-        let loaded = cell.load().expect("a filled cell loads");
-        assert_eq!(
-            (
-                loaded.frame.base,
-                loaded.frame.flags,
-                loaded.frame.width,
-                loaded.payload
-            ),
-            (u64::MAX, 0xFF, 64, largest)
-        );
-        assert!(cell.is_filled(), "a stored cell counts as filled");
-    }
-
-    #[test]
-    fn a_cell_refuses_a_payload_start_of_two_to_the_forty_eighth() {
-        let cell = Cell::empty();
-        let parsed = Parsed {
-            frame: codec::Frame {
-                base: 0,
-                flags: 0,
-                width: 0,
-            },
-            payload: 1_usize << 48_u32,
-        };
-        assert!(cell.store(parsed).is_none(), "the start does not fit");
-        assert!(!cell.is_filled(), "a refused store leaves the cell empty");
-    }
-
-    #[test]
     fn a_date_lookup_verifies_only_its_dates_block() {
         let fixture = Fixture::new();
         let _bytes = fixture.saved();
@@ -1887,7 +1260,7 @@ mod tests {
 
     /// A mailbox of `messages` messages dated every other message, with varying body lengths so
     /// message starts do not line up with segment boundaries.
-    fn dated_mailbox(messages: usize) -> Vec<u8> {
+    pub(super) fn dated_mailbox(messages: usize) -> Vec<u8> {
         (0..messages)
             .flat_map(|number| {
                 let date = if number.rem_euclid(2) == 0 {
@@ -1925,110 +1298,6 @@ mod tests {
             sections.directory,
             widen(blocks * 2 * 32),
             "each block has a 32-byte entry in two directories"
-        );
-    }
-
-    /// `format::encode` over the whole scan, the reference the streaming build must match.
-    fn reference(contents: &[u8], fingerprint: Fingerprint, shift: u8) -> Vec<u8> {
-        let starts = scan::find_message_starts(contents);
-        let dates: Vec<i64> = starts
-            .iter()
-            .enumerate()
-            .map(|(position, &start)| {
-                let end = starts
-                    .get(position.saturating_add(1))
-                    .copied()
-                    .unwrap_or(contents.len());
-                super::date::extract(&contents[start..end])
-            })
-            .collect();
-        let wide: Vec<u64> = starts.iter().map(|&start| widen(start)).collect();
-        format::encode(&wide, &dates, fingerprint, shift).expect("the reference encodes")
-    }
-
-    #[test]
-    fn a_build_over_forced_small_windows_matches_the_whole_vector_encoding() {
-        let contents = dated_mailbox(10_000);
-        let fingerprint = Fingerprint::new(&contents, None);
-        for (segment, per_window, shift) in [(4096, 1, 8), (999, 3, 8), (50_000, 2, 5), (1, 7, 1)] {
-            let windows = scan::windows_with(&contents, segment, per_window, Parallelism::Parallel);
-            let streamed = super::stream(
-                &contents,
-                windows,
-                fingerprint,
-                shift,
-                Parallelism::Parallel,
-            )
-            .expect("the streaming build encodes");
-            assert_eq!(
-                streamed,
-                reference(&contents, fingerprint, shift),
-                "segment {segment} x {per_window} windows at shift {shift} equals the reference"
-            );
-        }
-    }
-
-    #[test]
-    fn a_block_straddling_a_window_boundary_decodes_to_the_per_position_spans() {
-        let contents = dated_mailbox(10_000);
-        let fingerprint = Fingerprint::new(&contents, None);
-        let windows = scan::windows_with(&contents, 3000, 1, Parallelism::Parallel);
-        let bytes = super::stream(&contents, windows, fingerprint, 8, Parallelism::Parallel)
-            .expect("the build encodes");
-        let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
-        let starts = scan::find_message_starts(&contents);
-        for position in 0..starts.len() {
-            let span = layout
-                .span(&bytes, position)
-                .expect("every position has a span");
-            let end = starts
-                .get(position.saturating_add(1))
-                .copied()
-                .unwrap_or(contents.len());
-            assert_eq!(
-                span,
-                starts[position]..end,
-                "position {position} decodes its span"
-            );
-        }
-    }
-
-    #[test]
-    fn every_streamed_date_equals_the_extractor_including_the_last_message_of_each_window() {
-        let contents = dated_mailbox(10_000);
-        let fingerprint = Fingerprint::new(&contents, None);
-        let windows: Vec<Vec<usize>> =
-            scan::windows_with(&contents, 3000, 1, Parallelism::Parallel).collect();
-        let bytes = super::stream(&contents, windows, fingerprint, 8, Parallelism::Parallel)
-            .expect("the build encodes");
-        let layout = format::Layout::parse(&bytes, fingerprint).expect("the header parses");
-        let starts = scan::find_message_starts(&contents);
-        for position in 0..starts.len() {
-            let end = starts.get(position.saturating_add(1)).copied();
-            let message = &contents[starts[position]..end.unwrap_or(contents.len())];
-            assert_eq!(
-                layout.date(&bytes, position),
-                Some(super::date::extract(message)),
-                "position {position} carries the extractor's date"
-            );
-        }
-    }
-
-    #[test]
-    fn an_empty_mailbox_streams_to_the_reference_empty_index() {
-        let fingerprint = Fingerprint::new(b"", None);
-        let streamed = super::stream(
-            b"",
-            scan::windows(b"", Parallelism::Parallel),
-            fingerprint,
-            8,
-            Parallelism::Parallel,
-        )
-        .expect("an empty mailbox encodes");
-        assert_eq!(
-            streamed,
-            reference(b"", fingerprint, 8),
-            "no messages yield the reference empty file"
         );
     }
 
