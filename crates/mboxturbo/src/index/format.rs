@@ -171,10 +171,14 @@ impl Layout {
         }
     }
 
-    /// Date of message `position` in unix seconds, zero for none, or `None` when it does not
-    /// exist or its block is unreadable.
+    /// Date of message `position` in unix seconds, `Some(None)` when it has none, or `None` when
+    /// it does not exist or its block is unreadable.
     #[cfg(test)]
-    pub(crate) fn date(&self, bytes: &[u8], position: usize) -> Option<i64> {
+    #[expect(
+        clippy::option_option,
+        reason = "the outer `None` is a refused block, the inner one a message with no date"
+    )]
+    pub(crate) fn date(&self, bytes: &[u8], position: usize) -> Option<Option<i64>> {
         let (block, within) = self.held(position)?;
         let (entry, payload) = self.entry(bytes, Section::Dates, block)?;
         codec::date(&entry, payload, within)
@@ -394,7 +398,7 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     /// Appends one block: every block but the last holds exactly `block_size.entries()` values.
-    pub(crate) fn push(&mut self, starts: &[u64], dates: &[i64]) -> io::Result<()> {
+    pub(crate) fn push(&mut self, starts: &[u64], dates: &[Option<i64>]) -> io::Result<()> {
         self.admit(starts.len(), dates.len())?;
         let mut payload = Vec::new();
         let starts_block = codec::encode_starts(starts, &mut payload);
@@ -466,7 +470,7 @@ fn decode_header(head: &[u8]) -> Result<Layout, Rejection> {
 #[cfg(test)]
 pub(crate) fn encode(
     starts: &[u64],
-    dates: &[i64],
+    dates: &[Option<i64>],
     fingerprint: Fingerprint,
     block_size: BlockSize,
 ) -> io::Result<Vec<u8>> {
@@ -564,15 +568,13 @@ mod tests {
     }
 
     /// Dates for `count` messages, with every ninth missing.
-    fn dates_of(count: u64) -> Vec<i64> {
+    fn dates_of(count: u64) -> Vec<Option<i64>> {
         (0..count)
             .map(|position| {
-                if position.rem_euclid(9) == 0 {
-                    0
-                } else {
+                (position.rem_euclid(9) != 0).then(|| {
                     let minutes = i64::try_from(position).expect("test positions fit i64");
                     minutes.saturating_mul(60).saturating_add(1_400_000_000)
-                }
+                })
             })
             .collect()
     }
@@ -860,10 +862,10 @@ mod tests {
         let mut writer =
             Writer::new(Cursor::new(Vec::new()), print(), size(2)).expect("the writer starts");
         writer
-            .push(&[1, 2], &[1, 2])
+            .push(&[1, 2], &[Some(1), Some(2)])
             .expect("a short block is allowed once");
         let error = writer
-            .push(&[3, 4, 5, 6], &[3, 4, 5, 6])
+            .push(&[3, 4, 5, 6], &[Some(3), Some(4), Some(5), Some(6)])
             .expect_err("the file is closed");
         assert_eq!(
             error.kind(),
@@ -877,7 +879,7 @@ mod tests {
         let mut writer =
             Writer::new(Cursor::new(Vec::new()), print(), size(2)).expect("the writer starts");
         let error = writer
-            .push(&[1, 2], &[1])
+            .push(&[1, 2], &[Some(1)])
             .expect_err("unequal lengths are refused");
         assert_eq!(
             error.kind(),
@@ -891,7 +893,7 @@ mod tests {
         let mut sink = Cursor::new(Vec::new());
         let mut writer = Writer::new(&mut sink, print(), size(2)).expect("the writer starts");
         writer
-            .push(&[1, 2, 3, 4], &[1, 2, 3, 4])
+            .push(&[1, 2, 3, 4], &[Some(1), Some(2), Some(3), Some(4)])
             .expect("a full block");
         drop(writer);
         assert!(
@@ -917,7 +919,7 @@ mod tests {
             .map(widen)
             .collect();
         assert_eq!(starts.len(), 1_000, "every message is found");
-        let dates = vec![0_i64; starts.len()];
+        let dates = vec![None; starts.len()];
         let bytes = encode(&starts, &dates, mailbox, BlockSize::default())
             .expect("the starts and dates encode");
         let opened = Layout::parse(&bytes, mailbox).expect("the header is valid");

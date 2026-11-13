@@ -230,6 +230,30 @@ AAEC\n\
     }
 
     #[test]
+    fn an_epoch_date_reads_as_zero_and_a_missing_date_as_none() {
+        const EPOCH: &str = "From a@example.com Thu Jan  1 00:00:00 1970\n\
+Date: Thu, 1 Jan 1970 00:00:00 +0000\n\
+Subject: epoch\n\n\
+body\n\n";
+        const UNDATED: &str =
+            "From b@example.com Thu Jan  1 00:00:01 1970\nSubject: undated\n\nbody\n";
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let mbox = directory.path().join("dated.mbox");
+        fs::write(&mbox, [EPOCH, UNDATED].concat()).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(&mbox).expect("fixture mbox opens");
+        assert_eq!(
+            mailbox.date(0),
+            Some(0),
+            "a Date of exactly the epoch is a real date, not a missing one"
+        );
+        assert_eq!(
+            mailbox.date(1),
+            None,
+            "a message with no Date header has no date"
+        );
+    }
+
+    #[test]
     fn a_multipart_message_has_one_attachment() {
         let message = Fixture::new().message(1);
         assert_eq!(

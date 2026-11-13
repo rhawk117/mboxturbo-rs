@@ -182,7 +182,11 @@ struct Reach<'lookup> {
 
 impl<'lookup> Reach<'lookup> {
     /// Date of the message at `position`, read from the first entry.
-    fn date(&self, position: usize) -> Option<i64> {
+    #[expect(
+        clippy::option_option,
+        reason = "the outer `None` is a refused block, the inner one a message with no date"
+    )]
+    fn date(&self, position: usize) -> Option<Option<i64>> {
         self.first.frame().date(
             self.payload(&self.first, position)?,
             self.layout.place(position)?.1,
@@ -308,12 +312,14 @@ impl Index {
         Cursor::new(self)
     }
 
-    /// Date of the message at `position` in unix seconds, `Some(0)` when it has no parsable
-    /// Date header, or `None` past the last message.
+    /// Date of the message at `position` in unix seconds, or `None` when it has no parsable Date
+    /// header or `position` is past the last message. A Date of exactly the Unix epoch is
+    /// `Some(0)`.
     #[must_use]
     pub fn date(&self, position: usize) -> Option<i64> {
         let needed = position..position.saturating_add(1);
         self.lookup(Section::Dates, needed, |reach| reach.date(position))
+            .flatten()
     }
 
     /// Decodes into `bounds` the starts of original `block`, after verifying it and the block
@@ -1089,9 +1095,9 @@ mod tests {
     }
 
     #[test]
-    fn a_message_without_a_date_is_dated_zero() {
+    fn a_message_without_a_date_has_none() {
         let index = Fixture::new().built();
-        assert_eq!(index.date(7), Some(0), "message 7 has no Date header");
+        assert_eq!(index.date(7), None, "message 7 has no Date header");
     }
 
     #[test]
@@ -1287,7 +1293,7 @@ mod tests {
             .map(widen)
             .collect();
         starts[599] = widen(plus(fixture.contents.len(), 10));
-        let dates = vec![0_i64; starts.len()];
+        let dates = vec![None; starts.len()];
         let bytes = format::encode(&starts, &dates, fixture.fingerprint, BlockSize::default())
             .expect("the forged starts encode with valid checksums");
         fs::write(fixture.index_path(), bytes).expect("the forged index is written");

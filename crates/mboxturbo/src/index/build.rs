@@ -23,7 +23,7 @@ struct Streamer<'sink> {
     /// The mailbox the starts point into.
     contents: &'sink [u8],
     /// Dates of the messages in `starts`.
-    dates: Vec<i64>,
+    dates: Vec<Option<i64>>,
     /// Whether dating a window uses the rayon pool.
     parallelism: Parallelism,
     /// Messages in a full block.
@@ -78,12 +78,12 @@ impl Streamer<'_> {
 }
 
 /// Dates in unix seconds of every message of `run` but the last, each running to the next start,
-/// zero for a message without a parsable Date header.
+/// `None` for a message without a parsable Date header.
 fn dates_before_last(
     contents: &[u8],
     run: &[usize],
     parallelism: Parallelism,
-) -> io::Result<Vec<i64>> {
+) -> io::Result<Vec<Option<i64>>> {
     let date = |(&start, &end): (&usize, &usize)| message_date(contents, start, end);
     match parallelism {
         Parallelism::Parallel => run
@@ -118,7 +118,7 @@ pub(super) fn encoded(
 }
 
 /// Date of the message at `start..end` of `contents`, an error when the range is not inside it.
-fn message_date(contents: &[u8], start: usize, end: usize) -> io::Result<i64> {
+fn message_date(contents: &[u8], start: usize, end: usize) -> io::Result<Option<i64>> {
     contents
         .get(start..end)
         .map(date::extract)
@@ -177,7 +177,7 @@ mod tests {
     /// `format::encode` over the whole scan, the reference the streaming build must match.
     fn reference(contents: &[u8], fingerprint: Fingerprint, block_size: BlockSize) -> Vec<u8> {
         let starts = scan::find_message_starts(contents);
-        let dates: Vec<i64> = starts
+        let dates: Vec<Option<i64>> = starts
             .iter()
             .enumerate()
             .map(|(position, &start)| {

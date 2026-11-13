@@ -13,15 +13,14 @@ const NAME: &[u8; 5] = b"date:";
 /// A header and the bytes that follow it.
 type Split<'bytes> = (&'bytes [u8], &'bytes [u8]);
 
-/// The unix seconds `Message::date` reports for `message`, or zero when it has no usable date.
+/// The unix seconds `Message::date` reports for `message`, or `None` when it has no usable date.
 ///
 /// `message` is the stored bytes, with or without its leading `From ` line. Only the head is
 /// read, up to the first blank line, so a `Date:` line in the body never counts. When the
 /// header repeats, the last occurrence wins, as in `mail-parser`; if that one does not parse,
-/// the result is zero even when an earlier one would. Absent, unparsable and out-of-range
-/// dates all give zero, so a real date at exactly the Unix epoch is indistinguishable from a
-/// missing one.
-pub(crate) fn extract(message: &[u8]) -> i64 {
+/// the result is `None` even when an earlier one would. Absent, unparsable and out-of-range
+/// dates all give `None`, so a real date at exactly the Unix epoch is `Some(0)`.
+pub(crate) fn extract(message: &[u8]) -> Option<i64> {
     let mut rest = message;
     let mut last = None;
     while let Some((header, remainder)) = next_header(rest) {
@@ -30,7 +29,8 @@ pub(crate) fn extract(message: &[u8]) -> i64 {
         }
         rest = remainder;
     }
-    last.and_then(|value| parse(&value)).unwrap_or(0)
+    let value = last?;
+    parse(&value)
 }
 
 /// The unix seconds of the unfolded header text `value`; `None` when it is not a valid date.
@@ -114,22 +114,25 @@ mod tests {
         (file, mailbox)
     }
 
-    fn assert_agrees(message: &[u8]) -> i64 {
+    fn assert_agrees(message: &[u8]) {
         let (_file, mailbox) = mailbox(&[message]);
         let expected = mailbox
             .message(0)
             .expect("the fixture holds one message")
             .date()
-            .map_or(0, |stamp| stamp.unix_seconds);
+            .map(|stamp| stamp.unix_seconds);
         let raw = mailbox.raw(0).expect("message 0 has raw bytes");
         assert_eq!(extract(raw), expected, "extractor matches Message::date");
-        extract(raw)
     }
 
     #[test]
     fn every_zone_and_layout_matches_the_message_accessor() {
         for message in [FOLDED, LOWER, NZ, KIRITIMATI, TWICE, CRLF] {
-            assert_ne!(assert_agrees(message), 0, "the fixture carries a real date");
+            assert_agrees(message);
+            assert!(
+                extract(message).is_some(),
+                "the fixture carries a real date"
+            );
         }
     }
 
@@ -137,7 +140,7 @@ mod tests {
     fn the_last_of_two_date_headers_wins() {
         assert_eq!(
             extract(TWICE),
-            1_704_196_800,
+            Some(1_704_196_800),
             "2 Jan 2024 12:00 UTC, not the first header"
         );
     }
@@ -146,19 +149,16 @@ mod tests {
     fn plus_1400_is_not_clamped_to_the_parsers_twelve_hours() {
         assert_eq!(
             extract(KIRITIMATI),
-            1_704_060_000,
+            Some(1_704_060_000),
             "12:00 at +1400 is 22:00 UTC the day before"
         );
     }
 
     #[test]
-    fn missing_unparsable_and_body_only_dates_are_zero() {
+    fn missing_unparsable_and_body_only_dates_are_none() {
         for message in [BAD, BODY_ONLY, NONE] {
-            assert_eq!(
-                assert_agrees(message),
-                0,
-                "no usable head date reads as zero"
-            );
+            assert_agrees(message);
+            assert_eq!(extract(message), None, "no usable head date reads as none");
         }
     }
 
@@ -166,9 +166,10 @@ mod tests {
     fn a_crlf_blank_line_ends_the_head_so_a_body_date_is_ignored() {
         const CRLF_BODY_ONLY: &[u8] =
             b"From a\r\nSubject: s\r\n\r\nDate: Mon, 01 Jan 2024 12:00:00 +0000\r\n";
+        assert_agrees(CRLF_BODY_ONLY);
         assert_eq!(
-            assert_agrees(CRLF_BODY_ONLY),
-            0,
+            extract(CRLF_BODY_ONLY),
+            None,
             "a Date line after the CRLF blank line is body text"
         );
     }
@@ -178,6 +179,6 @@ mod tests {
         let mut message = b"From a\nSubject: s\n\n".to_vec();
         message.extend(repeat_n(b'x', 1 << 20));
         message.extend_from_slice(b"\nDate: Mon, 01 Jan 2024 12:00:00 +0000\n");
-        assert_eq!(extract(&message), 0, "a body Date line is ignored");
+        assert_eq!(extract(&message), None, "a body Date line is ignored");
     }
 }

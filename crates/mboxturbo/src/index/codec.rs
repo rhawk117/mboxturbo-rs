@@ -6,7 +6,7 @@ use std::iter::repeat_n;
 
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Flag bit of a dates block: its all-ones code means "no date" (stored as zero by callers).
+/// Flag bit of a dates block: its all-ones code means "no date".
 pub(crate) const MISSING: u8 = 1;
 /// Widest code a block can hold, in bits.
 const MAX_WIDTH: u8 = 64;
@@ -81,15 +81,19 @@ impl Frame {
     }
 
     /// Date at `index` of a dates block, as [`date`] answers it.
-    pub(crate) fn date(&self, payload: &[u8], index: usize) -> Option<i64> {
+    #[expect(
+        clippy::option_option,
+        reason = "the outer `None` is a refused block, the inner one a message with no date"
+    )]
+    pub(crate) fn date(&self, payload: &[u8], index: usize) -> Option<Option<i64>> {
         if self.flags & !MISSING != 0 || (self.flags == MISSING && self.width == 0) {
             return None;
         }
         let raw = self.code(payload, index)?;
         if self.flags == MISSING && raw == mask(self.width) {
-            return Some(0);
+            return Some(None);
         }
-        signed_of(self.base).checked_add_unsigned(raw)
+        signed_of(self.base).checked_add_unsigned(raw).map(Some)
     }
 
     /// Start at `index` of a starts block, as [`start`] answers it.
@@ -347,58 +351,54 @@ const fn signed_of(bits: u64) -> i64 {
     i64::from_le_bytes(bits.to_le_bytes())
 }
 
-/// Minimum and maximum of the non-zero dates, or `None` when there are none.
-fn nonzero_span(values: &[i64]) -> Option<(i64, i64)> {
-    let mut present = values.iter().copied().filter(|value| *value != 0);
+/// Minimum and maximum of the present dates, or `None` when there are none.
+fn dated_span(values: &[Option<i64>]) -> Option<(i64, i64)> {
+    let mut present = values.iter().copied().flatten();
     let first = present.next()?;
     Some(present.fold((first, first), |(low, high), value| {
         (low.min(value), high.max(value))
     }))
 }
 
-/// Chooses base, width and flags for a dates block: the "no date" sentinel is used only when zero
-/// is outside the span of the present dates; its width holds `span + 1`, so the all-ones code
-/// exceeds every real delta.
-fn date_layout(values: &[i64]) -> Frame {
-    let min = values.iter().copied().min().unwrap_or(0);
-    let max = values.iter().copied().max().unwrap_or(0);
+/// Chooses base, width and flags for a dates block: the "no date" sentinel is used only when a
+/// date is missing; its width holds `span + 1`, so the all-ones code exceeds every real delta.
+/// A block with no present date keeps one bit per code, all ones.
+fn date_layout(values: &[Option<i64>]) -> Frame {
+    let span = dated_span(values);
+    let (min, max) = span.unwrap_or((0, 0));
     let plain = Frame {
         base: bits_of(min),
         flags: 0,
         width: bit_width(max.abs_diff(min)),
     };
-    let has_zero = values.contains(&0);
-    let Some((low, high)) = nonzero_span(values).filter(|_| has_zero) else {
-        return plain;
-    };
-    if low <= 0 && high >= 0 {
+    if !values.contains(&None) {
         return plain;
     }
     // The all-ones code of a width-w block is 2^w - 1, so it sits above every real delta (at most
-    // `range`) once w holds `range + 1`. Zero lies outside the span, so the non-zero dates share a
-    // sign and `range` stays below 2^63; the sum cannot overflow, and `None` falls back anyway.
-    let Some(width) = high.abs_diff(low).checked_add(1).map(bit_width) else {
+    // `range`) once w holds `range + 1`. A span of the whole `i64` range leaves no room for the
+    // sentinel; such a block keeps the plain layout and reads each missing date as its minimum.
+    let Some(width) = max.abs_diff(min).checked_add(1).map(bit_width) else {
         return plain;
     };
     Frame {
-        base: bits_of(low),
+        base: bits_of(min),
         flags: MISSING,
         width,
     }
 }
 
-/// Appends the payload of `values` (zero meaning "no date") to `out` and returns the entry.
-pub(crate) fn encode_dates(values: &[i64], out: &mut Vec<u8>) -> Block {
+/// Appends the payload of `values` (`None` meaning "no date") to `out` and returns the entry.
+pub(crate) fn encode_dates(values: &[Option<i64>], out: &mut Vec<u8>) -> Block {
     let layout = date_layout(values);
     let origin = signed_of(layout.base);
-    let sentinel = mask(layout.width);
-    let codes = values.iter().map(|value| {
-        if layout.flags & MISSING != 0 && *value == 0 {
-            sentinel
-        } else {
-            value.abs_diff(origin)
-        }
-    });
+    let sentinel = if layout.flags & MISSING != 0 {
+        mask(layout.width)
+    } else {
+        0
+    };
+    let codes = values
+        .iter()
+        .map(|value| value.map_or(sentinel, |date| date.abs_diff(origin)));
     seal(layout, values.len(), codes, out)
 }
 
@@ -414,10 +414,14 @@ pub(crate) fn start(block: &Block, payload: &[u8], index: usize) -> Option<u64> 
     block.frame().start(payload, index)
 }
 
-/// Date at `index` of a dates block, zero for "no date", or `None` for an unknown flag, a width
-/// above 64, a sentinel block of width 0, or an index the payload does not cover.
+/// Date at `index` of a dates block, `Some(None)` for "no date", or `None` for an unknown flag, a
+/// width above 64, a sentinel block of width 0, or an index the payload does not cover.
 #[cfg(test)]
-pub(crate) fn date(block: &Block, payload: &[u8], index: usize) -> Option<i64> {
+#[expect(
+    clippy::option_option,
+    reason = "the outer `None` is a refused block, the inner one a message with no date"
+)]
+pub(crate) fn date(block: &Block, payload: &[u8], index: usize) -> Option<Option<i64>> {
     block.frame().date(payload, index)
 }
 
@@ -504,7 +508,7 @@ mod tests {
         }
     }
 
-    fn decode_dates(values: &[i64]) -> Decoded<i64> {
+    fn decode_dates(values: &[Option<i64>]) -> Decoded<Option<i64>> {
         let mut payload = Vec::new();
         let block = encode_dates(values, &mut payload);
         let read = (0..values.len())
@@ -559,37 +563,45 @@ mod tests {
             "no bits are needed"
         );
         assert_eq!(starts.values, some(&[9_u64; 40]), "equal values read back");
-        let dates = decode_dates(&[0_i64; 5]);
+        let dates = decode_dates(&[Some(0); 5]);
         assert_eq!(
             (dates.block.width, dates.payload.len()),
             (0, 0),
-            "all-zero dates are equal values"
+            "all-epoch dates are equal values"
         );
-        assert_eq!(dates.values, some(&[0_i64; 5]), "all-zero dates read back");
+        assert_eq!(
+            dates.values,
+            some(&[Some(0); 5]),
+            "all-epoch dates read back"
+        );
     }
 
     #[test]
-    fn zero_outside_the_dates_uses_the_sentinel_and_keeps_the_width_small() {
-        let values = [0, 1_700_000_000, 0, 1_700_000_300, 0];
+    fn missing_dates_use_the_sentinel_and_keep_the_width_small() {
+        let values = [None, Some(1_700_000_000), None, Some(1_700_000_300), None];
         let decoded = decode_dates(&values);
         assert_eq!(
             decoded.block.flags, MISSING,
-            "zero is below the present dates"
+            "a missing date takes the sentinel"
         );
         assert_eq!(
             decoded.block.width, 9,
             "a span of 300 needs 301 codes, one more than the span, and that fits in nine bits"
         );
-        assert_eq!(decoded.values, some(&values), "zeros come back as zeros");
+        assert_eq!(
+            decoded.values,
+            some(&values),
+            "missing dates come back missing"
+        );
     }
 
     #[test]
-    fn zero_outside_a_full_width_span_uses_the_sentinel_at_width_64() {
-        let values = [i64::MIN, -1, 0];
+    fn a_missing_date_beside_a_full_width_span_uses_the_sentinel_at_width_64() {
+        let values = [Some(i64::MIN), Some(-1), None];
         let decoded = decode_dates(&values);
         assert_eq!(
             decoded.block.flags, MISSING,
-            "zero lies above the non-zero dates"
+            "a missing date takes the sentinel"
         );
         assert_eq!(
             decoded.block.width, 64,
@@ -602,7 +614,7 @@ mod tests {
         assert_eq!(
             decoded.values,
             some(&values),
-            "all three dates come back, zero included"
+            "all three dates come back, the missing one included"
         );
     }
 
@@ -619,11 +631,48 @@ mod tests {
     }
 
     #[test]
-    fn zero_inside_the_dates_is_an_ordinary_value() {
-        let values = [-5, 0, 7];
+    fn dates_without_a_missing_one_need_no_sentinel() {
+        let values = [Some(-5), Some(0), Some(7)];
         let decoded = decode_dates(&values);
-        assert_eq!(decoded.block.flags, 0, "zero lies within the span");
+        assert_eq!(decoded.block.flags, 0, "no date is missing");
         assert_eq!(decoded.values, some(&values), "dates come back");
+    }
+
+    #[test]
+    fn a_block_mixing_missing_epoch_and_other_dates_keeps_each_apart() {
+        let values = [
+            None,
+            Some(0),
+            Some(-86_400),
+            None,
+            Some(1_704_110_460),
+            Some(0),
+        ];
+        let decoded = decode_dates(&values);
+        assert_eq!(
+            decoded.block.flags, MISSING,
+            "a missing date takes the sentinel"
+        );
+        assert_eq!(
+            decoded.values,
+            some(&values),
+            "a real epoch date reads back as Some(0), apart from a missing one"
+        );
+    }
+
+    #[test]
+    fn a_block_of_only_missing_dates_reads_back_missing() {
+        let values = [None; 4];
+        let decoded = decode_dates(&values);
+        assert_eq!(
+            decoded.block.flags, MISSING,
+            "every date takes the sentinel"
+        );
+        assert_eq!(
+            decoded.values,
+            some(&values),
+            "every date reads back missing"
+        );
     }
 
     #[test]
@@ -634,7 +683,7 @@ mod tests {
             some(&[0, u64::MAX]),
             "a 64-bit span survives"
         );
-        let values = [i64::MIN, 0, i64::MAX];
+        let values = [Some(i64::MIN), Some(0), Some(i64::MAX)];
         let dates = decode_dates(&values);
         assert_eq!(dates.values, some(&values), "the full i64 range survives");
     }
@@ -692,7 +741,13 @@ mod tests {
         #[test]
         fn dates_roundtrip_for_any_block(
             values in vec(
-                prop_oneof![Just(0_i64), any::<i64>(), 1_i64..100_000, -500_i64..500],
+                prop_oneof![
+                    Just(None),
+                    Just(Some(0_i64)),
+                    any::<i64>().prop_map(Some),
+                    (1_i64..100_000).prop_map(Some),
+                    (-500_i64..500).prop_map(Some),
+                ],
                 0..=BLOCK,
             )
         ) {

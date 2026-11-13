@@ -130,11 +130,9 @@ impl Mailbox {
 
     /// Unix seconds of the Date header of the message at `position`, as the index recorded it,
     /// or `None` when the message has no parsable Date or `position` is past the last message.
-    /// A Date of exactly the epoch reads as missing, because the index stores 0 for a message
-    /// with no Date header.
     #[must_use]
     pub fn date(&self, position: usize) -> Option<i64> {
-        self.index.date(position).filter(|&seconds| seconds != 0)
+        self.index.date(position)
     }
 
     /// The message index.
