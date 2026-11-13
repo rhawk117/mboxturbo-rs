@@ -169,14 +169,14 @@ impl Message {
 
     /// Every value of the header called `name` (any case) in file order, unfolded onto one
     /// line each. Values are raw: encoded words such as `=?utf-8?...?=` are left as written.
+    /// A value is borrowed unless it was folded or held invalid UTF-8. The iterator borrows `name`.
     pub fn header_values<'message>(
         &'message self,
         name: &str,
-    ) -> impl Iterator<Item = Cow<'message, str>> + use<'message> {
-        let wanted = name.to_owned();
+    ) -> impl Iterator<Item = Cow<'message, str>> {
         self.head()
             .into_iter()
-            .flat_map(move |mail| fields::header_values(mail, wanted.clone()))
+            .flat_map(move |mail| fields::header_values(mail, name))
     }
 
     /// HTML bodies; a text-only message yields its text converted to HTML.
@@ -257,10 +257,22 @@ mod tests {
     use crate::Mailbox;
     use crate::fields::unfold;
 
+    const HEADERS: &[u8] = b"From a@example.com Mon Jan  1 00:00:00 2024\n\
+From: A <a@example.com>\nSubject: one line\nReceived: from a.example\n\tby b.example\n\
+X-Bad: bad\xe9\n\nbody\n";
+
     const MESSAGE: &[u8] = b"From a@example.com Mon Jan  1 00:00:00 2024\n\
 From: A <a@example.com>\nSubject: lazy\nMessage-ID: <m@example.com>\n\
 Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n\nhi\n\
 --B\nContent-Type: application/octet-stream\nContent-Transfer-Encoding: base64\n\nAAEC\n--B--\n";
+
+    fn headers_mailbox() -> (tempfile::TempDir, Mailbox) {
+        let directory = tempfile::tempdir().expect("temp directory is created");
+        let path = directory.path().join("headers.mbox");
+        fs::write(&path, HEADERS).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(&path).expect("fixture mbox opens");
+        (directory, mailbox)
+    }
 
     fn mailbox() -> (tempfile::TempDir, Mailbox) {
         let directory = tempfile::tempdir().expect("temp directory is created");
@@ -368,6 +380,38 @@ Content-Type: multipart/mixed; boundary=\"B\"\n\n--B\nContent-Type: text/plain\n
             message.subject(),
             before.as_deref(),
             "a successful full parse does not change the subject"
+        );
+    }
+
+    #[test]
+    fn a_one_line_header_value_is_borrowed() {
+        let (_directory, mailbox) = headers_mailbox();
+        let message = mailbox.message(0).expect("the fixture holds a message");
+        assert!(
+            matches!(message.header("subject"), Some(Cow::Borrowed("one line"))),
+            "a one-line valid UTF-8 value is borrowed from the mailbox"
+        );
+    }
+
+    #[test]
+    fn a_folded_header_value_is_owned_and_joined() {
+        let (_directory, mailbox) = headers_mailbox();
+        let message = mailbox.message(0).expect("the fixture holds a message");
+        assert_eq!(
+            message.header("received"),
+            Some(Cow::Owned("from a.example\tby b.example".to_owned())),
+            "a folded value is joined into an owned string"
+        );
+    }
+
+    #[test]
+    fn a_header_value_with_a_non_utf8_byte_is_owned_and_lossy() {
+        let (_directory, mailbox) = headers_mailbox();
+        let message = mailbox.message(0).expect("the fixture holds a message");
+        let value = message.header("x-bad").expect("the fixture has X-Bad");
+        assert!(
+            matches!(&value, Cow::Owned(lossy) if lossy.contains('\u{FFFD}')),
+            "a value with a non-UTF-8 byte is owned and holds U+FFFD"
         );
     }
 

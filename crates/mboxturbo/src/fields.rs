@@ -76,7 +76,18 @@ where
     mail.headers()
         .iter()
         .filter(move |header| header.name().as_str().eq_ignore_ascii_case(name.as_ref()))
-        .map(|header| unfold(String::from_utf8_lossy(header.raw_value())))
+        .map(|header| {
+            unfold(String::from_utf8_lossy(strip_line_break(
+                header.raw_value(),
+            )))
+        })
+}
+
+/// `raw` without its one final line break, which mail-parser keeps on a header's raw value.
+fn strip_line_break(raw: &[u8]) -> &[u8] {
+    raw.strip_suffix(b"\r\n")
+        .or_else(|| raw.strip_suffix(b"\n"))
+        .unwrap_or(raw)
 }
 
 /// The `Date:` header as an instant plus the offset it was written in; `None` when the header
@@ -225,13 +236,25 @@ fn numeric_zone_minutes(token: &str) -> Option<i32> {
 }
 
 /// `text` as one line: line breaks removed, surrounding whitespace trimmed. Borrows when the
-/// text needs no joining.
+/// text needs no joining and is already borrowed; allocates at most once otherwise.
 pub(crate) fn unfold(text: Cow<'_, str>) -> Cow<'_, str> {
     if text.contains(['\r', '\n']) {
-        return Cow::Owned(text.lines().collect::<String>().trim().to_owned());
+        let mut joined = text.lines().collect::<String>();
+        trim_in_place(&mut joined);
+        return Cow::Owned(joined);
     }
     match text {
         Cow::Borrowed(borrowed) => Cow::Borrowed(borrowed.trim()),
-        Cow::Owned(owned) => Cow::Owned(owned.trim().to_owned()),
+        Cow::Owned(mut owned) => {
+            trim_in_place(&mut owned);
+            Cow::Owned(owned)
+        },
     }
+}
+
+/// Removes the leading and trailing whitespace of `text` without reallocating.
+fn trim_in_place(text: &mut String) {
+    text.truncate(text.trim_end().len());
+    let leading = text.len().saturating_sub(text.trim_start().len());
+    drop(text.drain(..leading));
 }
