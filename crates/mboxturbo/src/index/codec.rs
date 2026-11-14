@@ -4,7 +4,7 @@
 
 use std::iter::repeat_n;
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::Xxh3;
 
 /// Flag bit of a dates block: its all-ones code means "no date".
 pub(crate) const MISSING: u8 = 1;
@@ -303,12 +303,11 @@ fn pack(codes: impl Iterator<Item = u64>, count: usize, width: u8) -> Vec<u8> {
 
 /// Checksum of an entry's base, width and flags bytes followed by its payload.
 fn checksum(base: u64, width: u8, flags: u8, payload: &[u8]) -> u64 {
-    let mut bytes = Vec::with_capacity(payload.len().saturating_add(10));
-    bytes.extend_from_slice(&base.to_le_bytes());
-    bytes.push(width);
-    bytes.push(flags);
-    bytes.extend_from_slice(payload);
-    xxh3_64(&bytes)
+    let mut hasher = Xxh3::new();
+    hasher.update(&base.to_le_bytes());
+    hasher.update(&[width, flags]);
+    hasher.update(payload);
+    hasher.digest()
 }
 
 /// Packs the codes, appends the payload to `out` and seals the entry with its checksum.
@@ -479,6 +478,7 @@ mod tests {
 
     use proptest::collection::vec;
     use proptest::prelude::*;
+    use xxhash_rust::xxh3::xxh3_64;
 
     use super::*;
 
@@ -853,5 +853,18 @@ mod tests {
                 prop_assert!(!verify(&entry, &decoded.payload), "a flipped entry bit is caught");
             }
         }
+    }
+
+    #[test]
+    fn the_streamed_checksum_equals_the_one_shot_digest() {
+        let payload = [3_u8, 1, 4, 1, 5, 9, 2, 6];
+        let mut bytes = 0x0123_4567_89ab_cdef_u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[7, 1]);
+        bytes.extend_from_slice(&payload);
+        assert_eq!(
+            checksum(0x0123_4567_89ab_cdef, 7, 1, &payload),
+            xxh3_64(&bytes),
+            "a sidecar sealed with the one-shot digest still verifies"
+        );
     }
 }
