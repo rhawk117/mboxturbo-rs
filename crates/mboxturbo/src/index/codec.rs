@@ -858,11 +858,11 @@ mod tests {
     #[test]
     fn the_streamed_checksum_equals_the_one_shot_digest() {
         let payload = [3_u8, 1, 4, 1, 5, 9, 2, 6];
-        let mut bytes = 0x0123_4567_89ab_cdef_u64.to_le_bytes().to_vec();
+        let mut bytes = 0x0123_4567_89AB_CDEF_u64.to_le_bytes().to_vec();
         bytes.extend_from_slice(&[7, 1]);
         bytes.extend_from_slice(&payload);
         assert_eq!(
-            checksum(0x0123_4567_89ab_cdef, 7, 1, &payload),
+            checksum(0x0123_4567_89AB_CDEF, 7, 1, &payload),
             xxh3_64(&bytes),
             "a sidecar sealed with the one-shot digest still verifies"
         );
