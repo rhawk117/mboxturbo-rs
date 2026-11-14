@@ -208,7 +208,8 @@ fn bit_width(range: u64) -> u8 {
     width
 }
 
-/// Mask of the low `width` bits; zero for width 0 or any width above 64.
+/// Mask of the low `width` bits: zero for width 0, all ones above 64, so callers check the
+/// width first.
 fn mask(width: u8) -> u64 {
     u64::MAX
         .checked_shr(u32::from(MAX_WIDTH.saturating_sub(width)))

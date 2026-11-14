@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::codec;
 
 /// A directory entry parsed once, kept so later reads of its block skip the parse. An entry of
-/// the original bytes is kept only after its block passed its checksum; its payload range was
-/// checked against the directories when it was parsed.
+/// the original bytes is kept only after its block passed its checksum. It keeps the frame and
+/// the payload start; the payload range is bounded at each read by [`Parsed::payload`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Parsed {
     /// Base, flags and width of the block.
@@ -84,6 +84,7 @@ impl Cell {
     }
 
     /// Whether an entry was stored.
+    #[cfg(test)]
     #[inline]
     pub(super) fn is_filled(&self) -> bool {
         self.word.load(Ordering::Relaxed) & Self::FILLED != 0

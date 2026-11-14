@@ -257,7 +257,8 @@ impl Index {
     /// header on all rayon threads, in blocks of 256 messages.
     ///
     /// A message starts at a line beginning with `From `, matching Python's `mailbox.mbox`; a
-    /// message without a parsable Date header is dated zero.
+    /// message without a parsable Date header reads back as `None`, not zero; a real date of the
+    /// epoch is `Some(0)`.
     #[must_use]
     pub fn build(contents: Arc<Mmap>, fingerprint: Fingerprint) -> Self {
         Self::build_with(contents, fingerprint, BlockSize::default())
@@ -281,8 +282,9 @@ impl Index {
     ///
     /// # Panics
     ///
-    /// Never in practice: the rebuild it falls back to was just encoded, so none of its
-    /// directory entries is refused.
+    /// Only if a directory entry of the freshly encoded rebuild were refused. The encoder writes
+    /// every entry and sizes every payload itself, so the rebuild's entries are always within
+    /// its directories and the rebuild always measures.
     #[must_use]
     pub fn bytes(&self) -> IndexBytes {
         #[expect(
@@ -437,8 +439,8 @@ impl Index {
     }
 
     /// Parses the entry of original `section` block `block` and, when its block passes its
-    /// checksum, keeps it in `cell`. A concurrent caller may check the block too; the first to
-    /// finish fills the cell and both get its entry.
+    /// checksum, keeps it in `cell`. A concurrent caller may check the block too; any thread may
+    /// store, and every store writes the same bits, so both get the entry.
     #[cold]
     fn parse(&self, section: Section, block: usize, cell: &Cell) -> Option<Parsed> {
         let bytes = self.original.bytes();
@@ -548,10 +550,7 @@ impl Index {
     }
 
     /// Blocks of `section` whose checksum a lookup has checked and accepted.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the cache statistics once T11 lands")
-    )]
+    #[cfg(test)]
     pub(crate) fn verified_blocks(&self, section: Section) -> usize {
         self.entries(section)
             .iter()
