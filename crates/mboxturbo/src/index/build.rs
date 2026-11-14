@@ -167,6 +167,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::super::tests::dated_mailbox;
     use super::super::{date, format};
     use super::{BlockSize, stream};
@@ -288,6 +290,25 @@ mod tests {
             streamed,
             reference(b"", fingerprint, BlockSize::default()),
             "no messages yield the reference empty file"
+        );
+    }
+
+    #[test]
+    fn a_start_past_the_end_of_the_mailbox_is_invalid_data() {
+        let contents = dated_mailbox(10);
+        let fingerprint = Fingerprint::new(&contents, None);
+        let error = stream(
+            &contents,
+            [vec![contents.len() + 1]],
+            fingerprint,
+            BlockSize::default(),
+            Parallelism::Sequential,
+        )
+        .expect_err("a start past the end cannot be dated");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "the out-of-range start is reported as invalid data"
         );
     }
 }

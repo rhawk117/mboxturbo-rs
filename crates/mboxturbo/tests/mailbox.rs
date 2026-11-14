@@ -2,13 +2,14 @@
 
 #[cfg(test)]
 mod mailbox {
+    use std::borrow::Cow;
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use std::{fs, thread};
 
-    use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
+    use mboxturbo::{Corruption, IndexSource, Mailbox, MboxTurboError, Message};
     use rayon::prelude::*;
     use tempfile::TempDir;
 
@@ -87,6 +88,20 @@ AAEC\n\
                 mbox,
                 index,
             }
+        }
+    }
+
+    /// Restores a directory's write permission when dropped.
+    #[cfg(unix)]
+    struct Restore<'dir>(&'dir Path);
+
+    #[cfg(unix)]
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(self.0, fs::Permissions::from_mode(0o755))
+                .expect("directory permissions are restored");
         }
     }
 
@@ -481,6 +496,67 @@ body of message {number} {body}\n\
         fs::write(&mbox, contents).expect("mbox is written");
         let sidecar = directory.path().join("big.mbox.mbxidx");
         (mbox, sidecar)
+    }
+
+    #[test]
+    fn a_crlf_header_value_is_borrowed_without_its_carriage_return() {
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let mbox = directory.path().join("crlf.mbox");
+        fs::write(
+            &mbox,
+            "From a@example.com Mon Jan  1 00:00:00 2024\r\nSubject: hello\r\n\r\nbody\r\n\r\n",
+        )
+        .expect("the CRLF mbox is written");
+        let mailbox = Mailbox::open(&mbox).expect("the CRLF mbox opens");
+        let message = mailbox.message(0).expect("the CRLF message is indexed");
+        let values: Vec<_> = message.header_values("Subject").collect();
+        assert_eq!(values.len(), 1, "the one Subject header is returned");
+        assert!(
+            matches!(values[0], Cow::Borrowed("hello")),
+            "the value is borrowed from the mailbox without its trailing CR, got {:?}",
+            values[0]
+        );
+    }
+
+    /// Makes `directory` read-only until the guard drops, `None` when writes still succeed
+    /// there (running as root, or a filesystem that ignores the mode).
+    #[cfg(unix)]
+    fn lock_directory(directory: &Path) -> Option<Restore<'_>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let restore = Restore(directory);
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o555))
+            .expect("directory is made read-only");
+        let probe = directory.join("probe");
+        if fs::write(&probe, b"").is_ok() {
+            fs::remove_file(&probe).expect("probe file is removed");
+            return None;
+        }
+        Some(restore)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rewrite_reports_the_index_as_served_from_memory() {
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let (mbox, sidecar) = large_mailbox(&directory, 2_000);
+        drop(Mailbox::open(&mbox).expect("the mbox opens and writes its sidecar"));
+        let mut damaged = fs::read(&sidecar).expect("the clean sidecar is written");
+        damaged[FIRST_PAYLOAD_BYTE] ^= 0xFF;
+        fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
+        let Some(_restore) = lock_directory(directory.path()) else {
+            return;
+        };
+        let mailbox = Mailbox::open(&mbox).expect("a damaged sidecar still opens");
+        assert!(
+            mailbox.message(0).is_some(),
+            "the first lookup rebuilds the damaged block in memory"
+        );
+        assert_eq!(
+            mailbox.index_source(),
+            IndexSource::Memory,
+            "a sidecar that could not be rewritten no longer matches the served index"
+        );
     }
 
     /// The raw bytes of the first message of `mailbox`.

@@ -178,4 +178,20 @@ mod tests {
         assert!(cell.store(parsed).is_none(), "the start does not fit");
         assert!(!cell.is_filled(), "a refused store leaves the cell empty");
     }
+
+    #[test]
+    fn a_cell_refuses_a_width_above_127() {
+        let cell = Cell::empty();
+        let parsed = Parsed {
+            frame: codec::Frame {
+                base: 0,
+                flags: 0,
+                width: 128,
+            },
+            payload: 8,
+        };
+        assert!(cell.store(parsed).is_none(), "the width does not fit");
+        assert!(!cell.is_filled(), "a refused store leaves the cell empty");
+        assert!(cell.load().is_none(), "a refused store loads nothing");
+    }
 }
