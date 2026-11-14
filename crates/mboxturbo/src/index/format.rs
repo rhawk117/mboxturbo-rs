@@ -75,7 +75,7 @@ pub(crate) struct Layout {
     /// Each block holds this many messages, except possibly the last.
     pub block_size: BlockSize,
     /// Number of messages.
-    pub count: u64,
+    pub count: usize,
     /// Where the starts directory begins, from the file start.
     pub dir_offset: u64,
     /// Identity of the mailbox the index was built from.
@@ -99,7 +99,7 @@ pub(crate) struct Writer<W: Write + Seek> {
     /// Whether a block shorter than a full one was pushed, which must be the last.
     closed: bool,
     /// Messages pushed so far.
-    count: u64,
+    count: usize,
     /// Dates directory entries, one per block.
     dates: Vec<Entry>,
     /// Identity of the mailbox being indexed.
@@ -127,19 +127,15 @@ impl Entry {
 impl Layout {
     /// Messages in block `block`, or `None` when the block does not exist.
     pub(crate) fn block_len(&self, block: usize) -> Option<usize> {
-        let per_block = self.per_block();
-        let first = widen(block).checked_mul(per_block)?;
+        let per_block = self.block_size.entries();
+        let first = block.checked_mul(per_block)?;
         let held = self.count.checked_sub(first)?.min(per_block);
-        narrow(held).filter(|messages| *messages > 0)
+        (held > 0).then_some(held)
     }
 
     /// Number of blocks in each directory.
-    ///
-    /// The fallback is unreachable for a header `parse` accepted: `check_extent` requires the
-    /// directories, two entries per block, to end exactly at the file length, so the count fits
-    /// `usize`; a layout built from a mailbox in memory holds fewer messages than `usize::MAX`.
-    pub(crate) fn blocks(&self) -> usize {
-        narrow(self.count.div_ceil(self.per_block())).unwrap_or(0)
+    pub(crate) const fn blocks(&self) -> usize {
+        self.count.div_ceil(self.block_size.entries())
     }
 
     /// The range `start..end` when it runs forward and ends no later than the `mailbox` length,
@@ -158,8 +154,7 @@ impl Layout {
                 offset: self.dir_offset,
             });
         }
-        let declared = self
-            .end_of_directories(self.per_block())
+        let declared = end_of_directories(widen(self.count), self.per_block(), self.dir_offset)
             .unwrap_or(u64::MAX);
         if declared == widen(actual) {
             Ok(())
@@ -182,13 +177,6 @@ impl Layout {
         let (block, within) = self.held(position)?;
         let (entry, payload) = self.entry(bytes, Section::Dates, block)?;
         codec::date(&entry, payload, within)
-    }
-
-    /// Where the file ends if the header is true, or `None` on overflow.
-    fn end_of_directories(&self, per_block: u64) -> Option<u64> {
-        let entries = self.count.div_ceil(per_block).checked_mul(2)?;
-        let bytes = entries.checked_mul(widen(ENTRY_LEN))?;
-        self.dir_offset.checked_add(bytes)
     }
 
     /// The directory entry of `block` in `section` and its payload, or `None` when the block does
@@ -249,7 +237,7 @@ impl Layout {
     pub(crate) fn is_last(&self, position: usize) -> bool {
         position
             .checked_add(1)
-            .is_some_and(|following| widen(following) == self.count)
+            .is_some_and(|following| following == self.count)
     }
 
     /// The highest position block `block` holds, or `None` when the block does not exist.
@@ -268,7 +256,7 @@ impl Layout {
             .ok_or_else(|| short_header(bytes.len()))?;
         check_signature_and_version(head)?;
         check_header_checksum(head)?;
-        let layout = decode_header(head)?;
+        let layout = decode_header(head, bytes.len())?;
         if layout.fingerprint != expected {
             return Err(Rejection::Stale);
         }
@@ -342,7 +330,7 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     /// Counts a block of `messages` and `written` payload bytes; returns where the block began.
-    fn advance(&mut self, written: u64, messages: u64) -> io::Result<u64> {
+    fn advance(&mut self, written: u64, messages: usize) -> io::Result<u64> {
         let began = self.offset;
         self.offset = began
             .checked_add(written)
@@ -352,7 +340,7 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     /// Writes both directories and the final header, flushes, and returns the message count.
-    pub(crate) fn finish(mut self) -> io::Result<u64> {
+    pub(crate) fn finish(mut self) -> io::Result<usize> {
         let dir_offset = self.offset;
         for entry in self.starts.iter().chain(&self.dates) {
             self.sink.write_all(&entry.bytes())?;
@@ -414,7 +402,7 @@ impl<W: Write + Seek> Writer<W> {
             ));
         };
         self.sink.write_all(&payload)?;
-        let began = self.advance(widen(payload.len()), widen(starts.len()))?;
+        let began = self.advance(widen(payload.len()), starts.len())?;
         self.starts.push(Entry {
             block: starts_block,
             offset: began,
@@ -457,9 +445,31 @@ fn check_signature_and_version(head: &[u8]) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// Where the file ends if a header claiming `count` messages is true, or `None` on overflow.
+fn end_of_directories(count: u64, per_block: u64, dir_offset: u64) -> Option<u64> {
+    let entries = count.div_ceil(per_block).checked_mul(2)?;
+    let bytes = entries.checked_mul(widen(ENTRY_LEN))?;
+    dir_offset.checked_add(bytes)
+}
+
+/// The header's `count` as a `usize`, or the length refusal for a count this target cannot hold,
+/// which no file of `actual` bytes can match.
+fn narrow_count(
+    count: u64,
+    block_size: BlockSize,
+    dir_offset: u64,
+    actual: usize,
+) -> Result<usize, Corruption> {
+    narrow(count).ok_or_else(|| Corruption::Length {
+        declared: end_of_directories(count, block_size.messages(), dir_offset).unwrap_or(u64::MAX),
+        actual: widen(actual),
+    })
+}
+
 /// Reads the layout fields out of a header whose checksum already held, refusing a block shift
-/// outside the range the format allows.
-fn decode_header(head: &[u8]) -> Result<Layout, Rejection> {
+/// outside the range the format allows and a count that does not fit `usize`; `actual` is the
+/// file length.
+fn decode_header(head: &[u8], actual: usize) -> Result<Layout, Rejection> {
     let missing = || short_header(head.len());
     let raw = *head.get(12).ok_or_else(missing)?;
     let block_size = BlockSize::from_shift(raw).ok_or(Corruption::BlockShift(raw))?;
@@ -467,10 +477,11 @@ fn decode_header(head: &[u8]) -> Result<Layout, Rejection> {
         .map(i128::from_le_bytes)
         .ok_or_else(missing)?;
     let field = |at| read_u64(head, at).ok_or_else(missing);
+    let dir_offset = field(56)?;
     Ok(Layout {
         block_size,
-        count: field(48)?,
-        dir_offset: field(56)?,
+        count: narrow_count(field(48)?, block_size, dir_offset, actual)?,
+        dir_offset,
         fingerprint: Fingerprint::from_parts(field(16)?, nanos, field(40)?),
     })
 }
@@ -489,7 +500,7 @@ pub(crate) fn encode(
     for (block_starts, block_dates) in starts.chunks(per_block).zip(dates.chunks(per_block)) {
         writer.push(block_starts, block_dates)?;
     }
-    if writer.finish()? != widen(starts.len()) || starts.len() != dates.len() {
+    if writer.finish()? != starts.len() || starts.len() != dates.len() {
         return Err(invalid("starts and dates differ in length"));
     }
     Ok(sink.into_inner())
@@ -504,7 +515,7 @@ fn header_body(layout: &Layout) -> Vec<u8> {
     head.extend_from_slice(&layout.fingerprint.len().to_le_bytes());
     head.extend_from_slice(&layout.fingerprint.modified_nanos().to_le_bytes());
     head.extend_from_slice(&layout.fingerprint.sample_hash().to_le_bytes());
-    head.extend_from_slice(&layout.count.to_le_bytes());
+    head.extend_from_slice(&widen(layout.count).to_le_bytes());
     head.extend_from_slice(&layout.dir_offset.to_le_bytes());
     head
 }
@@ -612,7 +623,7 @@ mod tests {
 
     /// A sealed header for a layout with these fields, whose shift byte may lie outside the range
     /// a `BlockSize` holds.
-    fn sealed(count: u64, block_shift: u8, dir_offset: u64) -> Vec<u8> {
+    fn sealed(count: usize, block_shift: u8, dir_offset: u64) -> Vec<u8> {
         let mut head = header_body(&Layout {
             block_size: BlockSize::default(),
             count,

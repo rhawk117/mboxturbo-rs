@@ -415,7 +415,7 @@ impl Index {
     /// Number of messages, as counted by the rebuild once one ran.
     #[must_use]
     pub fn len(&self) -> usize {
-        messages(self.active().1)
+        self.active().1.count
     }
 
     /// Answers `read` from the original bytes when the `section` blocks of every message in
@@ -430,7 +430,7 @@ impl Index {
         if let Some((bytes, layout)) = self.replacement.get() {
             return unchecked((bytes, layout), section, &needed, read);
         }
-        if needed.start >= messages(&self.layout) {
+        if needed.start >= self.layout.count {
             return None;
         }
         self.reach(section, &needed)
@@ -599,7 +599,7 @@ impl Index {
     /// [`Index::checked_span`] decides. Any span it answers is the one `checked_span` answers.
     #[inline]
     fn verified_span(&self, position: usize) -> Option<Range<usize>> {
-        let count = messages(&self.layout);
+        let count = self.layout.count;
         if self.replacement.get().is_some() || position >= count {
             return None;
         }
@@ -626,7 +626,7 @@ impl Index {
 /// whose header is `layout`; `None` when `needed` starts past the last message.
 #[inline]
 fn blocks_of(layout: &Layout, needed: &Range<usize>) -> Option<(usize, usize)> {
-    let count = messages(layout);
+    let count = layout.count;
     if needed.start >= count {
         return None;
     }
@@ -637,13 +637,6 @@ fn blocks_of(layout: &Layout, needed: &Range<usize>) -> Option<(usize, usize)> {
 /// One empty cell per block of `blocks`; nothing is parsed until a lookup reaches a block.
 fn cells(blocks: usize) -> Box<[Cell]> {
     iter::repeat_with(Cell::empty).take(blocks).collect()
-}
-
-/// Messages `layout` holds. Its header passed the length check, so on a 64-bit target the count
-/// fits; a count past `usize::MAX` on a narrower target saturates, and the lookups past the
-/// messages the file can hold fail verification and are answered by the rebuild.
-fn messages(layout: &Layout) -> usize {
-    narrow(layout.count).unwrap_or(usize::MAX)
 }
 
 /// Size of the index in `bytes` by section, or `None` when a directory entry is refused.
