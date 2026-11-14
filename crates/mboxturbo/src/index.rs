@@ -164,20 +164,30 @@ impl PartialEq for Index {
 
 impl Eq for Index {}
 
+/// The parsed entries of the blocks one lookup reads.
+#[derive(Debug)]
+enum Entries {
+    /// The first and the last message needed lie in one block, so one entry serves both.
+    One(Parsed),
+    /// The first and the last message needed lie in different blocks.
+    Two {
+        /// The entry of the block holding the first message needed.
+        first: Parsed,
+        /// The entry of the block holding the last message needed that exists.
+        last: Parsed,
+    },
+}
+
 /// What one lookup reads: the index bytes and the parsed entries of the blocks holding the first
-/// and the last message it needs, the same entry when both lie in one block.
+/// and the last message it needs.
 #[derive(Debug)]
 struct Reach<'lookup> {
     /// The index bytes the entries point into.
     bytes: &'lookup [u8],
-    /// The entry of the block holding the first message needed.
-    first: Parsed,
-    /// The entry of the block holding the last message needed that exists.
-    last: Parsed,
+    /// The entries of the blocks holding the first and the last message needed.
+    entries: Entries,
     /// The header of `bytes`.
     layout: &'lookup Layout,
-    /// Whether `first` and `last` are one entry.
-    same: bool,
 }
 
 impl<'lookup> Reach<'lookup> {
@@ -187,10 +197,17 @@ impl<'lookup> Reach<'lookup> {
         reason = "the outer `None` is a refused block, the inner one a message with no date"
     )]
     fn date(&self, position: usize) -> Option<Option<i64>> {
-        self.first.frame().date(
-            self.payload(&self.first, position)?,
+        self.first().frame().date(
+            self.payload(self.first(), position)?,
             self.layout.place(position)?.1,
         )
+    }
+
+    /// The entry of the block holding the first message needed.
+    const fn first(&self) -> &Parsed {
+        match &self.entries {
+            Entries::One(first) | Entries::Two { first, .. } => first,
+        }
     }
 
     /// The payload of `entry`, the entry of the block holding `position`.
@@ -209,14 +226,14 @@ impl<'lookup> Reach<'lookup> {
         let following = position.checked_add(1)?;
         let (start, end) = if self.layout.is_last(position) {
             let end = narrow(self.layout.fingerprint.len())?;
-            (self.start(&self.first, position)?, end)
-        } else if self.same {
-            self.start_pair(position)?
+            (self.start(self.first(), position)?, end)
         } else {
-            (
-                self.start(&self.first, position)?,
-                self.start(&self.last, following)?,
-            )
+            match &self.entries {
+                Entries::One(_) => self.start_pair(position)?,
+                Entries::Two { first, last } => {
+                    (self.start(first, position)?, self.start(last, following)?)
+                },
+            }
         };
         Layout::bounded(start, end, mailbox)
     }
@@ -233,9 +250,9 @@ impl<'lookup> Reach<'lookup> {
     /// Starts of the message at `position` and of the next one, both in the first entry's block.
     #[inline]
     fn start_pair(&self, position: usize) -> Option<(usize, usize)> {
-        let payload = self.payload(&self.first, position)?;
+        let payload = self.payload(self.first(), position)?;
         let (_, within) = self.layout.place(position)?;
-        let (start, next) = self.first.frame().start_pair(payload, within)?;
+        let (start, next) = self.first().frame().start_pair(payload, within)?;
         Some((narrow(start)?, narrow(next)?))
     }
 }
@@ -459,17 +476,17 @@ impl Index {
     fn reach(&self, section: Section, needed: &Range<usize>) -> Option<Reach<'_>> {
         let (first_block, last_block) = blocks_of(&self.layout, needed)?;
         let first = self.entry(section, first_block)?;
-        let same = last_block == first_block;
-        let last = if same {
-            first
+        let entries = if last_block == first_block {
+            Entries::One(first)
         } else {
-            self.entry(section, last_block)?
+            Entries::Two {
+                first,
+                last: self.entry(section, last_block)?,
+            }
         };
         Some(Reach {
             bytes: self.original.bytes(),
-            first,
-            last,
-            same,
+            entries,
             layout: &self.layout,
         })
     }
@@ -667,12 +684,17 @@ where
 {
     let (first_block, last_block) = blocks_of(layout, needed)?;
     let first = Parsed::new(layout.entry_at(bytes, section, first_block)?);
-    let last = Parsed::new(layout.entry_at(bytes, section, last_block)?);
+    let entries = if first_block == last_block {
+        Entries::One(first)
+    } else {
+        Entries::Two {
+            first,
+            last: Parsed::new(layout.entry_at(bytes, section, last_block)?),
+        }
+    };
     read(&Reach {
         bytes,
-        first,
-        last,
-        same: first_block == last_block,
+        entries,
         layout,
     })
 }
