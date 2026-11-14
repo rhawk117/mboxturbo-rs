@@ -9,7 +9,9 @@ mod mailbox {
     use std::time::Duration;
     use std::{fs, thread};
 
-    use mboxturbo::{Corruption, IndexSource, Mailbox, MboxTurboError, Message};
+    #[cfg(unix)]
+    use mboxturbo::IndexSource;
+    use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
     use rayon::prelude::*;
     use tempfile::TempDir;
 
@@ -48,6 +50,10 @@ AAEC\n\
 
     const BARE: &str = "From nobody Wed Jan  3 00:00:00 2024\nSubject: third\n\nbody\n";
 
+    const HEADERS: &[u8] = b"From a@example.com Mon Jan  1 00:00:00 2024\n\
+From: A <a@example.com>\nSubject: one line\nReceived: from a.example\n\tby b.example\n\
+X-Bad: bad\xe9\n\nbody\n";
+
     /// Offset of a byte in the first payload block of a freshly built sidecar.
     const FIRST_PAYLOAD_BYTE: usize = 72;
 
@@ -68,6 +74,22 @@ AAEC\n\
             Mailbox::open_cached(&self.mbox, &self.index).expect("fixture mbox opens with a cache")
         }
 
+        fn headers() -> Self {
+            Self::holding(HEADERS)
+        }
+
+        fn holding(contents: &[u8]) -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory is created");
+            let mbox = directory.path().join("inbox.mbox");
+            let index = directory.path().join("inbox.mbxidx");
+            fs::write(&mbox, contents).expect("fixture mbox is written");
+            Self {
+                _directory: directory,
+                mbox,
+                index,
+            }
+        }
+
         fn mailbox(&self) -> Mailbox {
             Mailbox::open(&self.mbox).expect("fixture mbox opens")
         }
@@ -79,15 +101,7 @@ AAEC\n\
         }
 
         fn new() -> Self {
-            let directory = tempfile::tempdir().expect("temporary directory is created");
-            let mbox = directory.path().join("inbox.mbox");
-            let index = directory.path().join("inbox.mbxidx");
-            fs::write(&mbox, [PLAIN, MULTIPART, BARE].concat()).expect("fixture mbox is written");
-            Self {
-                _directory: directory,
-                mbox,
-                index,
-            }
+            Self::holding([PLAIN, MULTIPART, BARE].concat().as_bytes())
         }
     }
 
@@ -515,6 +529,35 @@ body of message {number} {body}\n\
             matches!(values[0], Cow::Borrowed("hello")),
             "the value is borrowed from the mailbox without its trailing CR, got {:?}",
             values[0]
+        );
+    }
+
+    #[test]
+    fn a_one_line_header_value_is_borrowed() {
+        let message = Fixture::headers().message(0);
+        assert!(
+            matches!(message.header("subject"), Some(Cow::Borrowed("one line"))),
+            "a one-line valid UTF-8 value is borrowed from the mailbox"
+        );
+    }
+
+    #[test]
+    fn a_folded_header_value_is_owned_and_joined() {
+        let message = Fixture::headers().message(0);
+        assert_eq!(
+            message.header("received"),
+            Some(Cow::Owned("from a.example\tby b.example".to_owned())),
+            "a folded value is joined into an owned string"
+        );
+    }
+
+    #[test]
+    fn a_header_value_with_a_non_utf8_byte_is_owned_and_lossy() {
+        let message = Fixture::headers().message(0);
+        let value = message.header("x-bad").expect("the fixture has X-Bad");
+        assert!(
+            matches!(&value, Cow::Owned(lossy) if lossy.contains('\u{FFFD}')),
+            "a value with a non-UTF-8 byte is owned and holds U+FFFD"
         );
     }
 
