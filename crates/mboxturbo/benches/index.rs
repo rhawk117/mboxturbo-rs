@@ -1,8 +1,9 @@
 //! Harness-free timings of the message index over the synthetic fixture.
 //!
 //! The fixture is generated under the target directory on the first run and reused while its
-//! message count and seed match. `MBOXTURBO_BENCH_DIR` moves it, and `MBOXTURBO_BENCH_MESSAGES`
-//! and `MBOXTURBO_BENCH_SEED` override the defaults of one million messages and seed 1.
+//! message count and seed match and its length equals the byte count recorded beside it.
+//! `MBOXTURBO_BENCH_DIR` moves it, and `MBOXTURBO_BENCH_MESSAGES` and `MBOXTURBO_BENCH_SEED`
+//! override the defaults of one million messages and seed 1.
 
 #[path = "../tests/common/mod.rs"]
 #[expect(
@@ -16,7 +17,7 @@ use std::error::Error;
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mboxturbo::{IndexBytes, IndexPolicy, Mailbox, MailboxBuilder};
@@ -131,18 +132,63 @@ fn bytes_per_message(bytes: u64, messages: u64) -> String {
     )
 }
 
-/// Generates the fixture at its derived path unless it already exists, and says which.
+/// `path` with `suffix` appended to its file name, in the same directory.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The byte count recorded beside the fixture at `path`, or `None` when no record exists or it is
+/// not a number, which makes the fixture untrusted.
+fn recorded_length(path: &Path) -> Outcome<Option<u64>> {
+    match fs::read_to_string(sibling(path, ".len")) {
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map_or_else(|_| Ok(None), |bytes| Ok(Some(bytes))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The length of the fixture at `path` when it exists and matches its recorded byte count.
+fn reusable_length(path: &Path) -> Outcome<Option<u64>> {
+    let actual = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok((recorded_length(path)? == Some(actual)).then_some(actual))
+}
+
+/// Generates the fixture to a partial file and renames it to `path`, so a killed run leaves
+/// nothing at `path`, then records its byte count beside it.
+fn generate_atomically(path: &Path, spec: &common::Spec) -> Outcome<common::Summary> {
+    let length_path = sibling(path, ".len");
+    match fs::remove_file(&length_path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {},
+    }
+    let partial = sibling(path, ".partial");
+    let summary = common::generate(&partial, spec)?;
+    fs::rename(&partial, path)?;
+    fs::write(&length_path, summary.bytes.to_string())?;
+    Ok(summary)
+}
+
+/// Generates the fixture at its derived path unless one of its recorded length already
+/// exists, and says which.
 fn ensure_fixture(spec: &common::Spec) -> Outcome<PathBuf> {
     let directory = bench_directory()?;
     fs::create_dir_all(&directory)?;
     let path = directory.join(common::file_name(spec));
     let mut out = io::stdout().lock();
-    if path.exists() {
-        let bytes = fs::metadata(&path)?.len();
+    if let Some(bytes) = reusable_length(&path)? {
         writeln!(out, "reused {} ({bytes} bytes)", path.display())?;
     } else {
         let started = Instant::now();
-        let summary = common::generate(&path, spec)?;
+        let summary = generate_atomically(&path, spec)?;
         writeln!(
             out,
             "generated {} ({} messages, {} dated, {} bytes) in {} ms",
@@ -154,6 +200,25 @@ fn ensure_fixture(spec: &common::Spec) -> Outcome<PathBuf> {
         )?;
     }
     Ok(path)
+}
+
+/// The error for a position the index has no span for, which a valid fixture never produces.
+fn missing_span(position: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the index has no span for message {position}"),
+    )
+}
+
+/// The first byte of the message at `position`, an error when the message is empty.
+fn first_byte(raw: &[u8], position: usize) -> Outcome<u8> {
+    raw.first().copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message {position} is empty"),
+        )
+        .into()
+    })
 }
 
 /// Times `OPEN_RUNS` cached opens, sorted ascending.
@@ -177,8 +242,10 @@ fn random_access(mailbox: &Mailbox, seed: u64) -> Outcome<Duration> {
         for _ in 0..RANDOM_READS {
             let position =
                 usize::try_from(splitmix64(&mut state).checked_rem(length).unwrap_or(0))?;
-            let first = mailbox.raw(position).and_then(|raw| raw.first().copied());
-            sum = sum.wrapping_add(u64::from(first.unwrap_or(0)));
+            let raw = mailbox
+                .raw(position)
+                .ok_or_else(|| missing_span(position))?;
+            sum = sum.wrapping_add(u64::from(first_byte(raw, position)?));
         }
         Ok(black_box(sum))
     })?;
@@ -189,8 +256,8 @@ fn random_access(mailbox: &Mailbox, seed: u64) -> Outcome<Duration> {
 fn sequential(mailbox: &Mailbox) -> Outcome<Duration> {
     let (_, elapsed) = timed(|| {
         let mut sum = 0_u64;
-        for raw in mailbox.iter() {
-            sum = sum.wrapping_add(u64::from(raw.first().copied().unwrap_or(0)));
+        for (position, raw) in mailbox.iter().enumerate() {
+            sum = sum.wrapping_add(u64::from(first_byte(raw, position)?));
         }
         Ok(black_box(sum))
     })?;
@@ -206,8 +273,11 @@ fn index_lookup(mailbox: &Mailbox, seed: u64) -> Outcome<Duration> {
         for _ in 0..RANDOM_READS {
             let position =
                 usize::try_from(splitmix64(&mut state).checked_rem(length).unwrap_or(0))?;
-            let len = mailbox.index().span(position).map_or(0, |span| span.len());
-            sum = sum.wrapping_add(len);
+            let span = mailbox
+                .index()
+                .span(position)
+                .ok_or_else(|| missing_span(position))?;
+            sum = sum.wrapping_add(span.len());
         }
         Ok(black_box(sum))
     })?;
