@@ -2,9 +2,15 @@
 
 #[cfg(test)]
 mod mailbox {
-    use std::fs;
-    use std::path::PathBuf;
+    use std::borrow::Cow;
+    use std::fmt::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    use std::{fs, thread};
 
+    #[cfg(unix)]
+    use mboxturbo::IndexSource;
     use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
     use rayon::prelude::*;
     use tempfile::TempDir;
@@ -44,6 +50,13 @@ AAEC\n\
 
     const BARE: &str = "From nobody Wed Jan  3 00:00:00 2024\nSubject: third\n\nbody\n";
 
+    const HEADERS: &[u8] = b"From a@example.com Mon Jan  1 00:00:00 2024\n\
+From: A <a@example.com>\nSubject: one line\nReceived: from a.example\n\tby b.example\n\
+X-Bad: bad\xe9\n\nbody\n";
+
+    /// Offset of a byte in the first payload block of a freshly built sidecar.
+    const FIRST_PAYLOAD_BYTE: usize = 72;
+
     struct Fixture {
         _directory: TempDir,
         index: PathBuf,
@@ -61,6 +74,22 @@ AAEC\n\
             Mailbox::open_cached(&self.mbox, &self.index).expect("fixture mbox opens with a cache")
         }
 
+        fn headers() -> Self {
+            Self::holding(HEADERS)
+        }
+
+        fn holding(contents: &[u8]) -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory is created");
+            let mbox = directory.path().join("inbox.mbox");
+            let index = directory.path().join("inbox.mbxidx");
+            fs::write(&mbox, contents).expect("fixture mbox is written");
+            Self {
+                _directory: directory,
+                mbox,
+                index,
+            }
+        }
+
         fn mailbox(&self) -> Mailbox {
             Mailbox::open(&self.mbox).expect("fixture mbox opens")
         }
@@ -72,15 +101,21 @@ AAEC\n\
         }
 
         fn new() -> Self {
-            let directory = tempfile::tempdir().expect("temporary directory is created");
-            let mbox = directory.path().join("inbox.mbox");
-            let index = directory.path().join("inbox.mbxidx");
-            fs::write(&mbox, [PLAIN, MULTIPART, BARE].concat()).expect("fixture mbox is written");
-            Self {
-                _directory: directory,
-                mbox,
-                index,
-            }
+            Self::holding([PLAIN, MULTIPART, BARE].concat().as_bytes())
+        }
+    }
+
+    /// Restores a directory's write permission when dropped.
+    #[cfg(unix)]
+    struct Restore<'dir>(&'dir Path);
+
+    #[cfg(unix)]
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(self.0, fs::Permissions::from_mode(0o755))
+                .expect("directory permissions are restored");
         }
     }
 
@@ -220,6 +255,30 @@ AAEC\n\
                 .map(|stamp| (stamp.unix_seconds, stamp.offset_minutes)),
             Some((1_704_085_200_i64, -300_i32)),
             "midnight at -0500 is 05:00 UTC"
+        );
+    }
+
+    #[test]
+    fn an_epoch_date_reads_as_zero_and_a_missing_date_as_none() {
+        const EPOCH: &str = "From a@example.com Thu Jan  1 00:00:00 1970\n\
+Date: Thu, 1 Jan 1970 00:00:00 +0000\n\
+Subject: epoch\n\n\
+body\n\n";
+        const UNDATED: &str =
+            "From b@example.com Thu Jan  1 00:00:01 1970\nSubject: undated\n\nbody\n";
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let mbox = directory.path().join("dated.mbox");
+        fs::write(&mbox, [EPOCH, UNDATED].concat()).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(&mbox).expect("fixture mbox opens");
+        assert_eq!(
+            mailbox.date(0),
+            Some(0),
+            "a Date of exactly the epoch is a real date, not a missing one"
+        );
+        assert_eq!(
+            mailbox.date(1),
+            None,
+            "a message with no Date header has no date"
         );
     }
 
@@ -428,5 +487,241 @@ AAEC\n\
             matches!(&error, MboxTurboError::Io { path, .. } if *path == missing),
             "the error carries the missing path"
         );
+    }
+
+    /// Writes `messages` numbered messages of about 200 bytes each and returns the mailbox's path
+    /// and the path of its sidecar.
+    fn large_mailbox(directory: &TempDir, messages: usize) -> (PathBuf, PathBuf) {
+        let mbox = directory.path().join("big.mbox");
+        let body = "x".repeat(90);
+        let mut contents = String::new();
+        for number in 0..messages {
+            write!(
+                contents,
+                "From sender{number}@example.com Mon Jan  1 00:00:00 2024\n\
+Subject: message {number}\n\
+Date: Mon, 01 Jan 2024 00:00:00 +0000\n\
+\n\
+body of message {number} {body}\n\
+\n"
+            )
+            .expect("a String accepts every write");
+        }
+        fs::write(&mbox, contents).expect("mbox is written");
+        let sidecar = directory.path().join("big.mbox.mbxidx");
+        (mbox, sidecar)
+    }
+
+    #[test]
+    fn a_crlf_header_value_is_borrowed_without_its_carriage_return() {
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let mbox = directory.path().join("crlf.mbox");
+        fs::write(
+            &mbox,
+            "From a@example.com Mon Jan  1 00:00:00 2024\r\nSubject: hello\r\n\r\nbody\r\n\r\n",
+        )
+        .expect("the CRLF mbox is written");
+        let mailbox = Mailbox::open(&mbox).expect("the CRLF mbox opens");
+        let message = mailbox.message(0).expect("the CRLF message is indexed");
+        let values: Vec<_> = message.header_values("Subject").collect();
+        assert_eq!(values.len(), 1, "the one Subject header is returned");
+        assert!(
+            matches!(values[0], Cow::Borrowed("hello")),
+            "the value is borrowed from the mailbox without its trailing CR, got {:?}",
+            values[0]
+        );
+    }
+
+    #[test]
+    fn a_one_line_header_value_is_borrowed() {
+        let message = Fixture::headers().message(0);
+        assert!(
+            matches!(message.header("subject"), Some(Cow::Borrowed("one line"))),
+            "a one-line valid UTF-8 value is borrowed from the mailbox"
+        );
+    }
+
+    #[test]
+    fn a_folded_header_value_is_owned_and_joined() {
+        let message = Fixture::headers().message(0);
+        assert_eq!(
+            message.header("received"),
+            Some(Cow::Owned("from a.example\tby b.example".to_owned())),
+            "a folded value is joined into an owned string"
+        );
+    }
+
+    #[test]
+    fn a_header_value_with_a_non_utf8_byte_is_owned_and_lossy() {
+        let message = Fixture::headers().message(0);
+        let value = message.header("x-bad").expect("the fixture has X-Bad");
+        assert!(
+            matches!(&value, Cow::Owned(lossy) if lossy.contains('\u{FFFD}')),
+            "a value with a non-UTF-8 byte is owned and holds U+FFFD"
+        );
+    }
+
+    /// Makes `directory` read-only until the guard drops, `None` when writes still succeed
+    /// there (running as root, or a filesystem that ignores the mode).
+    #[cfg(unix)]
+    fn lock_directory(directory: &Path) -> Option<Restore<'_>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let restore = Restore(directory);
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o555))
+            .expect("directory is made read-only");
+        let probe = directory.join("probe");
+        if fs::write(&probe, b"").is_ok() {
+            fs::remove_file(&probe).expect("probe file is removed");
+            return None;
+        }
+        Some(restore)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rewrite_reports_the_index_as_served_from_memory() {
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let (mbox, sidecar) = large_mailbox(&directory, 2_000);
+        drop(Mailbox::open(&mbox).expect("the mbox opens and writes its sidecar"));
+        let mut damaged = fs::read(&sidecar).expect("the clean sidecar is written");
+        damaged[FIRST_PAYLOAD_BYTE] ^= 0xFF;
+        fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
+        let Some(_restore) = lock_directory(directory.path()) else {
+            return;
+        };
+        let mailbox = Mailbox::open(&mbox).expect("a damaged sidecar still opens");
+        assert!(
+            mailbox.message(0).is_some(),
+            "the first lookup rebuilds the damaged block in memory"
+        );
+        assert_eq!(
+            mailbox.index_source(),
+            IndexSource::Memory,
+            "a sidecar that could not be rewritten no longer matches the served index"
+        );
+    }
+
+    /// The raw bytes of the first message of `mailbox`.
+    fn first_raw(mailbox: &Mailbox) -> Vec<u8> {
+        mailbox
+            .message(0)
+            .expect("the first message is indexed")
+            .raw()
+            .to_vec()
+    }
+
+    /// Queues a lookup of the first message of `mailbox` on the worker at index 0 of `pool`
+    /// alone, behind any work already queued for it; the lookup sends the raw bytes to `sender`.
+    fn queue_on_the_first_worker(
+        pool: &rayon::ThreadPool,
+        mailbox: &Arc<Mailbox>,
+        sender: &mpsc::Sender<Vec<u8>>,
+    ) {
+        let shared = Arc::clone(mailbox);
+        let answers = sender.clone();
+        pool.spawn_broadcast(move |context| {
+            if context.index() == 0 {
+                answers
+                    .send(first_raw(&shared))
+                    .expect("the test still receives answers");
+            }
+        });
+    }
+
+    /// Pins the race in which a lookup into a damaged block rebuilds the index on a rayon worker:
+    /// a parallel rebuild that finds a job of its own stolen runs the work queued for its thread
+    /// while it waits, and a second lookup in that work re-enters the sidecar's `OnceLock` on
+    /// the thread already initializing it, which never returns. A broadcast queues the second
+    /// lookup on the rebuilding worker alone, standing in for a lookup it would steal or take
+    /// from the pool's injector, so a parallel rebuild reaches it at its first such wait.
+    #[test]
+    fn a_lookup_queued_on_the_rebuilding_worker_answers_with_the_clean_message() {
+        const REPEATS: usize = 10;
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let (mbox, sidecar) = large_mailbox(&directory, 20_000);
+        let expected =
+            first_raw(&Mailbox::open(&mbox).expect("the mbox opens and writes its sidecar"));
+        let mut damaged = fs::read(&sidecar).expect("the clean sidecar is written");
+        damaged[FIRST_PAYLOAD_BYTE] ^= 0xFF;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("the private pool is built");
+        for repeat in 0..REPEATS {
+            fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
+            let mailbox = Arc::new(Mailbox::open(&mbox).expect("a damaged sidecar still opens"));
+            let (sender, receiver) = mpsc::channel();
+            queue_on_the_first_worker(&pool, &mailbox, &sender);
+            queue_on_the_first_worker(&pool, &mailbox, &sender);
+            for lookup in 0_usize..2 {
+                let raw = receiver
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the lookup answers within 30 seconds rather than hanging");
+                assert_eq!(
+                    raw, expected,
+                    "repeat {repeat}: lookup {lookup} answers with the clean bytes"
+                );
+            }
+        }
+    }
+
+    /// Opens `mbox` and collects every message through `par_iter` on a spawned thread, so a
+    /// hang on a rayon worker fails the test after 30 seconds instead of stalling it.
+    fn par_iter_spans_within_the_timeout(mbox: &Path) -> Vec<Vec<u8>> {
+        let (sender, receiver) = mpsc::channel();
+        let owned = mbox.to_path_buf();
+        let worker = thread::spawn(move || {
+            let spans: Vec<Vec<u8>> = Mailbox::open(&owned)
+                .expect("a damaged sidecar still opens")
+                .par_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
+            sender
+                .send(spans)
+                .expect("the test still receives the spans");
+        });
+        let spans = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("par_iter answers within 30 seconds rather than hanging on a rayon worker");
+        worker
+            .join()
+            .expect("the par_iter thread finishes without panicking");
+        spans
+    }
+
+    #[test]
+    fn par_iter_over_a_freshly_damaged_sidecar_every_time_returns_the_clean_spans_and_rewrites_it()
+    {
+        const MESSAGES: usize = 30_000;
+        const REPEATS: usize = 5;
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let (mbox, sidecar) = large_mailbox(&directory, MESSAGES);
+        let clean: Vec<Vec<u8>> = Mailbox::open(&mbox)
+            .expect("the mbox opens and writes its sidecar")
+            .par_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(
+            clean.len(),
+            MESSAGES,
+            "the clean build indexes every message"
+        );
+        let mut damaged = fs::read(&sidecar).expect("the clean sidecar is written");
+        damaged[FIRST_PAYLOAD_BYTE] ^= 0xFF;
+        // Guards the rebuild-on-a-rayon-worker re-entry race, which hangs only some runs.
+        for repeat in 0..REPEATS {
+            fs::write(&sidecar, &damaged).expect("the sidecar is damaged");
+            let spans = par_iter_spans_within_the_timeout(&mbox);
+            assert_eq!(
+                spans, clean,
+                "repeat {repeat}: the rebuilt spans match a clean build"
+            );
+            assert_ne!(
+                fs::read(&sidecar).expect("the sidecar is readable"),
+                damaged,
+                "repeat {repeat}: the rebuild rewrote the damaged sidecar"
+            );
+        }
     }
 }

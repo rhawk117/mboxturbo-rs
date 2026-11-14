@@ -1,7 +1,6 @@
 //! An mbox file mapped read-only together with its message index.
 
 use std::fs::File;
-use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,22 +8,27 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
+use crate::builder::{IndexPolicy, IndexSource, MailboxBuilder};
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
-use crate::index::Index;
+use crate::index::{BlockSize, Cursor, Index};
+use crate::mapping::map_read_only;
 use crate::message::Message;
 
 /// An mbox file mapped read-only, with the byte offset of every message.
 ///
 /// The file must not be modified or truncated while the mailbox, or any [`Message`] taken
-/// from it, is alive.
+/// from it, is alive. The same holds for an index file passed to [`Mailbox::open_cached`], which
+/// this crate only ever replaces by renaming a new file over it.
 #[derive(Debug)]
 pub struct Mailbox {
     /// The read-only mapping, shared with every [`Message`] taken from this mailbox.
     contents: Arc<Mmap>,
     /// Start offsets of the messages within `contents`.
     index: Index,
+    /// Where `index` came from, as reported by [`Mailbox::index_source`].
+    source: IndexSource,
 }
 
 /// The result of [`Mailbox::parse_batch`]: the parsed messages and the positions that failed.
@@ -41,27 +45,39 @@ pub struct ParsedBatch {
 
 /// A mapped file with its fingerprint, before an index is attached.
 #[derive(Debug)]
-struct Mapped {
-    /// The read-only mapping of the whole file.
-    contents: Mmap,
+pub(crate) struct Mapped {
+    /// The read-only mapping of the whole file, shared with the index for a rebuild.
+    contents: Arc<Mmap>,
     /// Identity of the mapped bytes, which a cached index must match to be reused.
     fingerprint: Fingerprint,
 }
 
 impl Mapped {
-    /// Builds a fresh index over the mapping.
-    fn into_indexed(self) -> Mailbox {
-        let index = Index::build(&self.contents, self.fingerprint);
-        Mailbox {
-            contents: Arc::new(self.contents),
-            index,
-        }
+    /// Builds a fresh index over the mapping, with blocks of `block_size` messages.
+    pub(crate) fn build(&self, block_size: BlockSize) -> Index {
+        Index::build_with(Arc::clone(&self.contents), self.fingerprint, block_size)
+    }
+
+    /// Loads the index saved at `index_path`, which must match this mapping's fingerprint.
+    pub(crate) fn load(&self, index_path: &Path) -> Result<Index, MboxTurboError> {
+        Index::load(index_path, Arc::clone(&self.contents), self.fingerprint)
+    }
+
+    /// Loads the sidecar index of the mbox at `mbox` saved at `sidecar`, which must match this
+    /// mapping's fingerprint, and refuses it, mapping nothing, unless it is a regular file owned
+    /// by the mbox's owner. See [`Index::load_trusted`].
+    pub(crate) fn load_sidecar(
+        &self,
+        sidecar: &Path,
+        mbox: &Path,
+    ) -> Result<Index, MboxTurboError> {
+        Index::load_trusted(sidecar, mbox, Arc::clone(&self.contents), self.fingerprint)
     }
 
     /// Opens and maps `path`, fingerprinting what was mapped.
     ///
     /// Fails with [`MboxTurboError::Io`] when the file cannot be opened or mapped.
-    fn open(path: &Path) -> Result<Self, MboxTurboError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, MboxTurboError> {
         let file = File::open(path).map_err(|source| MboxTurboError::io(path, source))?;
         #[expect(
             clippy::disallowed_methods,
@@ -73,7 +89,8 @@ impl Mapped {
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
-        let contents = map_read_only(&file).map_err(|source| MboxTurboError::io(path, source))?;
+        let contents =
+            Arc::new(map_read_only(&file).map_err(|source| MboxTurboError::io(path, source))?);
         let fingerprint = Fingerprint::new(&contents, modified);
         Ok(Self {
             contents,
@@ -82,20 +99,40 @@ impl Mapped {
     }
 
     /// Attaches an index that was already validated against this mapping's fingerprint.
-    fn with_index(self, index: Index) -> Mailbox {
+    pub(crate) fn with_index(self, index: Index, source: IndexSource) -> Mailbox {
         Mailbox {
-            contents: Arc::new(self.contents),
+            contents: self.contents,
             index,
+            source,
         }
     }
 }
 
 impl Mailbox {
+    /// The bytes of `span`, or an empty span and slice when the index has no span inside the
+    /// file contents.
+    fn bounded(&self, span: Option<Range<usize>>) -> (Range<usize>, &[u8]) {
+        span.and_then(|inside| Some((inside.clone(), self.contents.get(inside)?)))
+            .unwrap_or((0..0, &[]))
+    }
+
     /// Narrows `positions` to the messages that exist. A range that starts past the end becomes
     /// empty and sits at the end, never inverted.
     pub(crate) fn clamped(&self, positions: Range<usize>) -> Range<usize> {
         let end = positions.end.min(self.len());
         positions.start.min(end)..end
+    }
+
+    /// [`Mailbox::row`] with the span answered by `cursor`, which must walk this mailbox's index.
+    fn cursor_row(&self, cursor: &mut Cursor<'_>, position: usize) -> (Range<usize>, &[u8]) {
+        self.bounded(cursor.span(position))
+    }
+
+    /// Unix seconds of the Date header of the message at `position`, as the index recorded it,
+    /// or `None` when the message has no parsable Date or `position` is past the last message.
+    #[must_use]
+    pub fn date(&self, position: usize) -> Option<i64> {
+        self.index.date(position)
     }
 
     /// The message index.
@@ -104,21 +141,36 @@ impl Mailbox {
         &self.index
     }
 
+    /// Where the index being served came from: the file it was read from or written to, or
+    /// memory. A file is reported only while it matches what is served: after a lookup rebuilt
+    /// the index and rewriting the file failed, the file no longer matches what is served
+    /// and this reports [`IndexSource::Memory`].
+    #[must_use]
+    pub fn index_source(&self) -> IndexSource {
+        match &self.source {
+            IndexSource::File(path) if !matches!(self.index.rewrite_outcome(), Some(Err(_))) => {
+                IndexSource::File(path.clone())
+            },
+            IndexSource::File(_) | IndexSource::Memory => IndexSource::Memory,
+        }
+    }
+
     /// Whether the mailbox holds no messages.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
 
     /// Raw bytes of every message, in file order.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
-        (0..self.len()).map(|position| self.row(position).1)
+        let mut cursor = self.index.cursor();
+        (0..self.len()).map(move |position| self.cursor_row(&mut cursor, position).1)
     }
 
     /// Number of messages.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.index.len()
     }
 
@@ -131,16 +183,20 @@ impl Mailbox {
         ))
     }
 
-    /// Maps the mbox at `path` and indexes it on all rayon threads.
+    /// Maps the mbox at `path` and serves its index from the sidecar file `<path>.mbxidx`
+    /// beside it, so a later open of the same mbox skips the scan. A missing, stale or damaged
+    /// sidecar is rebuilt on all rayon threads and written back. When it cannot be written, for
+    /// example in a read-only directory, the open still succeeds with an index held in memory
+    /// and leaves nothing behind; [`Mailbox::index_source`] tells which happened.
     ///
     /// # Errors
     ///
-    /// [`MboxTurboError::Io`] when the file cannot be opened or mapped.
+    /// [`MboxTurboError::Io`] when the mbox cannot be opened or mapped.
     pub fn open<P>(path: P) -> Result<Self, MboxTurboError>
     where
         P: AsRef<Path>,
     {
-        Ok(Mapped::open(path.as_ref())?.into_indexed())
+        MailboxBuilder::new().open(path)
     }
 
     /// Maps the mbox at `path`, reusing the index saved at `index_path` when it still matches
@@ -149,32 +205,27 @@ impl Mailbox {
     /// # Errors
     ///
     /// [`MboxTurboError::Io`] when either file cannot be read or the new index cannot be written,
-    /// and [`MboxTurboError::CorruptIndex`] when `index_path` exists but fails validation; a
-    /// corrupt file is left in place for inspection rather than overwritten.
+    /// and [`MboxTurboError::CorruptIndex`] when the header of `index_path` is damaged; that file
+    /// is left in place for inspection rather than overwritten. Only the header is checked here:
+    /// a damaged block is found by the first lookup that reaches it, which rescans the mailbox
+    /// and rewrites `index_path` with the repaired index when its directory is writable.
     pub fn open_cached<P, Q>(path: P, index_path: Q) -> Result<Self, MboxTurboError>
     where
         P: AsRef<Path>,
         Q: AsRef<Path>,
     {
-        let cache_file = index_path.as_ref();
-        let mapped = Mapped::open(path.as_ref())?;
-        match Index::load(cache_file, mapped.fingerprint) {
-            Ok(index) => Ok(mapped.with_index(index)),
-            Err(error) if error.calls_for_rebuild() => {
-                let mailbox = mapped.into_indexed();
-                mailbox.index.save(cache_file)?;
-                Ok(mailbox)
-            },
-            Err(error) => Err(error),
-        }
+        MailboxBuilder::new()
+            .index(IndexPolicy::Path(index_path.as_ref().to_path_buf()))
+            .open(path)
     }
 
     /// Raw bytes of every message, split across rayon threads.
     #[must_use]
     pub fn par_iter(&self) -> impl IndexedParallelIterator<Item = &[u8]> {
-        (0..self.len())
-            .into_par_iter()
-            .map(|position| self.row(position).1)
+        (0..self.len()).into_par_iter().map_init(
+            || self.index.cursor(),
+            |cursor, position| self.cursor_row(cursor, position).1,
+        )
     }
 
     /// The messages at `positions` (clamped to those that exist), all parsed in parallel.
@@ -220,66 +271,49 @@ impl Mailbox {
     }
 
     /// The span and raw bytes of the message at `position`, which must be below `len()`.
-    #[expect(
-        clippy::expect_used,
-        reason = "`position` is below `len()`, so the index has a span for it, and every index in \
-                  use keeps its spans inside the mapping: `Index::build` takes `end` from \
-                  `contents.len()` and emits ascending starts below it, and `Index::decode` \
-                  accepts a cached index only on a matching fingerprint and after \
-                  `validate_starts` checked its starts"
-    )]
+    ///
+    /// The index answers every position below its count with a span inside the mapping, except
+    /// one that a forged index file claimed and the rescan it triggered then disowned: a header
+    /// with a valid checksum and this mailbox's fingerprint can claim more messages than the
+    /// mailbox holds. Such a position yields an empty span at 0 and an empty slice, so iterators
+    /// sized from the claimed count still end without a panic.
     fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
-        let span = self
-            .index
-            .span(position)
-            .expect("a position below len() has a span");
-        let raw = self
-            .contents
-            .get(span.clone())
-            .expect("a validated index spans bytes inside the mapping");
-        (span, raw)
+        self.bounded(self.index.span(position))
     }
 
     /// The span and raw bytes of every message in `positions`, clamped to the messages that
     /// exist, as `(position, span, raw)`.
     ///
-    /// Yields one item for every clamped position and never skips one. This rests on one
-    /// invariant: every index in use has starts that ascend, each below its end. A freshly
-    /// built index takes `end` from `contents.len()` in `Index::build`, and its starts come
-    /// from the scanner, which emits them ascending and each below that length. A cached index
-    /// is accepted by `Index::decode` only when its fingerprint, which includes the length,
-    /// matches the mapping's, and `validate_starts` has checked that its starts ascend with the
-    /// last one below `end`.
+    /// Yields one item for every clamped position and never skips one. The index answers every
+    /// position below its count with a span inside the mapping, apart from a position a forged
+    /// index claimed and its rescan disowned, which yields an empty span and slice. A built index
+    /// takes its starts from the scanner, which emits them ascending and each below the
+    /// mapping's length. A cached index is accepted only when its fingerprint, which includes
+    /// the length, matches the mapping's; each of its blocks is checked on first use, and a
+    /// block that fails its checksum or places a message outside the mapping makes
+    /// the index answer from a rescan instead.
     pub(crate) fn rows(
         &self,
         positions: Range<usize>,
     ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
-        self.clamped(positions).map(|position| {
-            let (span, raw) = self.row(position);
+        let mut cursor = self.index.cursor();
+        self.clamped(positions).map(move |position| {
+            let (span, raw) = self.cursor_row(&mut cursor, position);
             (position, span, raw)
         })
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "a read-only map is sound while the file is neither written nor truncated, which \
-              is the documented contract of Mailbox and of every Message borrowed from it"
-)]
-/// Maps `file` read-only; the caller upholds the no-write, no-truncate contract of [`Mailbox`].
-fn map_read_only(file: &File) -> io::Result<Mmap> {
-    // SAFETY: a read-only map is sound while the file is neither written nor truncated, which
-    // is the documented contract of `Mailbox` and of every `Message` borrowed from it.
-    unsafe { Mmap::map(file) }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write as _;
 
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
+    use xxhash_rust::xxh3::xxh3_64;
 
     use super::Mailbox;
+    use crate::index::BlockSize;
 
     const MBOX: &[u8] = b"From a@x Mon Jan  1 00:00:00 2024\nSubject: one\n\nfirst\n\
 From b@x Mon Jan  1 00:00:01 2024\nSubject: two\n\nsecond\n\
@@ -354,6 +388,89 @@ From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
             mailbox.rows(5..9).count(),
             0,
             "a range wholly beyond the last message has no rows",
+        );
+    }
+
+    #[test]
+    fn a_position_a_forged_index_claims_yields_an_empty_message() {
+        let dir = TempDir::new().expect("a temporary directory is created");
+        let mbox = dir.path().join("mbox");
+        let cache = dir.path().join("mbox.idx");
+        fs::write(&mbox, MBOX).expect("fixture mbox is written");
+        drop(Mailbox::open_cached(&mbox, &cache).expect("the first open builds the cache"));
+        let mut bytes = fs::read(&cache).expect("the saved index reads back");
+        let count: [u8; 8] = bytes[48..56]
+            .try_into()
+            .expect("the count field is eight bytes");
+        bytes[48..56].copy_from_slice(&(u64::from_le_bytes(count) + 1).to_le_bytes());
+        let checksum = xxh3_64(&bytes[..64]);
+        bytes[64..72].copy_from_slice(&checksum.to_le_bytes());
+        fs::write(&cache, bytes).expect("the forged index is written");
+        let mailbox = Mailbox::open_cached(&mbox, &cache).expect("the forged header is accepted");
+        let raws: Vec<&[u8]> = mailbox.iter().collect();
+        assert_eq!(
+            raws.len(),
+            4,
+            "iteration covers the claimed count without a panic"
+        );
+        assert!(
+            raws[3].is_empty(),
+            "the phantom position yields an empty message"
+        );
+        assert_eq!(mailbox.len(), 3, "the rebuilt index reports the true count");
+    }
+
+    #[test]
+    fn the_indexed_date_equals_the_parsed_date_and_is_none_when_missing() {
+        const DATED: &[u8] =
+            b"From a@x Mon Jan  1 00:00:00 2024\nDate: Mon, 1 Jan 2024 10:00:00 +0100\n\
+Subject: one\n\nfirst\n\
+From b@x Mon Jan  1 00:00:01 2024\nDate: Mon, 1 Jan 2024 10:00:00 -0500\n\
+Subject: two\n\nsecond\n\
+From c@x Mon Jan  1 00:00:02 2024\nSubject: three\n\nthird\n";
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        file.write_all(DATED).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(file.path()).expect("fixture mbox opens");
+        for position in 0..mailbox.len() {
+            let parsed = mailbox
+                .message(position)
+                .and_then(|message| message.date())
+                .map(|date| date.unix_seconds);
+            assert_eq!(
+                mailbox.date(position),
+                parsed,
+                "the indexed date is the parsed Date at position {position}"
+            );
+        }
+        assert_eq!(
+            mailbox.date(2),
+            None,
+            "a message without a Date header has no indexed date"
+        );
+        assert_eq!(
+            mailbox.date(mailbox.len()),
+            None,
+            "a position past the last message has no indexed date"
+        );
+    }
+
+    #[test]
+    fn one_iter_pass_decodes_each_block_once() {
+        let messages = 600_usize;
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        for number in 0..messages {
+            write!(
+                file,
+                "From a@x Mon Jan  1 00:00:00 2024\nSubject: {number}\n\nbody\n"
+            )
+            .expect("fixture message is written");
+        }
+        let mailbox = Mailbox::open(file.path()).expect("fixture mbox opens");
+        assert_eq!(mailbox.iter().count(), messages, "one item per message");
+        assert_eq!(
+            mailbox.index().decoded_blocks(),
+            messages.div_ceil(BlockSize::default().entries()),
+            "a cursor pass decodes each block's starts once, not once per message"
         );
     }
 }

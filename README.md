@@ -4,7 +4,7 @@ Rust rewrite of [MboxTurbo](https://github.com/rhawk117/mboxturbo): offset-index
 
 | Crate | What it is |
 |---|---|
-| `crates/mboxturbo` | Pure Rust core: mmap, SIMD `From ` scan split across rayon threads, fingerprinted index file, zero-copy two-tier lazy parsing via `mail-parser`, and a columnar pipeline into Arrow batches and Parquet |
+| `crates/mboxturbo` | Pure Rust core: mmap, SIMD `From ` scan split across rayon threads, fingerprinted, block-verified index mapped beside the mbox, zero-copy two-tier lazy parsing via `mail-parser`, and a columnar pipeline into Arrow batches and Parquet |
 | `crates/mboxturbo-py` | Thin PyO3 layer (`import mboxturbo`), CPython 3.14 and free-threaded 3.14t |
 
 ## Python
@@ -23,7 +23,9 @@ with Mailbox('inbox.mbox', index='inbox.mbxidx') as mailbox:
             payloads = [attachment.data for attachment in message.attachments]
 ```
 
-- `index=` is a cache file: reused while it matches the mailbox, rebuilt and rewritten when missing or stale, and `CorruptIndexError` (file left untouched) when damaged.
+- Without `index=`, the index is saved beside the mailbox as `<mailbox path>.mbxidx` (`inbox.mbox` gets `inbox.mbox.mbxidx`) and reused while it matches. Anyone who can write the mailbox's directory controls that path, so the file is trusted only when it is a regular file owned by the mailbox's owner: a symlink, FIFO or foreign-owned file is never mapped and is replaced by a rebuilt index. A directory that cannot be written leaves nothing behind and the index stays in memory.
+- `index=` names the cache file explicitly: reused while it matches the mailbox, rebuilt and rewritten when missing or stale, and `CorruptIndexError` (file left untouched) when its header is damaged.
+- The index is mapped rather than loaded: each block is verified on first use, and a damaged block triggers a rescan and a rewrite instead of an error.
 - Header fields (`subject`, `from_`, `to`, `cc`, `date`, `message_id`, `get`, `get_all`) parse the header block only. Bodies and attachments trigger the full MIME parse.
 - `batches()` decodes bodies and attachments in parallel. For header-only passes, plain iteration is faster.
 - Iterators are safe to share between threads; each `next` claims a distinct message or batch.
@@ -59,6 +61,8 @@ let total_bytes: usize = mailbox.par_iter().map(<[u8]>::len).sum();
 let message = mailbox.message(0).expect("non-empty");
 let received: Vec<_> = message.header_values("Received").collect();
 ```
+
+`Mailbox::open` keeps the index beside the mailbox by default; `MailboxBuilder` picks the policy (`IndexPolicy::Sidecar`, `Path` or `Memory`) and the block size.
 
 ## Benchmarks
 

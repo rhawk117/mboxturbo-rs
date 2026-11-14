@@ -169,14 +169,14 @@ impl Message {
 
     /// Every value of the header called `name` (any case) in file order, unfolded onto one
     /// line each. Values are raw: encoded words such as `=?utf-8?...?=` are left as written.
+    /// A value is borrowed unless it was folded or held invalid UTF-8. The iterator borrows `name`.
     pub fn header_values<'message>(
         &'message self,
         name: &str,
-    ) -> impl Iterator<Item = Cow<'message, str>> + use<'message> {
-        let wanted = name.to_owned();
+    ) -> impl Iterator<Item = Cow<'message, str>> {
         self.head()
             .into_iter()
-            .flat_map(move |mail| fields::header_values(mail, wanted.clone()))
+            .flat_map(move |mail| fields::header_values(mail, name))
     }
 
     /// HTML bodies; a text-only message yields its text converted to HTML.

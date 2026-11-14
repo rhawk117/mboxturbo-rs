@@ -17,6 +17,7 @@
               uses syn 3"
 )]
 
+mod builder;
 mod columns;
 mod error;
 mod fields;
@@ -24,15 +25,17 @@ mod fingerprint;
 mod hint;
 mod index;
 mod mailbox;
+mod mapping;
 mod message;
 mod pipeline;
 mod scan;
 mod width;
 
+pub use builder::{IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
 pub use error::{Corruption, MboxTurboError};
 pub use fingerprint::Fingerprint;
-pub use index::Index;
+pub use index::{BlockSize, Index, IndexBytes};
 pub use mailbox::{Mailbox, ParsedBatch};
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use pipeline::{BatchReader, Compression, Pipeline};

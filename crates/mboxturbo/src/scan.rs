@@ -1,6 +1,7 @@
 //! SIMD search for mbox `From ` separator lines, split across threads by newline position.
 
 use std::ops::Range;
+use std::vec::IntoIter;
 
 use memchr::memmem::Finder;
 use rayon::prelude::*;
@@ -14,41 +15,103 @@ const BOUNDARY_TAIL: usize = BOUNDARY.len().saturating_sub(1);
 /// Bytes per parallel work unit: 16 MiB.
 const SEGMENT_LEN: usize = 16 << 20;
 
+/// Segments scanned in parallel per window: 8, so 128 MiB of `contents` at [`SEGMENT_LEN`].
+pub(crate) const WINDOW_SEGMENTS: usize = 8;
+
+/// Whether a scan or an encode may spread its work over the global rayon pool.
+///
+/// A caller that is itself a rayon worker must use [`Parallelism::Sequential`]: its jobs would
+/// be stolen by workers that are blocked waiting on that caller, and it, waiting for them, would
+/// steal work that waits on it in turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Parallelism {
+    /// Split the work across the global rayon pool.
+    Parallel,
+    /// Run every step on the calling thread, touching no rayon pool.
+    Sequential,
+}
+
+/// Iterator over the message starts of a mailbox, one ascending `Vec` per window in file order.
+///
+/// An item may be empty. The separator at offset zero, if any, belongs to the first window.
+#[derive(Debug)]
+pub(crate) struct Windows<'mbox> {
+    /// The mailbox bytes being scanned.
+    contents: &'mbox [u8],
+    /// Searcher for [`BOUNDARY`], shared by every segment.
+    finder: Finder<'static>,
+    /// The offset of a separator at the very start of `contents`, until the first window takes it.
+    leading: Option<usize>,
+    /// Whether the segments of a window are scanned on the rayon pool or on this thread.
+    parallelism: Parallelism,
+    /// Segments not yet scanned.
+    segments: IntoIter<Range<usize>>,
+    /// Segments scanned in parallel per window, at least one.
+    window_segments: usize,
+}
+
+impl Iterator for Windows<'_> {
+    type Item = Vec<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let window: Vec<Range<usize>> = self.segments.by_ref().take(self.window_segments).collect();
+        if window.is_empty() {
+            return None;
+        }
+        let scan = |segment| starts_in_segment(self.contents, segment, &self.finder);
+        let per_segment: Vec<Vec<usize>> = match self.parallelism {
+            Parallelism::Parallel => window.into_par_iter().map(scan).collect(),
+            Parallelism::Sequential => window.into_iter().map(scan).collect(),
+        };
+        let mut starts: Vec<usize> = self.leading.take().into_iter().collect();
+        starts.extend(per_segment.into_iter().flatten());
+        Some(starts)
+    }
+}
+
 /// Byte offsets of every line in `contents` that begins with `From `, in ascending order.
 ///
 /// Never panics, whatever bytes `contents` holds; empty input yields no offsets.
+#[cfg(test)]
 pub(crate) fn find_message_starts(contents: &[u8]) -> Vec<usize> {
-    find_message_starts_in_segments(contents, SEGMENT_LEN)
+    windows(contents, Parallelism::Parallel).flatten().collect()
 }
 
-/// As [`find_message_starts`], scanning `segment_len` bytes per parallel unit.
+/// Message starts of `contents` one window at a time, using [`SEGMENT_LEN`] and
+/// [`WINDOW_SEGMENTS`].
+pub(crate) fn windows(contents: &[u8], parallelism: Parallelism) -> Windows<'_> {
+    windows_with(contents, SEGMENT_LEN, WINDOW_SEGMENTS, parallelism)
+}
+
+/// As [`windows`], scanning `segment_len` bytes per parallel unit and `window_segments` units
+/// per window, on the threads `parallelism` allows.
 ///
-/// A `segment_len` of zero is treated as one. The result is identical for every segment size.
-pub(crate) fn find_message_starts_in_segments(contents: &[u8], segment_len: usize) -> Vec<usize> {
-    let finder = Finder::new(BOUNDARY);
-    let per_segment: Vec<Vec<usize>> = segment_ranges(contents.len(), segment_len)
-        .into_par_iter()
-        .map(|segment| starts_in_segment(contents, segment, &finder))
-        .collect();
-    let leading = contents.starts_with(SEPARATOR).then_some(0);
-    let total = per_segment
-        .iter()
-        .map(Vec::len)
-        .sum::<usize>()
-        .saturating_add(1);
-    let mut starts = Vec::with_capacity(total);
-    starts.extend(leading);
-    starts.extend(per_segment.into_iter().flatten());
-    starts
+/// A zero `segment_len` or `window_segments` is treated as one. The concatenated windows are
+/// identical for every choice of either.
+pub(crate) fn windows_with(
+    contents: &[u8],
+    segment_len: usize,
+    window_segments: usize,
+    parallelism: Parallelism,
+) -> Windows<'_> {
+    Windows {
+        contents,
+        finder: Finder::new(BOUNDARY),
+        parallelism,
+        segments: segment_ranges(contents.len(), segment_len).into_iter(),
+        window_segments: window_segments.max(1),
+        leading: contents.starts_with(SEPARATOR).then_some(0),
+    }
 }
 
 /// Splits `0..len` into consecutive ranges of `segment_len` bytes, the last one clamped to `len`.
 ///
 /// A `segment_len` of zero is treated as one; `len == 0` yields no ranges.
 fn segment_ranges(len: usize, segment_len: usize) -> Vec<Range<usize>> {
+    let step = segment_len.max(1);
     (0..len)
-        .step_by(segment_len.max(1))
-        .map(|start| start..start.saturating_add(segment_len).min(len))
+        .step_by(step)
+        .map(|start| start..start.saturating_add(step).min(len))
         .collect()
 }
 
@@ -73,12 +136,28 @@ fn starts_in_segment(contents: &[u8], segment: Range<usize>, finder: &Finder<'_>
         })
 }
 
+/// The synthetic mbox generator, shared with the integration tests.
+///
+/// Declared beside `tests` because a path attribute inside an inline module resolves through a
+/// directory that does not exist.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use proptest::collection::vec;
     use proptest::prelude::*;
 
-    use super::{find_message_starts, find_message_starts_in_segments};
+    use super::{Parallelism, SEGMENT_LEN, common, find_message_starts, windows_with};
+
+    fn starts_in_segments(contents: &[u8], segment_len: usize) -> Vec<usize> {
+        windows_with(contents, segment_len, 1, Parallelism::Parallel)
+            .flatten()
+            .collect()
+    }
 
     fn line_by_line_reference(contents: &[u8]) -> Vec<usize> {
         let mut starts = Vec::new();
@@ -117,7 +196,7 @@ mod tests {
             segment_len in 1_usize..48,
         ) {
             prop_assert_eq!(
-                find_message_starts_in_segments(&contents, segment_len),
+                starts_in_segments(&contents, segment_len),
                 line_by_line_reference(&contents),
                 "the parallel scan finds the same starts as a line-by-line scan"
             );
@@ -134,7 +213,7 @@ mod tests {
             "the fixture has a separator at the segment boundary offset"
         );
         assert_eq!(
-            find_message_starts_in_segments(contents, boundary_line),
+            starts_in_segments(contents, boundary_line),
             vec![0, boundary_line],
             "the Python scanner dropped this message"
         );
@@ -154,6 +233,84 @@ mod tests {
         assert!(
             find_message_starts(b"").is_empty(),
             "empty input has no messages"
+        );
+    }
+
+    #[test]
+    fn reports_a_separator_that_starts_exactly_on_a_window_boundary_once() {
+        let contents = b"From a\nxx\nFrom b\nbody\n";
+        let window_boundary = 10;
+        assert_eq!(
+            windows_with(contents, 5, 2, Parallelism::Parallel)
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![0, window_boundary],
+            "a window boundary neither drops nor repeats the message"
+        );
+    }
+
+    #[test]
+    fn reports_a_separator_after_a_newline_that_opens_a_window_once() {
+        let contents = b"From a\nxxx\nFrom b\nbody\n";
+        assert_eq!(
+            windows_with(contents, 5, 2, Parallelism::Parallel)
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![0, 11],
+            "a newline that opens a window neither drops nor repeats the message"
+        );
+    }
+
+    #[test]
+    fn yields_one_window_per_group_of_segments_in_file_order() {
+        let contents = b"From a\nxx\nFrom b\nbody\nFrom c\n";
+        let windows: Vec<Vec<usize>> =
+            windows_with(contents, 8, 2, Parallelism::Parallel).collect();
+        assert_eq!(
+            windows,
+            vec![vec![0, 10], vec![22]],
+            "the first window holds the first two starts, the second the last"
+        );
+    }
+
+    #[test]
+    fn a_zero_segment_length_scans_one_byte_segments_like_a_length_of_one() {
+        let contents = b"From a\nx\nFrom b\ny\n";
+        let zero: Vec<Vec<usize>> = windows_with(contents, 0, 4, Parallelism::Parallel).collect();
+        let one: Vec<Vec<usize>> = windows_with(contents, 1, 4, Parallelism::Parallel).collect();
+        assert_eq!(zero, one, "zero is clamped to one, not read as no segments");
+        assert_eq!(
+            zero.concat(),
+            vec![0, 9],
+            "the clamped scan still finds both starts"
+        );
+    }
+
+    #[test]
+    fn small_windows_match_a_single_window_over_the_ten_thousand_message_fixture() {
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let spec = common::Spec::default();
+        let path = directory.path().join(common::file_name(&spec));
+        let summary = common::generate(&path, &spec).expect("the generator writes the fixture");
+        assert_eq!(
+            summary.messages, spec.messages,
+            "the fixture has the default message count"
+        );
+        let contents = fs::read(&path).expect("the fixture is readable");
+        let single_window: Vec<usize> =
+            windows_with(&contents, SEGMENT_LEN, usize::MAX, Parallelism::Parallel)
+                .flatten()
+                .collect();
+        let small_windows: Vec<Vec<usize>> =
+            windows_with(&contents, 1 << 20, 3, Parallelism::Parallel).collect();
+        assert!(
+            small_windows.len() > 1,
+            "the fixture spans several windows at this size"
+        );
+        assert_eq!(
+            small_windows.into_iter().flatten().collect::<Vec<_>>(),
+            single_window,
+            "window size does not change the starts"
         );
     }
 }
