@@ -18,9 +18,6 @@ use pyo3::types::PyCapsule;
 
 use crate::errors::into_py_err;
 
-/// Batches per Parquet row group.
-const ROW_GROUP_BATCHES: usize = 16;
-
 /// Chosen columns over a mailbox. Any Arrow consumer reads it directly (``pyarrow.table``,
 /// ``polars.DataFrame``, ``DuckDB``), and ``to_parquet`` writes it to a file. Each read extracts
 /// afresh, in parallel, parsing only what the columns need.
@@ -88,8 +85,7 @@ impl Selection {
             Overwrite::Refuse
         };
         let codec = parse_compression(compression)?;
-        let sink = ParquetExporter::new(codec)
-            .with_row_group_rows(self.batch_size.saturating_mul(ROW_GROUP_BATCHES));
+        let sink = ParquetExporter::new(codec).with_row_group_batches(self.batch_size);
         let export = Export::new(
             Arc::clone(&self.pipeline),
             Arc::clone(&self.mailbox),

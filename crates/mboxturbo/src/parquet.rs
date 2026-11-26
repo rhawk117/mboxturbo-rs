@@ -15,6 +15,8 @@ use crate::width::widen;
 
 /// Rows per row group: 16 batches of the default 8192.
 const ROW_GROUP_ROWS: usize = 0x0002_0000;
+/// Batches per row group when the row group is sized from the batch size.
+const ROW_GROUP_BATCHES: usize = 16;
 
 /// Writes the exported columns as one Parquet file.
 ///
@@ -54,6 +56,13 @@ impl ParquetExporter {
             row_group_rows: ROW_GROUP_ROWS,
             writer: None,
         }
+    }
+
+    /// The same sink with row groups of 16 batches of `batch_size` rows each, so a row group
+    /// closes on a batch boundary.
+    #[must_use]
+    pub fn with_row_group_batches(self, batch_size: usize) -> Self {
+        self.with_row_group_rows(batch_size.saturating_mul(ROW_GROUP_BATCHES))
     }
 
     /// The same sink with row groups of at most `rows` rows (at least one); the default is

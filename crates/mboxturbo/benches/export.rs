@@ -8,11 +8,6 @@
 //! `MBOXTURBO_BENCH_MESSAGES` and `MBOXTURBO_BENCH_SEED` override its defaults of one million
 //! messages and seed 1. Each row is the median of `RUNS` passes, in milliseconds per pass.
 
-#[path = "../tests/common/mod.rs"]
-#[expect(
-    clippy::missing_docs_in_private_items,
-    reason = "the generator is shared with the integration tests, where the lint does not reach it"
-)]
 mod common;
 
 // ab:api begin (scripts/bench-ab.sh swaps this block for scripts/ab/export_main.rs)
@@ -68,15 +63,13 @@ mod api {
 }
 // ab:api end
 
-use std::env::{self, VarError};
-use std::error::Error;
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::Outcome;
 use mboxturbo::{Column, Compression, Mailbox, Pipeline};
 
 /// Messages in the fixture when `MBOXTURBO_BENCH_MESSAGES` is unset.
@@ -89,95 +82,6 @@ const BATCH_SIZE: usize = 8192;
 const MEDIAN_RUN: usize = 2;
 /// Passes timed per row.
 const RUNS: usize = 5;
-
-/// Result of a bench step.
-type Outcome<T> = Result<T, Box<dyn Error>>;
-
-/// Reads `name` as a number, or `default` when it is unset.
-fn env_number(name: &str, default: u64) -> Outcome<u64> {
-    match env::var(name) {
-        Ok(text) => Ok(text.parse()?),
-        Err(VarError::NotPresent) => Ok(default),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Directory holding the fixture and the temporary export.
-fn bench_directory() -> Outcome<PathBuf> {
-    match env::var_os("MBOXTURBO_BENCH_DIR") {
-        Some(directory) => Ok(directory.into()),
-        None => match env::var_os("CARGO_TARGET_DIR") {
-            Some(directory) => Ok(directory.into()),
-            None => Ok(PathBuf::from(env::var("CARGO_MANIFEST_DIR")?)
-                .join("..")
-                .join("..")
-                .join("target")),
-        },
-    }
-}
-
-/// `path` with `suffix` appended to its file name, in the same directory.
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// The byte count recorded beside the fixture at `path`, or `None` when no record exists or it is
-/// not a number, which makes the fixture untrusted.
-fn recorded_length(path: &Path) -> Outcome<Option<u64>> {
-    match fs::read_to_string(sibling(path, ".len")) {
-        Ok(text) => text
-            .trim()
-            .parse()
-            .map_or_else(|_| Ok(None), |bytes| Ok(Some(bytes))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// The length of the fixture at `path` when it exists and matches its recorded byte count.
-fn reusable_length(path: &Path) -> Outcome<Option<u64>> {
-    let actual = match fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    Ok((recorded_length(path)? == Some(actual)).then_some(actual))
-}
-
-/// Generates the fixture to a partial file and renames it to `path`, so a killed run leaves
-/// nothing at `path`, then records its byte count beside it.
-fn generate_atomically(path: &Path, spec: &common::Spec) -> Outcome<common::Summary> {
-    let length_path = sibling(path, ".len");
-    match fs::remove_file(&length_path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-        _ => {},
-    }
-    let partial = sibling(path, ".partial");
-    let summary = common::generate(&partial, spec)?;
-    fs::rename(&partial, path)?;
-    fs::write(&length_path, summary.bytes.to_string())?;
-    Ok(summary)
-}
-
-/// The fixture path for `spec` under `directory`, generated unless one of its recorded length
-/// already exists.
-fn ensure_fixture(directory: &Path, spec: &common::Spec) -> Outcome<PathBuf> {
-    fs::create_dir_all(directory)?;
-    let path = directory.join(common::file_name(spec));
-    if reusable_length(&path)?.is_none() {
-        let summary = generate_atomically(&path, spec)?;
-        writeln!(
-            io::stdout().lock(),
-            "generated {} ({} messages, {} bytes)",
-            path.display(),
-            summary.messages,
-            summary.bytes
-        )?;
-    }
-    Ok(path)
-}
 
 /// Times `RUNS` calls of `pass` and returns the median.
 ///
@@ -219,11 +123,11 @@ fn report(name: &str, expected: u64, pass: impl FnMut() -> Outcome<u64>) -> Outc
 /// Times the select, the Parquet exports and the copy over the fixture and prints their rows.
 fn main() -> Outcome<()> {
     let spec = common::Spec {
-        messages: env_number("MBOXTURBO_BENCH_MESSAGES", DEFAULT_MESSAGES)?,
-        seed: env_number("MBOXTURBO_BENCH_SEED", DEFAULT_SEED)?,
+        messages: common::env_number("MBOXTURBO_BENCH_MESSAGES", DEFAULT_MESSAGES)?,
+        seed: common::env_number("MBOXTURBO_BENCH_SEED", DEFAULT_SEED)?,
     };
-    let directory = bench_directory()?;
-    let path = ensure_fixture(&directory, &spec)?;
+    let directory = common::bench_directory()?;
+    let path = common::ensure_fixture(&directory, &spec)?;
     let mailbox = Arc::new(Mailbox::open(&path)?);
     let pipeline = Arc::new(Pipeline::new(Column::defaults(), BATCH_SIZE));
     let scratch = tempfile::tempdir_in(&directory)?;

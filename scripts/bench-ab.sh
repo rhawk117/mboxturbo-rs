@@ -63,6 +63,9 @@ log::step "Extracting ${REF}"
 mkdir "${WORK}/ref"
 git -C "${ROOT}" archive "${REF}" | tar -x -C "${WORK}/ref"
 BENCH_SRC=crates/mboxturbo/benches/export.rs
+BENCH_COMMON=crates/mboxturbo/benches/common
+mkdir -p "${WORK}/ref/${BENCH_COMMON}"
+cp "${ROOT}/${BENCH_COMMON}/mod.rs" "${WORK}/ref/${BENCH_COMMON}/mod.rs"
 if git -C "${ROOT}" cat-file -e "${REF}:crates/mboxturbo/src/export.rs" 2>/dev/null; then
   cp "${ROOT}/${BENCH_SRC}" "${WORK}/ref/${BENCH_SRC}"
 else
