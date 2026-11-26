@@ -8,8 +8,10 @@
 
 mod caps;
 mod issue;
+mod tokenize;
 
 pub use caps::{
     Cap, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES, MAX_RECEIVED_HOPS,
 };
 pub use issue::{Issue, IssueKind, Parsed};
+pub use tokenize::{Token, TokenKind, tokenize};

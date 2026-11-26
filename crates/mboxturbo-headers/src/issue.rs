@@ -13,6 +13,10 @@ pub enum IssueKind {
     },
     /// Input was not valid UTF-8 where text was expected; the bytes were decoded lossily.
     InvalidUtf8,
+    /// A parenthesised comment was still open at the end of the value.
+    UnterminatedComment,
+    /// A quoted string was still open at the end of the value.
+    UnterminatedQuote,
 }
 
 /// One problem found while parsing, located by byte offset.
