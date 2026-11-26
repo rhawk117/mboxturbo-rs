@@ -22,6 +22,10 @@ pub enum IssueKind {
     /// An encoded word decoded to bytes that are not valid in its charset; they became
     /// U+FFFD.
     MalformedBytes,
+    /// An `Authentication-Results` value had a structure the grammar does not allow, such as a
+    /// result with no `=`, a missing authserv-id or a non-numeric version; the entry or pair
+    /// at the offset was skipped.
+    MalformedEntry,
     /// A date field was outside its range: a leap second (60) was clamped to 59 and any other
     /// out-of-range field made the date unparsable.
     OutOfRange,

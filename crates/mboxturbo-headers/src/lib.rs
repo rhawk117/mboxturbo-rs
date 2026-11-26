@@ -6,6 +6,7 @@
 //! problem starts. Input that exceeds one of the caps, such as [`MAX_HEADER_BYTES`], is
 //! truncated or skipped and reported as [`IssueKind::CapExceeded`].
 
+mod auth_results;
 mod caps;
 mod date;
 mod encoded_word;
@@ -13,6 +14,10 @@ mod issue;
 mod tokenize;
 mod trust;
 
+pub use auth_results::{
+    AuthMethod, AuthProperty, AuthResult, AuthenticationResults, ResInfo, TrustStatus,
+    parse_authentication_results,
+};
 pub use caps::{
     Cap, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES, MAX_RECEIVED_HOPS,
 };
