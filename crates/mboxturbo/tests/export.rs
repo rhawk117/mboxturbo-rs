@@ -18,6 +18,7 @@ mod export {
         MboxTurboError, Output, Overwrite, ParquetExporter, Pipeline, Progress, Selection, Staged,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::metadata::RowGroupMetaData;
     use tempfile::TempDir;
 
     const MESSAGES: usize = 7;
@@ -220,24 +221,7 @@ mod export {
         }
 
         fn new() -> Self {
-            let input = tempfile::tempdir().expect("input directory creates");
-            let mut contents = String::new();
-            for position in 0..MESSAGES {
-                write!(
-                    contents,
-                    "From a@example.com Mon Jan  1 00:00:00 2024\nSubject: message {position}\n\n\
-                     body {position}\n\n"
-                )
-                .expect("a string accepts formatted text");
-            }
-            let path = input.path().join("inbox.mbox");
-            fs::write(&path, contents).expect("fixture mbox is written");
-            Self {
-                mailbox: Arc::new(Mailbox::open(&path).expect("fixture mbox opens")),
-                _input: input,
-                output: tempfile::tempdir().expect("output directory creates"),
-                pipeline: Arc::new(Pipeline::new(vec![Column::Raw], BATCH_SIZE)),
-            }
+            Self::with_messages(MESSAGES)
         }
 
         fn raw_messages(&self) -> Vec<Vec<u8>> {
@@ -253,6 +237,28 @@ mod export {
 
         fn target(&self) -> PathBuf {
             self.output.path().join("target")
+        }
+
+        /// A mailbox of `messages` numbered messages, exported in batches of `BATCH_SIZE`.
+        fn with_messages(messages: usize) -> Self {
+            let input = tempfile::tempdir().expect("input directory creates");
+            let mut contents = String::new();
+            for position in 0..messages {
+                write!(
+                    contents,
+                    "From a@example.com Mon Jan  1 00:00:00 2024\nSubject: message {position}\n\n\
+                     body {position}\n\n"
+                )
+                .expect("a string accepts formatted text");
+            }
+            let path = input.path().join("inbox.mbox");
+            fs::write(&path, contents).expect("fixture mbox is written");
+            Self {
+                mailbox: Arc::new(Mailbox::open(&path).expect("fixture mbox opens")),
+                _input: input,
+                output: tempfile::tempdir().expect("output directory creates"),
+                pipeline: Arc::new(Pipeline::new(vec![Column::Raw], BATCH_SIZE)),
+            }
         }
     }
 
@@ -588,6 +594,33 @@ mod export {
             summary.bytes,
             count(written.len()),
             "the reported bytes are the streamed buffer's length"
+        );
+    }
+
+    #[test]
+    fn parquet_row_groups_hold_sixteen_batches_of_the_given_batch_size() {
+        let fixture = Fixture::with_messages(70);
+        let _summary = fixture
+            .export(Destination::File(fixture.target()))
+            .run(Box::new(
+                ParquetExporter::new(Compression::Uncompressed).with_row_group_batches(BATCH_SIZE),
+            ))
+            .expect("the parquet export succeeds");
+
+        let file = File::open(fixture.target()).expect("exported parquet file opens");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet footer is readable");
+        let rows: Vec<i64> = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(RowGroupMetaData::num_rows)
+            .collect();
+        // mboxturbo-py's Selection.to_parquet sizes its row groups through this rule
+        assert_eq!(
+            rows,
+            [32, 32, 6],
+            "a row group closes after 16 batches of 2 rows and the last holds the rest"
         );
     }
 
