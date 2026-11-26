@@ -12,7 +12,8 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::{iter, thread};
 
 use arrow_array::builder::{
-    Int32Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, UInt64Builder,
+    Int32Builder, LargeBinaryBuilder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
+    UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
@@ -78,6 +79,8 @@ struct Record<'mail> {
     mail: Option<&'mail Mail<'mail>>,
     /// Zero-based index of the message in the mailbox.
     position: usize,
+    /// The message's stored bytes, separator line included.
+    raw: &'mail [u8],
     /// Byte range of the message in the mailbox file.
     span: Range<usize>,
 }
@@ -154,6 +157,7 @@ impl Pipeline {
             let parsed = self.parse(raw);
             let record = Record {
                 position,
+                raw,
                 span,
                 mail: parsed.as_ref(),
             };
@@ -318,6 +322,8 @@ enum Slot {
     Offset(UInt64Builder),
     /// Message index.
     Position(UInt64Builder),
+    /// The message's stored bytes, separator line included.
+    Raw(LargeBinaryBuilder),
     /// Message length in bytes.
     Size(UInt64Builder),
     /// Decoded subject, null when absent.
@@ -420,6 +426,7 @@ impl Slot {
             Self::Position(builder) => builder.append_value(widen(record.position)),
             Self::Offset(builder) => builder.append_value(widen(record.span.start)),
             Self::Size(builder) => builder.append_value(widen(record.span.len())),
+            Self::Raw(builder) => builder.append_value(record.raw),
             Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
             Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
             Self::Date(builder) => builder.append_option(date_micros(mail)),
@@ -441,6 +448,7 @@ impl Slot {
             Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
                 Arc::new(builder.finish())
             },
+            Self::Raw(builder) => Arc::new(builder.finish()),
             Self::Addresses(_, builder) | Self::HeaderValues(_, builder) => {
                 Arc::new(builder.finish())
             },
@@ -474,6 +482,7 @@ impl Slot {
             Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
             Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
             Column::Size => Self::Size(UInt64Builder::with_capacity(rows)),
+            Column::Raw => Self::Raw(LargeBinaryBuilder::new()),
             Column::From => addresses(AddressHeader::From),
             Column::To => addresses(AddressHeader::To),
             Column::Cc => addresses(AddressHeader::Cc),
@@ -557,6 +566,7 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         Column::Position
         | Column::Offset
         | Column::Size
+        | Column::Raw
         | Column::Received
         | Column::AuthenticationResults
         | Column::ReceivedSpf
@@ -794,6 +804,10 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert!(
             matches!(depth_for(&[Column::Position, Column::Size]), Depth::Nothing),
             "no message is parsed"
+        );
+        assert!(
+            matches!(depth_for(&[Column::Raw]), Depth::Nothing),
+            "raw alone parses no message"
         );
     }
 

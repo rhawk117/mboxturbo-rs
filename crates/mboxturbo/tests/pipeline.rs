@@ -105,6 +105,29 @@ AAEC\n\
     }
 
     #[test]
+    fn the_raw_column_holds_each_messages_stored_bytes_as_large_binary() {
+        let (fixture, batch) = header_batch(&[Column::Raw]);
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &arrow_schema::DataType::LargeBinary,
+            "raw uses 64-bit offsets"
+        );
+        let cells = batch.column(0).as_binary::<i64>();
+        assert_eq!(
+            batch.num_rows(),
+            fixture.mailbox.len(),
+            "one cell per message"
+        );
+        for position in 0..fixture.mailbox.len() {
+            assert_eq!(
+                Some(cells.value(position)),
+                fixture.mailbox.raw(position),
+                "raw cell {position} equals Mailbox::raw, separator line included"
+            );
+        }
+    }
+
+    #[test]
     fn the_subject_column_lists_each_subject_in_mailbox_order() {
         let (_fixture, batch) = header_batch(&[Column::Subject]);
         let subjects: Vec<_> = batch
