@@ -9,6 +9,7 @@ use std::time::Duration;
 use tempfile::{NamedTempFile, TempDir};
 
 use crate::error::MboxTurboError;
+use crate::export::DestinationKind;
 
 /// Name of the previous output inside its set-aside holder directory.
 const SET_ASIDE: &str = "previous";
@@ -224,6 +225,21 @@ impl Staged {
     #[must_use]
     pub fn target_label(&self) -> &Path {
         self.target().unwrap_or_else(|| Path::new(STREAM_LABEL))
+    }
+
+    /// The refusal a sink returns when handed an output kind it does not accept: an
+    /// [`MboxTurboError::UnsupportedDestination`] naming the staged kind and its target.
+    #[must_use]
+    pub fn unsupported(&self) -> MboxTurboError {
+        let kind = match self.kind {
+            Kind::Directory(_) => DestinationKind::Directory,
+            Kind::File(_) => DestinationKind::File,
+            Kind::Stream(_) => DestinationKind::Stream,
+        };
+        MboxTurboError::UnsupportedDestination {
+            kind,
+            target: self.target.clone(),
+        }
     }
 }
 

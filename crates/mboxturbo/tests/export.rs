@@ -53,7 +53,7 @@ mod export {
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
             let Output::Directory(directory) = staged.output() else {
-                return Ok(0);
+                return Err(staged.unsupported());
             };
             let mut bytes = 0_u64;
             for raw in batch.column(0).as_binary::<i64>().iter().flatten() {
@@ -93,7 +93,7 @@ mod export {
         ) -> Result<u64, MboxTurboError> {
             let target = staged.target_label().to_path_buf();
             let Output::Writer(writer) = staged.output() else {
-                return Ok(0);
+                return Err(staged.unsupported());
             };
             let mut bytes = 0_u64;
             for raw in batch.column(0).as_binary::<i64>().iter().flatten() {
@@ -533,6 +533,31 @@ mod export {
             summary.bytes,
             count(file.len()),
             "the reported bytes are the committed file's length"
+        );
+    }
+
+    #[test]
+    fn a_parquet_sink_handed_a_directory_refuses_it_instead_of_writing_nothing() {
+        let (fixture, expected) = default_columns_fixture();
+        let batch = expected.first().expect("the pipeline yields a batch");
+        let mut staged = Destination::Directory(fixture.target())
+            .stage(Overwrite::Refuse)
+            .expect("a directory destination stages");
+        let mut sink = ParquetExporter::new(Compression::Zstd);
+        sink.begin(batch.schema_ref(), &mut staged)
+            .expect("the encoder starts without touching the output");
+
+        let refusal = sink.write(batch, &mut staged);
+
+        assert!(
+            matches!(
+                refusal,
+                Err(MboxTurboError::UnsupportedDestination {
+                    kind: DestinationKind::Directory,
+                    target: Some(_),
+                })
+            ),
+            "a directory is refused with its kind and target, not reported as zero bytes"
         );
     }
 

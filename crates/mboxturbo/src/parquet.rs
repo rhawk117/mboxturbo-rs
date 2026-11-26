@@ -105,8 +105,8 @@ fn drain(writer: &mut ArrowWriter<Vec<u8>>, staged: &mut Staged) -> Result<u64, 
     let pending = writer.inner_mut();
     let bytes = widen(pending.len());
     let Output::Writer(destination) = staged.output() else {
-        // `accepts` refused directory destinations, so the driver never stages one for this sink
-        return Ok(0);
+        // `accepts` refuses directory destinations, so the driver never stages one for this sink
+        return Err(staged.unsupported());
     };
     let written = destination.write_all(pending);
     written.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
