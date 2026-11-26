@@ -68,8 +68,25 @@ impl Selection {
     }
 
     /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
-    #[pyo3(signature = (path, *, compression = "zstd"))]
-    fn to_parquet(&self, py: Python<'_>, path: PathBuf, compression: &str) -> PyResult<u64> {
+    /// An existing file raises ``FileExistsError`` and is left untouched unless ``overwrite`` is
+    /// true. The GIL is released while exporting.
+    #[pyo3(signature = (path, *, compression = "zstd", overwrite = false))]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Python's `overwrite=` keyword is a bool by the requested interface"
+    )]
+    fn to_parquet(
+        &self,
+        py: Python<'_>,
+        path: PathBuf,
+        compression: &str,
+        overwrite: bool,
+    ) -> PyResult<u64> {
+        let policy = if overwrite {
+            Overwrite::Replace
+        } else {
+            Overwrite::Refuse
+        };
         let codec = parse_compression(compression)?;
         let sink = ParquetExporter::new(codec)
             .with_row_group_rows(self.batch_size.saturating_mul(ROW_GROUP_BATCHES));
@@ -78,7 +95,7 @@ impl Selection {
             Arc::clone(&self.mailbox),
             Destination::File(path),
         )
-        .overwrite(Overwrite::Replace);
+        .overwrite(policy);
         py.detach(move || export.run(Box::new(sink)).map_err(Box::new))
             .map(|summary| summary.messages)
             .map_err(|error| into_py_err(py, *error))
