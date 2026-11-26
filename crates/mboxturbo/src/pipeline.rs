@@ -2,7 +2,6 @@
 //! record batches, and stream them to a consumer or a Parquet file.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::fs::File;
 use std::ops::Range;
 use std::panic::resume_unwind;
@@ -22,7 +21,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use rayon::prelude::*;
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
@@ -34,6 +32,11 @@ use crate::fields::{
 use crate::mailbox::Mailbox;
 use crate::selection::{Plan, Selection};
 use crate::width::widen;
+
+#[path = "stream.rs"]
+mod stream;
+
+use stream::Ordered;
 
 /// Parquet page compression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,17 +89,18 @@ struct Record<'mail> {
     span: Range<usize>,
 }
 
-/// Batches over a selection of a mailbox, produced a window at a time on all rayon threads.
+/// Batches over a selection of a mailbox, extracted on all rayon threads and handed over in
+/// selection order as soon as each is ready.
 #[derive(Debug)]
 pub struct BatchReader {
     /// Mailbox being read.
     mailbox: Arc<Mailbox>,
-    /// Plan that decides columns, schema and batch size.
+    /// Pipeline that decides columns, schema and batch size.
     pipeline: Arc<Pipeline>,
     /// The selected positions not yet scheduled for extraction.
     plan: Plan,
-    /// Extracted batches, in mailbox order, awaiting delivery.
-    ready: VecDeque<Result<RecordBatch, MboxTurboError>>,
+    /// Batches scheduled or extracted, in selection order, awaiting delivery.
+    stream: Ordered<Result<RecordBatch, MboxTurboError>>,
 }
 
 impl Pipeline {
@@ -220,7 +224,7 @@ impl Pipeline {
             pipeline: Arc::clone(self),
             mailbox: Arc::clone(mailbox),
             plan: Plan::whole(mailbox.len()),
-            ready: VecDeque::new(),
+            stream: Ordered::new(),
         }
     }
 
@@ -246,21 +250,8 @@ impl Pipeline {
             pipeline: Arc::clone(self),
             mailbox: Arc::clone(mailbox),
             plan: selection.plan(mailbox.len())?,
-            ready: VecDeque::new(),
+            stream: Ordered::new(),
         })
-    }
-
-    /// Takes from `plan` the span of positions that all threads can work on at once (two batches
-    /// per thread) as batches of positions. Empty when `plan` is exhausted; the last batch may be
-    /// shorter than the batch size.
-    fn window(&self, plan: &mut Plan) -> Vec<Vec<Range<usize>>> {
-        let batches = rayon::current_num_threads().saturating_mul(2);
-        (0..batches)
-            .map_while(|_| {
-                let runs = plan.take(self.batch_size);
-                (!runs.is_empty()).then_some(runs)
-            })
-            .collect()
     }
 
     /// Writes every batch to a Parquet file at `path`, atomically, while the next batches are
@@ -303,20 +294,31 @@ impl Pipeline {
 }
 
 impl BatchReader {
-    /// The next batch, keeping the typed error so callers can read the positions it covers.
-    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
-        if self.ready.is_empty() {
-            let window = self.pipeline.window(&mut self.plan);
+    /// Schedules batches until about two per rayon thread are in flight or the plan runs out,
+    /// asking the kernel to read the batch after each one in the background.
+    fn fill(&mut self) {
+        let in_flight = rayon::current_num_threads().saturating_mul(2);
+        while self.stream.in_flight() < in_flight {
+            let runs = self.plan.take(self.pipeline.batch_size);
+            if runs.is_empty() {
+                break;
+            }
             for ahead in self.plan.clone().take(self.pipeline.batch_size) {
                 self.mailbox.prefetch(ahead);
             }
-            let extracted: Vec<_> = window
-                .into_par_iter()
-                .map(|runs| self.pipeline.extract_runs(&self.mailbox, &runs))
-                .collect();
-            self.ready.extend(extracted);
+            let pipeline = Arc::clone(&self.pipeline);
+            let mailbox = Arc::clone(&self.mailbox);
+            self.stream
+                .submit(move || pipeline.extract_runs(&mailbox, &runs));
         }
-        self.ready.pop_front()
+    }
+
+    /// The next batch, keeping the typed error so callers can read the positions it covers.
+    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
+        self.fill();
+        let batch = self.stream.next();
+        self.fill();
+        batch
     }
 
     /// The number of messages the selection yields in total, whatever has been read so far.

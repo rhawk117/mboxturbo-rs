@@ -375,6 +375,102 @@ AAEC\n\
         );
     }
 
+    fn numbered_mailbox(count: usize) -> Fixture {
+        let contents = (0..count)
+            .map(|index| format!("From x Mon Jan  1 00:00:00 2024\nSubject: s{index}\n\nb\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        Fixture::with(&contents)
+    }
+
+    /// The (position, subject) pair of every row of a two-column position and subject batch.
+    fn rows(batch: &RecordBatch) -> Vec<(u64, String)> {
+        let positions = batch.column(0).as_primitive::<UInt64Type>();
+        let subjects = batch.column(1).as_string::<i32>();
+        (0..batch.num_rows())
+            .map(|row| (positions.value(row), subjects.value(row).to_owned()))
+            .collect()
+    }
+
+    /// The positions each selection yields, flattened, for a mailbox of `count` messages.
+    fn selections(count: usize) -> Vec<(Selection, Vec<usize>)> {
+        let positions = vec![count - 1, 3, 3, 0, 7, 8, 9, 2, 1];
+        let ranges = vec![5..12, 0..0, 20..count, 2..4, 12..5];
+        let flat_ranges = ranges.iter().cloned().flatten().collect();
+        vec![
+            (Selection::All, (0..count).collect()),
+            (Selection::Positions(positions.clone()), positions),
+            (Selection::Ranges(ranges), flat_ranges),
+        ]
+    }
+
+    #[test]
+    fn a_reader_yields_the_batches_single_batch_extraction_gives_at_any_threads_and_batch_size() {
+        let count = 37;
+        let fixture = numbered_mailbox(count);
+        let columns = [Column::Position, Column::Subject];
+        for threads in [1, 2, 5] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test thread pool builds");
+            for batch_size in [1, 3, 8, 100] {
+                let pipeline = Arc::new(Pipeline::new(columns.to_vec(), batch_size));
+                for (selection, expected) in selections(count) {
+                    let batches: Vec<Vec<(u64, String)>> = pool.install(|| {
+                        pipeline
+                            .select(&fixture.mailbox, selection)
+                            .expect("the selection is within the mailbox")
+                            .map(|batch| rows(&batch.expect("every batch is assembled")))
+                            .collect()
+                    });
+                    let wanted: Vec<Vec<(u64, String)>> = expected
+                        .chunks(batch_size)
+                        .map(|chunk| {
+                            chunk
+                                .iter()
+                                .flat_map(|&position| {
+                                    rows(
+                                        &pipeline
+                                            .extract(&fixture.mailbox, position..position + 1)
+                                            .expect("one message is extracted"),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    assert_eq!(
+                        batches, wanted,
+                        "{threads} threads, batch size {batch_size}: batches match extraction"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_reader_part_way_returns_and_leaves_the_pool_usable() {
+        let fixture = numbered_mailbox(200);
+        let pipeline = Arc::new(Pipeline::new(vec![Column::Subject], 2));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("test thread pool builds");
+        let first = pool.install(|| {
+            let mut reader = pipeline.reader(&fixture.mailbox);
+            reader
+                .next()
+                .expect("a batch exists")
+                .expect("it is assembled")
+        });
+        assert_eq!(first.num_rows(), 2, "the first batch holds batch-size rows");
+        assert_eq!(
+            pool.install(|| 1 + 1),
+            2,
+            "the pool still runs work after the reader was dropped"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
