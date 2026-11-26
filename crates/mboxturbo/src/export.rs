@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::SchemaRef;
 
 use crate::error::MboxTurboError;
 use crate::mailbox::Mailbox;
 use crate::pipeline::{BatchReader, Pipeline};
 use crate::selection::Selection;
 use crate::staging::{Destination, ExportSummary, Overwrite, Staged};
+use crate::width::widen;
 
 /// The kind of place an export writes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,26 +292,6 @@ struct Run {
 }
 
 impl Run {
-    /// An Arrow failure at the first message not yet written.
-    fn arrow_error(&self, source: ArrowError) -> MboxTurboError {
-        let next = position(self.done);
-        MboxTurboError::Arrow {
-            positions: next..next,
-            source,
-        }
-    }
-
-    /// Recovers the typed error the batch reader wrapped in an Arrow error.
-    fn batch_error(&self, error: ArrowError) -> MboxTurboError {
-        let ArrowError::ExternalError(inner) = error else {
-            return self.arrow_error(error);
-        };
-        match inner.downcast::<MboxTurboError>() {
-            Ok(typed) => *typed,
-            Err(other) => self.arrow_error(ArrowError::ExternalError(other)),
-        }
-    }
-
     /// Fails with [`MboxTurboError::Cancelled`] once the token is cancelled.
     fn check_cancelled(&self) -> Result<(), MboxTurboError> {
         let cancelled = self.cancel.as_ref().is_some_and(CancelToken::is_cancelled);
@@ -327,11 +308,10 @@ impl Run {
     fn drain(&mut self) -> Result<(), MboxTurboError> {
         loop {
             self.check_cancelled()?;
-            let Some(batch) = self.reader.next() else {
+            let Some(batch) = self.reader.next_batch() else {
                 return Ok(());
             };
-            let decoded = batch.map_err(|error| self.batch_error(error))?;
-            self.write(&decoded)?;
+            self.write(&batch?)?;
         }
     }
 
@@ -339,32 +319,14 @@ impl Run {
     fn write(&mut self, batch: &RecordBatch) -> Result<(), MboxTurboError> {
         let written = self.exporter.write(batch, &mut self.staged)?;
         self.bytes = self.bytes.saturating_add(written);
-        self.done = self.done.saturating_add(count(batch.num_rows()));
+        self.done = self.done.saturating_add(widen(batch.num_rows()));
         if let Some(hook) = &mut self.progress {
             hook(Progress {
                 bytes: self.bytes,
                 messages: self.done,
-                total: count(self.reader.total()),
+                total: widen(self.reader.total()),
             });
         }
         Ok(())
     }
-}
-
-/// A row count as `u64`, saturating on a platform where `usize` is wider.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "saturating is the right answer on a hypothetical wider usize"
-)]
-fn count(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-/// A message count as a position, saturating on a platform where `usize` is narrower.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "saturating is the right answer on a narrower usize"
-)]
-fn position(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
 }

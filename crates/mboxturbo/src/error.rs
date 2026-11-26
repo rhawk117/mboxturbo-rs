@@ -73,7 +73,7 @@ pub enum MboxTurboError {
     /// Extracted columns could not be assembled into an Arrow batch.
     #[error("cannot assemble an Arrow batch for messages {}..{}", positions.start, positions.end)]
     Arrow {
-        /// The message positions the failed batch covered, clamped to those that exist.
+        /// The smallest range covering the failed batch's positions, clamped to those that exist.
         positions: Range<usize>,
         /// The Arrow failure.
         #[source]

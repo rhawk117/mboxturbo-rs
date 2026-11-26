@@ -255,7 +255,7 @@ impl BatchReader {
     }
 
     /// The next batch, keeping the typed error so callers can read the positions it covers.
-    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
+    pub(crate) fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
         self.fill();
         let batch = self.stream.next();
         self.fill();

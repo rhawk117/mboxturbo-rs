@@ -14,6 +14,7 @@ use crate::error::MboxTurboError;
 use crate::export::{DestinationKind, Exporter};
 use crate::pipeline::Compression;
 use crate::staging::Staged;
+use crate::width::widen;
 
 /// Rows per row group: 16 batches of the default 8192.
 const ROW_GROUP_ROWS: usize = 0x0002_0000;
@@ -108,7 +109,7 @@ impl Exporter for ParquetExporter {
 /// Moves the bytes the encoder has finished into the staged destination and returns how many.
 fn drain(writer: &mut ArrowWriter<Vec<u8>>, staged: &mut Staged) -> Result<u64, MboxTurboError> {
     let pending = writer.inner_mut();
-    let bytes = count(pending.len());
+    let bytes = widen(pending.len());
     let target = staged.target().map(ToOwned::to_owned);
     let path = target.as_deref().unwrap_or_else(|| Path::new(STREAM));
     let Some(destination) = staged.writer() else {
@@ -122,15 +123,6 @@ fn drain(writer: &mut ArrowWriter<Vec<u8>>, staged: &mut Staged) -> Result<u64, 
         .map_err(|source| MboxTurboError::io(path, source))?;
     pending.clear();
     Ok(bytes)
-}
-
-/// A byte count as `u64`, saturating on a platform where `usize` is wider.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "saturating is the right answer on a hypothetical wider usize"
-)]
-fn count(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// Maps the public [`Compression`] choice to the Parquet writer's codec (Zstd at its default
