@@ -1,6 +1,6 @@
 //! The Python exception hierarchy and the mapping from core errors onto it.
 
-use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::exceptions::{PyException, PyFileExistsError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::{create_exception, intern};
 
@@ -24,7 +24,8 @@ create_exception!(
 );
 
 /// The Python exception for a core error: `OSError` (with `filename`) for I/O, the matching
-/// `MboxTurboError` subclass for a damaged or stale index, the base class otherwise (Arrow,
+/// `MboxTurboError` subclass for a damaged or stale index, `FileExistsError` (with `filename`)
+/// for an existing export target, the base class otherwise (Arrow,
 /// Parquet and out-of-range position errors included).
 #[expect(
     clippy::match_same_arms,
@@ -38,11 +39,17 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> P
             let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
             tagged.err().unwrap_or(raised)
         },
+        mboxturbo::MboxTurboError::TargetExists { path } => {
+            let raised = PyFileExistsError::new_err(message);
+            let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
+            tagged.err().unwrap_or(raised)
+        },
         mboxturbo::MboxTurboError::CorruptIndex { .. } => CorruptIndexError::new_err(message),
         mboxturbo::MboxTurboError::StaleIndex { .. } => StaleIndexError::new_err(message),
         // Naming each variant that raises the base class keeps
         // `clippy::wildcard_enum_match_arm` quiet for the wildcard below.
         mboxturbo::MboxTurboError::Arrow { .. }
+        | mboxturbo::MboxTurboError::Cancelled { .. }
         | mboxturbo::MboxTurboError::Parquet { .. }
         | mboxturbo::MboxTurboError::PositionOutOfRange { .. } => MboxTurboError::new_err(message),
         // The Python API is frozen (plan invariant I2): the non-exhaustive remainder raises the

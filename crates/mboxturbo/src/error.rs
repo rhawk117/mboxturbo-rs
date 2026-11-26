@@ -78,6 +78,14 @@ pub enum MboxTurboError {
         #[source]
         source: arrow_schema::ArrowError,
     },
+    /// An export was cancelled before it finished.
+    #[error("export to {} cancelled after {written} messages", target_label(target.as_deref()))]
+    Cancelled {
+        /// The file or directory being written; `None` for a stream.
+        target: Option<PathBuf>,
+        /// Messages written before the export stopped.
+        written: u64,
+    },
     /// The index file is damaged or is not an mboxturbo index.
     #[error("index file {} is corrupt: {corruption}", path.display())]
     CorruptIndex {
@@ -119,6 +127,12 @@ pub enum MboxTurboError {
         /// The rejected index file.
         path: PathBuf,
     },
+    /// The export target already exists and overwriting was not requested.
+    #[error("export target {} already exists", path.display())]
+    TargetExists {
+        /// The existing file or directory.
+        path: PathBuf,
+    },
 }
 
 impl MboxTurboError {
@@ -136,4 +150,9 @@ impl MboxTurboError {
             source,
         }
     }
+}
+
+/// The target of a cancelled export as the message names it; a stream has no path.
+fn target_label(target: Option<&Path>) -> String {
+    target.map_or_else(|| "a stream".to_owned(), |path| path.display().to_string())
 }
