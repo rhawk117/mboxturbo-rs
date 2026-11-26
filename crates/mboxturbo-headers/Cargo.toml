@@ -1,0 +1,15 @@
+[package]
+name = "mboxturbo-headers"
+description = "Total, panic-free parsers for email header values that report malformed input as issues"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true

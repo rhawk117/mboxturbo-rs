@@ -1,0 +1,15 @@
+//! Total parsers for email header values.
+//!
+//! Every parser in this crate takes the bytes of one header value and returns a [`Parsed`]:
+//! the best value that could be recovered plus the [`Issue`]s found on the way. Malformed
+//! input is never a panic and never an error; it is an issue with the byte offset where the
+//! problem starts. Input that exceeds one of the caps, such as [`MAX_HEADER_BYTES`], is
+//! truncated or skipped and reported as [`IssueKind::CapExceeded`].
+
+mod caps;
+mod issue;
+
+pub use caps::{
+    Cap, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES, MAX_RECEIVED_HOPS,
+};
+pub use issue::{Issue, IssueKind, Parsed};
