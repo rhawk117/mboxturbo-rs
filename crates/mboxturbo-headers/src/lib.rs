@@ -11,6 +11,7 @@ mod date;
 mod encoded_word;
 mod issue;
 mod tokenize;
+mod trust;
 
 pub use caps::{
     Cap, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES, MAX_RECEIVED_HOPS,
@@ -19,3 +20,4 @@ pub use date::{Instant, parse_date};
 pub use encoded_word::decode_encoded_words;
 pub use issue::{Issue, IssueKind, Parsed};
 pub use tokenize::{Token, TokenKind, tokenize};
+pub use trust::{InvalidIpRange, TrustSet};
