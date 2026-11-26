@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use mboxturbo::{Column, Compression, Pipeline};
+use mboxturbo::{Column, Compression, Destination, Export, Overwrite, ParquetExporter, Pipeline};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
@@ -24,6 +24,8 @@ use crate::errors::into_py_err;
 #[pyclass(frozen, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct Selection {
+    /// Rows per batch; a Parquet row group holds sixteen batches.
+    batch_size: usize,
     /// The mapping the columns are extracted from.
     mailbox: Arc<mboxturbo::Mailbox>,
     /// The column names, in selection order.
@@ -63,17 +65,36 @@ impl Selection {
     }
 
     /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
-    #[pyo3(signature = (path, *, compression = "zstd"))]
-    fn to_parquet(&self, py: Python<'_>, path: PathBuf, compression: &str) -> PyResult<u64> {
+    /// An existing file raises ``FileExistsError`` and is left untouched unless ``overwrite`` is
+    /// true. The GIL is released while exporting.
+    #[pyo3(signature = (path, *, compression = "zstd", overwrite = false))]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Python's `overwrite=` keyword is a bool by the requested interface"
+    )]
+    fn to_parquet(
+        &self,
+        py: Python<'_>,
+        path: PathBuf,
+        compression: &str,
+        overwrite: bool,
+    ) -> PyResult<u64> {
+        let policy = if overwrite {
+            Overwrite::Replace
+        } else {
+            Overwrite::Refuse
+        };
         let codec = parse_compression(compression)?;
-        let mailbox = Arc::clone(&self.mailbox);
-        let pipeline = Arc::clone(&self.pipeline);
-        py.detach(move || {
-            pipeline
-                .write_parquet(&mailbox, &path, codec)
-                .map_err(Box::new)
-        })
-        .map_err(|error| into_py_err(py, *error))
+        let sink = ParquetExporter::new(codec).with_row_group_batches(self.batch_size);
+        let export = Export::new(
+            Arc::clone(&self.pipeline),
+            Arc::clone(&self.mailbox),
+            Destination::File(path),
+        )
+        .overwrite(policy);
+        py.detach(move || export.run(Box::new(sink)).map_err(Box::new))
+            .map(|summary| summary.messages)
+            .map_err(|error| into_py_err(py, *error))
     }
 }
 
@@ -95,6 +116,7 @@ pub(crate) fn select_columns(
         .collect();
     let pipeline = Arc::new(Pipeline::new(columns, batch_size));
     Ok(Selection {
+        batch_size,
         mailbox,
         names,
         pipeline,

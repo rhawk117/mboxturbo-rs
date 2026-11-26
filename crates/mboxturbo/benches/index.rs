@@ -5,21 +5,15 @@
 //! `MBOXTURBO_BENCH_DIR` moves it, and `MBOXTURBO_BENCH_MESSAGES` and `MBOXTURBO_BENCH_SEED`
 //! override the defaults of one million messages and seed 1.
 
-#[path = "../tests/common/mod.rs"]
-#[expect(
-    clippy::missing_docs_in_private_items,
-    reason = "the generator is shared with the integration tests, where the lint does not reach it"
-)]
 mod common;
 
-use std::env::{self, VarError};
-use std::error::Error;
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use common::Outcome;
 use mboxturbo::{IndexBytes, IndexPolicy, Mailbox, MailboxBuilder};
 
 /// Messages in the fixture when `MBOXTURBO_BENCH_MESSAGES` is unset.
@@ -32,9 +26,6 @@ const MEDIAN_RUN: usize = 2;
 const OPEN_RUNS: usize = 5;
 /// Positions read by the random-access row.
 const RANDOM_READS: u64 = 100_000;
-
-/// Result of a bench step.
-type Outcome<T> = Result<T, Box<dyn Error>>;
 
 /// Everything one run measures.
 #[derive(Debug)]
@@ -68,29 +59,6 @@ const fn splitmix64(state: &mut u64) -> u64 {
     mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     mixed ^ (mixed >> 31)
-}
-
-/// Reads `name` as a number, or `default` when it is unset.
-fn env_number(name: &str, default: u64) -> Outcome<u64> {
-    match env::var(name) {
-        Ok(text) => Ok(text.parse()?),
-        Err(VarError::NotPresent) => Ok(default),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Directory holding the fixture and the saved index.
-fn bench_directory() -> Outcome<PathBuf> {
-    match env::var_os("MBOXTURBO_BENCH_DIR") {
-        Some(directory) => Ok(directory.into()),
-        None => match env::var_os("CARGO_TARGET_DIR") {
-            Some(directory) => Ok(directory.into()),
-            None => Ok(PathBuf::from(env::var("CARGO_MANIFEST_DIR")?)
-                .join("..")
-                .join("..")
-                .join("target")),
-        },
-    }
 }
 
 /// Times `work` and returns its result with the elapsed time.
@@ -130,76 +98,6 @@ fn bytes_per_message(bytes: u64, messages: u64) -> String {
         hundredths.checked_div(100).unwrap_or(0),
         hundredths.checked_rem(100).unwrap_or(0)
     )
-}
-
-/// `path` with `suffix` appended to its file name, in the same directory.
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// The byte count recorded beside the fixture at `path`, or `None` when no record exists or it is
-/// not a number, which makes the fixture untrusted.
-fn recorded_length(path: &Path) -> Outcome<Option<u64>> {
-    match fs::read_to_string(sibling(path, ".len")) {
-        Ok(text) => text
-            .trim()
-            .parse()
-            .map_or_else(|_| Ok(None), |bytes| Ok(Some(bytes))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// The length of the fixture at `path` when it exists and matches its recorded byte count.
-fn reusable_length(path: &Path) -> Outcome<Option<u64>> {
-    let actual = match fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    Ok((recorded_length(path)? == Some(actual)).then_some(actual))
-}
-
-/// Generates the fixture to a partial file and renames it to `path`, so a killed run leaves
-/// nothing at `path`, then records its byte count beside it.
-fn generate_atomically(path: &Path, spec: &common::Spec) -> Outcome<common::Summary> {
-    let length_path = sibling(path, ".len");
-    match fs::remove_file(&length_path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-        _ => {},
-    }
-    let partial = sibling(path, ".partial");
-    let summary = common::generate(&partial, spec)?;
-    fs::rename(&partial, path)?;
-    fs::write(&length_path, summary.bytes.to_string())?;
-    Ok(summary)
-}
-
-/// Generates the fixture at its derived path unless one of its recorded length already
-/// exists, and says which.
-fn ensure_fixture(spec: &common::Spec) -> Outcome<PathBuf> {
-    let directory = bench_directory()?;
-    fs::create_dir_all(&directory)?;
-    let path = directory.join(common::file_name(spec));
-    let mut out = io::stdout().lock();
-    if let Some(bytes) = reusable_length(&path)? {
-        writeln!(out, "reused {} ({bytes} bytes)", path.display())?;
-    } else {
-        let started = Instant::now();
-        let summary = generate_atomically(&path, spec)?;
-        writeln!(
-            out,
-            "generated {} ({} messages, {} dated, {} bytes) in {} ms",
-            path.display(),
-            summary.messages,
-            summary.dated,
-            summary.bytes,
-            started.elapsed().as_millis()
-        )?;
-    }
-    Ok(path)
 }
 
 /// The error for a position the index has no span for, which a valid fixture never produces.
@@ -298,7 +196,7 @@ fn index_sweep(mailbox: &Mailbox) -> Outcome<Duration> {
 
 /// Times every operation against the v1 index.
 fn measure(spec: &common::Spec) -> Outcome<Report> {
-    let path = ensure_fixture(spec)?;
+    let path = common::ensure_fixture(&common::bench_directory()?, spec)?;
     let index_path = path.with_extension("index");
     let (mailbox, build) = timed(|| {
         Ok(MailboxBuilder::new()
@@ -366,8 +264,8 @@ fn print_sizes(out: &mut impl io::Write, report: &Report) -> Outcome<()> {
 /// Runs every timing against the v1 index and prints the table.
 fn main() -> Outcome<()> {
     let spec = common::Spec {
-        messages: env_number("MBOXTURBO_BENCH_MESSAGES", DEFAULT_MESSAGES)?,
-        seed: env_number("MBOXTURBO_BENCH_SEED", DEFAULT_SEED)?,
+        messages: common::env_number("MBOXTURBO_BENCH_MESSAGES", DEFAULT_MESSAGES)?,
+        seed: common::env_number("MBOXTURBO_BENCH_SEED", DEFAULT_SEED)?,
     };
     print(&measure(&spec)?)
 }

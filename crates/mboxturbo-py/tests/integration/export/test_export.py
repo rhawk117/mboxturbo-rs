@@ -1,6 +1,8 @@
 """Columnar selections: Arrow consumers, Parquet output and agreement with Message."""
 
 import hashlib
+import threading
+import time
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
@@ -11,7 +13,7 @@ import pytest
 from hypothesis import example, given
 from hypothesis import strategies as st
 
-from mboxturbo import Mailbox, Message
+from mboxturbo import Mailbox, Message, Selection
 from mboxturbo.tests.drafts import (
     MailboxWriter,
     MessageDraft,
@@ -112,6 +114,14 @@ class TestSelection:
         assert 'text' not in columns
         assert 'attachment_sha256' not in columns
 
+    @given(drafts=mailbox_drafts)
+    def test_the_raw_column_equals_each_messages_bytes(
+        self, mailbox_writer: MailboxWriter, drafts: Sequence[MessageDraft]
+    ) -> None:
+        mailbox = Mailbox(mailbox_writer.write(drafts))
+        table = pa.table(mailbox.select(['raw']))
+        assert table.column('raw').to_pylist() == [message.raw for message in mailbox]
+
 
 class TestConsumers:
     SAMPLE = (MessageDraft(sender='a@example.com', subject='s', body=['b']),)
@@ -194,3 +204,67 @@ class TestParquet:
     ) -> None:
         mailbox = Mailbox(mailbox_writer.write_raw(contents))
         assert pa.table(mailbox.select(self.ALL_COLUMNS)).num_rows == len(mailbox)
+
+
+class TestParquetOverwrite:
+    @pytest.fixture
+    def selection(self, mailbox_writer: MailboxWriter) -> Selection:
+        drafts = [MessageDraft(sender='a@example.com', subject='s', body=['b'])]
+        return Mailbox(mailbox_writer.write(drafts)).select(['subject'])
+
+    def test_an_existing_file_is_refused_and_left_unchanged(
+        self, selection: Selection, tmp_path: Path
+    ) -> None:
+        target = tmp_path / 'out.parquet'
+        target.write_bytes(b'precious')
+        with pytest.raises(FileExistsError) as refused:
+            selection.to_parquet(target)
+        assert str(target) in str(refused.value.filename)
+        assert target.read_bytes() == b'precious'
+
+    def test_overwrite_replaces_an_existing_file(
+        self, selection: Selection, tmp_path: Path
+    ) -> None:
+        target = tmp_path / 'out.parquet'
+        target.write_bytes(b'stale')
+        assert selection.to_parquet(target, overwrite=True) == 1
+        assert pq.read_table(target).to_pylist() == [{'subject': 's'}]
+
+
+class TestGilRelease:
+    MESSAGES = 20_000
+    MIN_TICKS = 3
+
+    @pytest.fixture
+    def selection(self, mailbox_writer: MailboxWriter) -> Selection:
+        drafts = [
+            MessageDraft(sender='a@example.com', subject=f'n{n}', body=['b'] * 20)
+            for n in range(self.MESSAGES)
+        ]
+        return Mailbox(mailbox_writer.write(drafts)).select(['raw', 'text'])
+
+    def test_other_threads_run_while_to_parquet_exports(
+        self, selection: Selection, tmp_path: Path
+    ) -> None:
+        stop, ticks = threading.Event(), []
+
+        def count() -> None:
+            while not stop.is_set():
+                ticks.append(time.perf_counter())
+                time.sleep(0.001)
+
+        counter = threading.Thread(target=count)
+        counter.start()
+        while not ticks:
+            time.sleep(0.001)
+        started = time.perf_counter()
+        try:
+            selection.to_parquet(tmp_path / 'out.parquet')
+        finally:
+            finished = time.perf_counter()
+            stop.set()
+            counter.join()
+        during = [tick for tick in ticks if started < tick < finished]
+        assert len(during) >= self.MIN_TICKS, (
+            'the counter thread advanced while the export ran'
+        )

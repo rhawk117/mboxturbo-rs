@@ -8,10 +8,11 @@ use arrow_schema::{DataType, Field, TimeUnit};
 const HEADER_PREFIX: &str = "header:";
 
 /// Public name and variant of every named column; the order is what [`Column::names`] yields.
-const NAMED: [(&str, Column); 22] = [
+const NAMED: [(&str, Column); 23] = [
     ("position", Column::Position),
     ("offset", Column::Offset),
     ("size", Column::Size),
+    ("raw", Column::Raw),
     ("from", Column::From),
     ("to", Column::To),
     ("cc", Column::Cc),
@@ -67,6 +68,8 @@ pub enum Column {
     Offset,
     /// Zero-based position of the message in the mailbox.
     Position,
+    /// The message's stored bytes, `From ` separator line included; opt-in, never a default.
+    Raw,
     /// Every raw `Received:` value, newest hop first.
     Received,
     /// Every raw `Received-SPF:` value.
@@ -96,6 +99,7 @@ impl Column {
             },
             Self::Date => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             Self::DateOffsetMinutes => DataType::Int32,
+            Self::Raw => DataType::LargeBinary,
             Self::AttachmentSizes => DataType::new_list(DataType::UInt64, true),
             Self::From
             | Self::To
@@ -112,13 +116,14 @@ impl Column {
         }
     }
 
-    /// The columns selected when none are named: everything that needs only the header block.
+    /// The columns selected when none are named: everything that needs only the header block,
+    /// except [`Column::Raw`], which is opt-in.
     #[must_use]
     pub fn defaults() -> Vec<Self> {
         NAMED
             .iter()
             .map(|(_, column)| column.clone())
-            .filter(|column| !column.needs_body())
+            .filter(|column| !column.needs_body() && *column != Self::Raw)
             .collect()
     }
 
@@ -170,10 +175,10 @@ impl Column {
         )
     }
 
-    /// Whether extracting this column requires parsing the message at all; position, offset and
-    /// size come from the index alone.
+    /// Whether extracting this column requires parsing the message at all; position, offset,
+    /// size and raw bytes come from the index alone.
     pub(crate) const fn needs_parsing(&self) -> bool {
-        !matches!(self, Self::Position | Self::Offset | Self::Size)
+        !matches!(self, Self::Position | Self::Offset | Self::Size | Self::Raw)
     }
 }
 
@@ -214,5 +219,16 @@ mod tests {
             Column::defaults().contains(&Column::Received),
             "the defaults include the Received forensics column"
         );
+        assert!(
+            !Column::defaults().contains(&Column::Raw),
+            "raw is opt-in and not a default"
+        );
+    }
+
+    #[test]
+    fn raw_is_a_catalogued_column_that_needs_no_parsing() {
+        assert_eq!(Column::from_name("raw"), Some(Column::Raw), "raw parses");
+        assert!(!Column::Raw.needs_body(), "raw needs no body parse");
+        assert!(!Column::Raw.needs_parsing(), "raw needs no parse at all");
     }
 }

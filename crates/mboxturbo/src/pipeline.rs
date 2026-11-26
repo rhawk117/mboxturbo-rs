@@ -1,29 +1,21 @@
 //! Columnar extraction: parse only what the selected columns need, in parallel, into Arrow
-//! record batches, and stream them to a consumer or a Parquet file.
+//! record batches, and stream them to a consumer. See [`Export`](crate::Export) and
+//! [`ParquetExporter`](crate::ParquetExporter) for files.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::fs::File;
+#[cfg(test)]
+use std::fmt::Debug;
 use std::ops::Range;
-use std::panic::resume_unwind;
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, sync_channel};
-use std::{iter, thread};
 
 use arrow_array::builder::{
-    Int32Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, UInt64Builder,
+    Int32Builder, LargeBinaryBuilder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
+    UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
-use parquet::errors::ParquetError;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use rayon::prelude::*;
 use sha2::{Digest as _, Sha256};
-use tempfile::NamedTempFile;
 
 use crate::columns::Column;
 use crate::error::MboxTurboError;
@@ -31,6 +23,8 @@ use crate::fields::{
     self, Mail, builtin_table_with_raw_received, contain_parser_panic, strip_separator,
 };
 use crate::mailbox::Mailbox;
+use crate::selection::{Plan, Selection};
+use crate::stream::Ordered;
 use crate::width::widen;
 
 /// Parquet page compression.
@@ -67,8 +61,18 @@ pub struct Pipeline {
     columns: Box<[Column]>,
     /// Parse depth required by `columns`.
     depth: Depth,
+    /// Called as each extraction job starts, so tests can observe and hold jobs.
+    #[cfg(test)]
+    probe: Option<Arc<dyn Probe>>,
     /// Arrow schema derived from `columns`, shared by every batch.
     schema: SchemaRef,
+}
+
+/// A test hook told which runs each extraction job covers as the job starts.
+#[cfg(test)]
+trait Probe: Debug + Send + Sync {
+    /// Called on the pool thread before the job extracts `runs`; may block to hold the job.
+    fn started(&self, runs: &[Range<usize>]);
 }
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
@@ -78,61 +82,27 @@ struct Record<'mail> {
     mail: Option<&'mail Mail<'mail>>,
     /// Zero-based index of the message in the mailbox.
     position: usize,
+    /// The message's stored bytes, separator line included.
+    raw: &'mail [u8],
     /// Byte range of the message in the mailbox file.
     span: Range<usize>,
 }
 
-/// Batches over a whole mailbox, produced a window at a time on all rayon threads.
+/// Batches over a selection of a mailbox, extracted on all rayon threads and handed over in
+/// selection order as soon as each is ready.
 #[derive(Debug)]
 pub struct BatchReader {
     /// Mailbox being read.
     mailbox: Arc<Mailbox>,
-    /// Position of the first message not yet scheduled for extraction.
-    next: usize,
-    /// Plan that decides columns, schema and batch size.
+    /// Pipeline that decides columns, schema and batch size.
     pipeline: Arc<Pipeline>,
-    /// Extracted batches, in mailbox order, awaiting delivery.
-    ready: VecDeque<Result<RecordBatch, MboxTurboError>>,
+    /// The selected positions not yet scheduled for extraction.
+    plan: Plan,
+    /// Batches scheduled or extracted, in selection order, awaiting delivery.
+    stream: Ordered<Result<RecordBatch, MboxTurboError>>,
 }
 
 impl Pipeline {
-    /// Drains a batch reader on a producer thread into `writer` and closes it, returning the
-    /// number of rows written.
-    ///
-    /// # Errors
-    ///
-    /// [`MboxTurboError::Parquet`] if writing or closing fails, or the first batch error
-    /// ([`MboxTurboError::Arrow`]) the reader yields; extraction stops at that error.
-    ///
-    /// # Panics
-    ///
-    /// Re-raises a panic from the producer thread on the calling thread.
-    fn encode_parquet(
-        self: &Arc<Self>,
-        mailbox: &Arc<Mailbox>,
-        mut writer: ArrowWriter<File>,
-        path: &Path,
-    ) -> Result<u64, MboxTurboError> {
-        let parquet_error = |source| parquet_failure(path, source);
-        let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
-        let mut batches = self.reader(mailbox);
-        let reader = iter::from_fn(move || batches.next_batch());
-        let produced = thread::scope(|scope| {
-            let reader_thread = scope.spawn(move || forward_batches(reader, &sender));
-            let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
-                let batch = received?;
-                writer.write(&batch).map_err(parquet_error)?;
-                Ok::<u64, MboxTurboError>(rows.saturating_add(widen(batch.num_rows())))
-            });
-            if let Err(payload) = reader_thread.join() {
-                resume_unwind(payload);
-            }
-            rows
-        })?;
-        writer.close().map(|_metadata| ()).map_err(parquet_error)?;
-        Ok(produced)
-    }
-
     /// Extracts the messages at `positions` (clamped to those that exist) into one batch.
     ///
     /// # Errors
@@ -145,15 +115,32 @@ impl Pipeline {
         positions: Range<usize>,
     ) -> Result<RecordBatch, MboxTurboError> {
         let clamped = mailbox.clamped(positions);
+        self.extract_runs(mailbox, &[clamped])
+    }
+
+    /// Extracts the messages of each run in `runs`, in order, into one batch. Every run must lie
+    /// within the mailbox.
+    ///
+    /// # Errors
+    ///
+    /// [`MboxTurboError::Arrow`], naming the smallest range covering every run, if the columns
+    /// cannot be assembled into a batch.
+    fn extract_runs(
+        &self,
+        mailbox: &Mailbox,
+        runs: &[Range<usize>],
+    ) -> Result<RecordBatch, MboxTurboError> {
+        let rows = runs.iter().map(Range::len).fold(0, usize::saturating_add);
         let mut slots: Vec<Slot> = self
             .columns
             .iter()
-            .map(|column| Slot::new(column, clamped.len()))
+            .map(|column| Slot::new(column, rows))
             .collect();
-        for (position, span, raw) in mailbox.rows(clamped.clone()) {
+        for (position, span, raw) in runs.iter().flat_map(|run| mailbox.rows(run.clone())) {
             let parsed = self.parse(raw);
             let record = Record {
                 position,
+                raw,
                 span,
                 mail: parsed.as_ref(),
             };
@@ -163,7 +150,7 @@ impl Pipeline {
         }
         let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
         RecordBatch::try_new(self.schema(), arrays).map_err(|source| MboxTurboError::Arrow {
-            positions: clamped,
+            positions: covering(runs),
             source,
         })
     }
@@ -177,6 +164,8 @@ impl Pipeline {
             schema: Arc::new(Schema::new(fields)),
             columns: columns.into_boxed_slice(),
             batch_size: batch_size.max(1),
+            #[cfg(test)]
+            probe: None,
         }
     }
 
@@ -198,9 +187,22 @@ impl Pipeline {
         BatchReader {
             pipeline: Arc::clone(self),
             mailbox: Arc::clone(mailbox),
-            next: 0,
-            ready: VecDeque::new(),
+            plan: Plan::whole(mailbox.len()),
+            stream: Ordered::new(),
         }
+    }
+
+    /// Extracts `runs` on a pool thread; the only entry of an extraction job.
+    fn run_job(
+        &self,
+        mailbox: &Mailbox,
+        runs: &[Range<usize>],
+    ) -> Result<RecordBatch, MboxTurboError> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.started(runs);
+        }
+        self.extract_runs(mailbox, runs)
     }
 
     /// The Arrow schema of every batch this pipeline produces.
@@ -209,74 +211,59 @@ impl Pipeline {
         Arc::clone(&self.schema)
     }
 
-    /// Splits the span of messages from `from` onward that all threads can work on at once (two
-    /// batches per thread) into batch-sized position ranges. Empty when `from` is at or past
-    /// the end of `mailbox`; the last range may be shorter than the batch size.
-    fn window(&self, from: usize, mailbox: &Mailbox) -> Vec<Range<usize>> {
-        let span = self
-            .batch_size
-            .saturating_mul(rayon::current_num_threads().saturating_mul(2));
-        let end = from.saturating_add(span).min(mailbox.len());
-        (from..end)
-            .step_by(self.batch_size)
-            .map(|start| start..start.saturating_add(self.batch_size).min(end))
-            .collect()
-    }
-
-    /// Writes every batch to a Parquet file at `path`, atomically, while the next batches are
-    /// extracted on other threads. Returns the number of rows written.
+    /// Streams batches over the messages `selection` names, in the order it gives them,
+    /// extracting several batches in parallel at a time.
     ///
     /// # Errors
     ///
-    /// [`MboxTurboError::Io`] when the file cannot be created or renamed into place,
-    /// [`MboxTurboError::Parquet`] when encoding fails, and [`MboxTurboError::Arrow`] if a
-    /// batch cannot be assembled.
-    pub fn write_parquet(
+    /// [`MboxTurboError::PositionOutOfRange`] naming the first position at or past the end of
+    /// `mailbox`; no message is read in that case.
+    pub fn select(
         self: &Arc<Self>,
         mailbox: &Arc<Mailbox>,
-        path: &Path,
-        compression: Compression,
-    ) -> Result<u64, MboxTurboError> {
-        let directory = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        let staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))
-            .map_err(|source| MboxTurboError::io(path, source))?;
-        let file = staged
-            .reopen()
-            .map_err(|source| MboxTurboError::io(path, source))?;
-        let properties = WriterProperties::builder()
-            .set_compression(parquet_compression(compression))
-            .set_max_row_group_row_count(Some(self.batch_size.saturating_mul(16)))
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::Chunk)
-            .build();
-        let writer = ArrowWriter::try_new(file, self.schema(), Some(properties))
-            .map_err(|source| parquet_failure(path, source))?;
-        let rows = self.encode_parquet(mailbox, writer, path)?;
-        staged
-            .persist(path)
-            .map(|_persisted| ())
-            .map_err(|failure| MboxTurboError::io(path, failure.error))?;
-        Ok(rows)
+        selection: Selection,
+    ) -> Result<BatchReader, MboxTurboError> {
+        Ok(BatchReader {
+            pipeline: Arc::clone(self),
+            mailbox: Arc::clone(mailbox),
+            plan: selection.plan(mailbox.len())?,
+            stream: Ordered::new(),
+        })
     }
 }
 
 impl BatchReader {
-    /// The next batch, keeping the typed error so callers can read the positions it covers.
-    fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
-        if self.ready.is_empty() {
-            let window = self.pipeline.window(self.next, &self.mailbox);
-            self.next = window.last().map_or(self.next, |last| last.end);
-            self.mailbox
-                .prefetch(self.next..self.next.saturating_add(self.pipeline.batch_size));
-            let extracted: Vec<_> = window
-                .into_par_iter()
-                .map(|positions| self.pipeline.extract(&self.mailbox, positions))
-                .collect();
-            self.ready.extend(extracted);
+    /// Schedules batches until about two per rayon thread are in flight or the plan runs out,
+    /// asking the kernel to read the batch after each one in the background.
+    fn fill(&mut self) {
+        let in_flight = rayon::current_num_threads().saturating_mul(2);
+        while self.stream.in_flight() < in_flight {
+            let runs = self.plan.take(self.pipeline.batch_size);
+            if runs.is_empty() {
+                break;
+            }
+            for ahead in self.plan.clone().take(self.pipeline.batch_size) {
+                self.mailbox.prefetch(ahead);
+            }
+            let pipeline = Arc::clone(&self.pipeline);
+            let mailbox = Arc::clone(&self.mailbox);
+            self.stream
+                .submit(move || pipeline.run_job(&mailbox, &runs));
         }
-        self.ready.pop_front()
+    }
+
+    /// The next batch, keeping the typed error so callers can read the positions it covers.
+    pub(crate) fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
+        self.fill();
+        let batch = self.stream.next();
+        self.fill();
+        batch
+    }
+
+    /// The number of messages the selection yields in total, whatever has been read so far.
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.plan.total()
     }
 }
 
@@ -318,6 +305,8 @@ enum Slot {
     Offset(UInt64Builder),
     /// Message index.
     Position(UInt64Builder),
+    /// The message's stored bytes, separator line included.
+    Raw(LargeBinaryBuilder),
     /// Message length in bytes.
     Size(UInt64Builder),
     /// Decoded subject, null when absent.
@@ -420,6 +409,7 @@ impl Slot {
             Self::Position(builder) => builder.append_value(widen(record.position)),
             Self::Offset(builder) => builder.append_value(widen(record.span.start)),
             Self::Size(builder) => builder.append_value(widen(record.span.len())),
+            Self::Raw(builder) => builder.append_value(record.raw),
             Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
             Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
             Self::Date(builder) => builder.append_option(date_micros(mail)),
@@ -441,6 +431,7 @@ impl Slot {
             Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
                 Arc::new(builder.finish())
             },
+            Self::Raw(builder) => Arc::new(builder.finish()),
             Self::Addresses(_, builder) | Self::HeaderValues(_, builder) => {
                 Arc::new(builder.finish())
             },
@@ -474,6 +465,7 @@ impl Slot {
             Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
             Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
             Column::Size => Self::Size(UInt64Builder::with_capacity(rows)),
+            Column::Raw => Self::Raw(LargeBinaryBuilder::new()),
             Column::From => addresses(AddressHeader::From),
             Column::To => addresses(AddressHeader::To),
             Column::Cc => addresses(AddressHeader::Cc),
@@ -503,26 +495,11 @@ fn text_list() -> ListBuilder<StringBuilder> {
     ListBuilder::new(StringBuilder::new())
 }
 
-/// Sends `batches` to `sender` in order until they run out or the receiver is gone.
-fn forward_batches(
-    batches: impl Iterator<Item = Result<RecordBatch, MboxTurboError>>,
-    sender: &SyncSender<Result<RecordBatch, MboxTurboError>>,
-) {
-    for batch in batches {
-        // A send fails only once the receiver is dropped, and the consumer drops it only after
-        // `try_fold` stopped on an `Err`, which `rows` returns.
-        if sender.send(batch).is_err() {
-            break;
-        }
-    }
-}
-
-/// Wraps a Parquet encoding failure with the output `path` it concerns.
-fn parquet_failure(path: &Path, source: ParquetError) -> MboxTurboError {
-    MboxTurboError::Parquet {
-        path: path.to_path_buf(),
-        source,
-    }
+/// The smallest range covering every run in `runs`.
+fn covering(runs: &[Range<usize>]) -> Range<usize> {
+    let start = runs.iter().map(|run| run.start).min().unwrap_or(0);
+    let end = runs.iter().map(|run| run.end).max().unwrap_or(0);
+    start..end
 }
 
 /// Picks the shallowest parse that serves `columns`: whole message if any needs the body, none if
@@ -557,6 +534,7 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         Column::Position
         | Column::Offset
         | Column::Size
+        | Column::Raw
         | Column::Received
         | Column::AuthenticationResults
         | Column::ReceivedSpf
@@ -569,16 +547,6 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         | Column::AttachmentSizes
         | Column::AttachmentSha256
         | Column::Header(_) => None,
-    }
-}
-
-/// Maps the public [`Compression`] choice to the Parquet writer's codec (Zstd at its default
-/// level).
-fn parquet_compression(compression: Compression) -> ParquetCompression {
-    match compression {
-        Compression::Zstd => ParquetCompression::ZSTD(ZstdLevel::default()),
-        Compression::Snappy => ParquetCompression::SNAPPY,
-        Compression::Uncompressed => ParquetCompression::UNCOMPRESSED,
     }
 }
 
@@ -672,25 +640,31 @@ mod tests {
     use std::borrow::Cow;
     use std::io::Write as _;
     use std::iter;
-    use std::sync::Arc;
-    use std::sync::mpsc::sync_channel;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray as _;
-    use arrow_array::{Array as _, Int32Array, ListArray, RecordBatch};
+    use arrow_array::{Array as _, ListArray};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use mail_parser::{HeaderForm, HeaderName, MessageParser};
     use tempfile::NamedTempFile;
 
     use super::{
-        AddressHeader, AttachmentSlot, Depth, Pipeline, Slot, append_addresses,
+        AddressHeader, AttachmentSlot, Depth, Pipeline, Probe, Slot, append_addresses,
         append_header_values, date_micros, date_offset_minutes, depth_for, first_header_value,
-        forward_batches, header_form, html_body, joined, text_body, utc_timestamps,
+        header_form, html_body, joined, text_body, utc_timestamps,
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
     use crate::fields::Mail;
     use crate::mailbox::Mailbox;
+
+    /// A bound only a broken implementation reaches: it turns a hang into a failure.
+    const STUCK: Duration = Duration::from_secs(60);
 
     const MULTIPART: &[u8] = b"From: a@example.org\r\nTo: b@example.org, c@example.org\r\n\
 Cc: d@example.org\r\nReply-To: e@example.org\r\nReceived: first\r\nReceived: second\r\n\
@@ -698,6 +672,36 @@ Date: Thu, 01 Jan 1970 00:00:10 +0130\r\n\
 Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
 --b\r\nContent-Type: text/plain\r\n\r\nplain part\r\n--b\r\nContent-Type: text/html\r\n\r\n\
 <p>html part</p>\r\n--b--\r\n";
+
+    /// Holds the extraction job whose first message is `held_start` until the test releases it.
+    #[derive(Debug)]
+    struct Hold {
+        gate: Mutex<Receiver<()>>,
+        held_start: usize,
+    }
+
+    impl Probe for Hold {
+        fn started(&self, runs: &[Range<usize>]) {
+            if runs.first().map(|run| run.start) != Some(self.held_start) {
+                return;
+            }
+            self.gate
+                .lock()
+                .expect("no job panics while holding the gate")
+                .recv_timeout(STUCK)
+                .expect("the test releases the held job after reading the first batch");
+        }
+    }
+
+    /// Counts the extraction jobs that have started.
+    #[derive(Debug, Default)]
+    struct Started(AtomicUsize);
+
+    impl Probe for Started {
+        fn started(&self, _runs: &[Range<usize>]) {
+            let _previous = self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn parse(raw: &[u8]) -> Mail<'_> {
         MessageParser::new()
@@ -718,37 +722,6 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         let mut builder = ListBuilder::new(StringBuilder::new());
         append_addresses(&mut builder, header, mail);
         list_cells(&builder.finish(), 0)
-    }
-
-    fn batch_of(rows: usize) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![0; rows]))])
-            .expect("fixture batch matches its schema")
-    }
-
-    #[test]
-    fn forwarding_delivers_every_batch_in_order() {
-        let (sender, receiver) = sync_channel(8);
-        forward_batches((1..=3).map(|rows| Ok(batch_of(rows))), &sender);
-        drop(sender);
-        let sizes: Vec<_> = receiver
-            .into_iter()
-            .map(|batch| batch.expect("fixture batches are Ok").num_rows())
-            .collect();
-        assert_eq!(sizes, [1, 2, 3], "batches arrive in production order");
-    }
-
-    #[test]
-    fn forwarding_stops_pulling_once_the_receiver_is_gone() {
-        let (sender, receiver) = sync_channel(1);
-        drop(receiver);
-        let mut pulled = 0_usize;
-        let batches = iter::repeat_with(|| {
-            pulled += 1;
-            Ok::<_, MboxTurboError>(batch_of(1))
-        });
-        forward_batches(batches.take(10), &sender);
-        assert_eq!(pulled, 1, "the failed first send ends extraction");
     }
 
     #[test]
@@ -794,6 +767,10 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert!(
             matches!(depth_for(&[Column::Position, Column::Size]), Depth::Nothing),
             "no message is parsed"
+        );
+        assert!(
+            matches!(depth_for(&[Column::Raw]), Depth::Nothing),
+            "raw alone parses no message"
         );
     }
 
@@ -1011,6 +988,80 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert!(
             matches!(&error, MboxTurboError::Arrow { positions, .. } if *positions == (0..1)),
             "the error names the positions clamped to the one message that exists"
+        );
+    }
+
+    fn numbered_mailbox(count: usize) -> (NamedTempFile, Arc<Mailbox>) {
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        for index in 0..count {
+            write!(
+                file,
+                "From x Mon Jan  1 00:00:00 2024\nSubject: s{index}\n\nb\n"
+            )
+            .expect("fixture mbox is written");
+        }
+        let mailbox = Arc::new(Mailbox::open(file.path()).expect("fixture mbox opens"));
+        (file, mailbox)
+    }
+
+    #[test]
+    fn a_reader_returns_the_first_batch_while_a_later_batch_of_its_window_is_unfinished() {
+        let (_file, mailbox) = numbered_mailbox(20);
+        let (release, gate) = channel::<()>();
+        let mut pipeline = Pipeline::new(vec![Column::Position], 1);
+        pipeline.probe = Some(Arc::new(Hold {
+            gate: Mutex::new(gate),
+            held_start: 1,
+        }));
+        let mut reader = Arc::new(pipeline).reader(&mailbox);
+        let first = reader
+            .next()
+            .expect("a first batch exists")
+            .expect("it is assembled");
+        assert_eq!(
+            first.num_rows(),
+            1,
+            "the first batch is returned although the second is still held in its window"
+        );
+        release.send(()).expect("the held job is still waiting");
+        let rest = reader.map(|batch| batch.expect("every batch is assembled").num_rows());
+        assert_eq!(
+            rest.sum::<usize>(),
+            19,
+            "the remaining batches arrive once the held one finishes"
+        );
+    }
+
+    #[test]
+    fn dropping_a_reader_stops_extraction_from_starting_on_its_queued_batches() {
+        let (_file, mailbox) = numbered_mailbox(200);
+        let started = Arc::new(Started::default());
+        let probe: Arc<dyn Probe> = Arc::<Started>::clone(&started);
+        let mut plan = Pipeline::new(vec![Column::Position], 1);
+        plan.probe = Some(probe);
+        let pipeline = Arc::new(plan);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("test thread pool builds");
+        let at_drop = pool.install(|| {
+            let mut reader = pipeline.reader(&mailbox);
+            let _first = reader
+                .next()
+                .expect("a first batch exists")
+                .expect("it is assembled");
+            drop(reader);
+            started.0.load(Ordering::SeqCst)
+        });
+        let (done, finished) = channel::<()>();
+        pool.spawn(move || done.send(()).expect("the test waits for the pool to drain"));
+        finished
+            .recv_timeout(STUCK)
+            .expect("the pool drains its queue after the reader is dropped");
+        assert_eq!(
+            started.0.load(Ordering::SeqCst),
+            at_drop,
+            "no extraction job started after the reader was dropped"
         );
     }
 }

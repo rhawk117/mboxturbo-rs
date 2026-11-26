@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use parquet::errors::ParquetError;
 
 use crate::index::BlockSize;
+use crate::staging::DestinationKind;
 
 /// Why an index file was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -72,11 +73,19 @@ pub enum MboxTurboError {
     /// Extracted columns could not be assembled into an Arrow batch.
     #[error("cannot assemble an Arrow batch for messages {}..{}", positions.start, positions.end)]
     Arrow {
-        /// The message positions the failed batch covered, clamped to those that exist.
+        /// The smallest range covering the failed batch's positions, clamped to those that exist.
         positions: Range<usize>,
         /// The Arrow failure.
         #[source]
         source: arrow_schema::ArrowError,
+    },
+    /// An export was cancelled before it finished.
+    #[error("export to {} cancelled after {written} messages", target_label(target.as_deref()))]
+    Cancelled {
+        /// The file or directory being written; `None` for a stream.
+        target: Option<PathBuf>,
+        /// Messages written before the export stopped.
+        written: u64,
     },
     /// The index file is damaged or is not an mboxturbo index.
     #[error("index file {} is corrupt: {corruption}", path.display())]
@@ -104,12 +113,37 @@ pub enum MboxTurboError {
         #[source]
         source: ParquetError,
     },
+    /// A selection named a message position past the last message.
+    #[error("message position {position} is out of range for a mailbox of {len} messages")]
+    PositionOutOfRange {
+        /// The first position at or past the end of the mailbox.
+        position: usize,
+        /// The number of messages in the mailbox.
+        len: usize,
+    },
     /// The index file was built for a different version of the mailbox, or by an older
     /// index format.
     #[error("index file {} no longer matches the mailbox", path.display())]
     StaleIndex {
         /// The rejected index file.
         path: PathBuf,
+    },
+    /// The export target already exists and overwriting was not requested.
+    #[error("export target {} already exists", path.display())]
+    TargetExists {
+        /// The existing file or directory.
+        path: PathBuf,
+    },
+    /// The exporter cannot write to this kind of destination.
+    #[error(
+        "this export format cannot write to a {kind} destination (target: {})",
+        target_label(target.as_deref())
+    )]
+    UnsupportedDestination {
+        /// The kind of destination that was refused.
+        kind: DestinationKind,
+        /// The file or directory that would have been written; `None` for a stream.
+        target: Option<PathBuf>,
     },
 }
 
@@ -128,4 +162,9 @@ impl MboxTurboError {
             source,
         }
     }
+}
+
+/// The target of a cancelled export as the message names it; a stream has no path.
+fn target_label(target: Option<&Path>) -> String {
+    target.map_or_else(|| "a stream".to_owned(), |path| path.display().to_string())
 }
