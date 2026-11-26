@@ -6,7 +6,9 @@ version = 2
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no safe upgrade available. It is required by arrow-array (parquet's Arrow stack) and is not used directly. Remove this ignore once arrow drops chrono." },
+]
 
 [licenses]
 version = 2
