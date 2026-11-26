@@ -1,6 +1,7 @@
 //! The value-plus-issues result every parser returns.
 
 use crate::caps::Cap;
+use crate::dkim::RequiredTag;
 
 /// What went wrong at an [`Issue`]'s offset. New kinds are added as parsers are added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,13 +23,22 @@ pub enum IssueKind {
     /// An encoded word decoded to bytes that are not valid in its charset; they became
     /// U+FFFD.
     MalformedBytes,
-    /// An `Authentication-Results` value had a structure the grammar does not allow, such as a
-    /// result with no `=`, a missing authserv-id or a non-numeric version; the entry or pair
-    /// at the offset was skipped.
+    /// An `Authentication-Results` value or a DKIM tag list had a structure the grammar does
+    /// not allow, such as a result or tag with no `=`, a missing authserv-id, a non-numeric
+    /// version or a stray `;`; the entry or pair at the offset was skipped.
     MalformedEntry,
+    /// A tag required by the header's grammar is absent from a tag list; the offset is the end
+    /// of the value.
+    MissingTag {
+        /// The name of the absent tag.
+        tag: RequiredTag,
+    },
     /// A date field was outside its range: a leap second (60) was clamped to 59 and any other
     /// out-of-range field made the date unparsable.
     OutOfRange,
+    /// A tag name appeared again in a tag list; the first value was kept and the offset is the
+    /// repeated name.
+    RepeatedTag,
     /// Text followed a complete date and was ignored.
     TrailingText,
     /// An encoded word named a charset that is unknown, or that has no decoder; the word was

@@ -9,6 +9,7 @@
 mod auth_results;
 mod caps;
 mod date;
+mod dkim;
 mod encoded_word;
 mod issue;
 mod tokenize;
@@ -22,6 +23,7 @@ pub use caps::{
     Cap, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES, MAX_RECEIVED_HOPS,
 };
 pub use date::{Instant, parse_date};
+pub use dkim::{DkimSignature, RequiredTag, Tag, TagList, parse_dkim_signature, parse_tag_list};
 pub use encoded_word::decode_encoded_words;
 pub use issue::{Issue, IssueKind, Parsed};
 pub use tokenize::{Token, TokenKind, tokenize};
