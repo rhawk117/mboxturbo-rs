@@ -32,11 +32,17 @@ bench() {
 
 run() {
   local label=$1 tree=$2 target=$3 round=$4 line
+  local out="${WORK}/out.txt" err="${WORK}/err.txt"
+  if ! bench "${tree}" "${target}" >"${out}" 2>"${err}"; then
+    log::error "bench run failed (${label}, round ${round}):"
+    cat "${err}" >&2
+    exit 1
+  fi
   while IFS= read -r line; do
     case ${line} in
-      select* | parquet*) printf '%-8s round %s  %s\n' "${label}" "${round}" "${line}" ;;
+      select* | parquet*) printf '%-22s round %s  %s\n' "${label}" "${round}" "${line}" ;;
     esac
-  done < <(bench "${tree}" "${target}" 2>/dev/null)
+  done <"${out}"
 }
 
 log::step "Extracting ${REF}"
@@ -58,5 +64,5 @@ run head "${ROOT}" "${WORK}/target-head" warmup >/dev/null
 log::step "Rounds"
 for ((round = 1; round <= ROUNDS; round++)); do
   run "${REF}" "${WORK}/ref" "${WORK}/target-ref" "${round}"
-  run HEAD "${ROOT}" "${WORK}/target-head" "${round}"
+  run "HEAD (working tree)" "${ROOT}" "${WORK}/target-head" "${round}"
 done

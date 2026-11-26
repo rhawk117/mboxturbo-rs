@@ -124,12 +124,12 @@ fn ensure_fixture(directory: &Path, spec: &common::Spec) -> Outcome<PathBuf> {
 }
 
 /// Passes every batch of the default columns through the reader and returns the rows seen.
-fn select_pass(pipeline: &Arc<Pipeline>, mailbox: &Arc<Mailbox>) -> Outcome<usize> {
+fn select_pass(pipeline: &Arc<Pipeline>, mailbox: &Arc<Mailbox>) -> Outcome<u64> {
     let mut rows = 0_usize;
     for batch in pipeline.reader(mailbox) {
         rows = rows.saturating_add(black_box(batch?).num_rows());
     }
-    Ok(rows)
+    Ok(u64::try_from(rows)?)
 }
 
 /// Writes every message's default columns to a Parquet file at `path` and returns the rows
@@ -138,25 +138,35 @@ fn parquet_pass(pipeline: &Arc<Pipeline>, mailbox: &Arc<Mailbox>, path: &Path) -
     Ok(pipeline.write_parquet(mailbox, path, Compression::default())?)
 }
 
-/// Times `RUNS` calls of `pass`, keeping each result alive, and returns the median.
-fn median<T>(mut pass: impl FnMut() -> Outcome<T>) -> Outcome<Duration> {
+/// Times `RUNS` calls of `pass` and returns the median.
+///
+/// # Errors
+///
+/// Fails when a pass fails or reports a row count other than `expected`, so a pass that drops
+/// batches cannot time faster unnoticed.
+fn median(name: &str, expected: u64, mut pass: impl FnMut() -> Outcome<u64>) -> Outcome<Duration> {
     let mut runs = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         let start = Instant::now();
-        let _kept = black_box(pass()?);
+        let rows = black_box(pass()?);
         runs.push(start.elapsed());
+        if rows != expected {
+            return Err(format!("{name}: expected {expected} rows, got {rows}").into());
+        }
     }
     runs.sort_unstable();
     Ok(runs.get(MEDIAN_RUN).copied().unwrap_or(Duration::ZERO))
 }
 
-/// Prints one row: the median pass in milliseconds.
+/// Prints one row: the median pass in milliseconds, to 0.01 ms.
 fn row(name: &str, elapsed: Duration) -> Outcome<()> {
-    writeln!(
-        io::stdout().lock(),
-        "{name:<14} {:>10} ms",
-        elapsed.as_millis()
-    )?;
+    let micros = elapsed.as_micros();
+    let text = format!(
+        "{}.{:02}",
+        micros.div_euclid(1000),
+        micros.rem_euclid(1000).div_euclid(10)
+    );
+    writeln!(io::stdout().lock(), "{name:<14} {text:>12} ms")?;
     Ok(())
 }
 
@@ -172,10 +182,16 @@ fn main() -> Outcome<()> {
     let pipeline = Arc::new(Pipeline::new(Column::defaults(), BATCH_SIZE));
     let scratch = tempfile::tempdir_in(&directory)?;
     let target = scratch.path().join("export.parquet");
-    writeln!(io::stdout().lock(), "messages {}", mailbox.len())?;
-    row("select", median(|| select_pass(&pipeline, &mailbox))?)?;
+    let expected = u64::try_from(mailbox.len())?;
+    writeln!(io::stdout().lock(), "messages {expected}")?;
+    row(
+        "select",
+        median("select", expected, || select_pass(&pipeline, &mailbox))?,
+    )?;
     row(
         "parquet",
-        median(|| parquet_pass(&pipeline, &mailbox, &target))?,
+        median("parquet", expected, || {
+            parquet_pass(&pipeline, &mailbox, &target)
+        })?,
     )
 }
