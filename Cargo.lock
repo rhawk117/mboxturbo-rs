@@ -637,6 +637,7 @@ name = "mboxturbo-headers"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "proptest",
 ]
 
 [[package]]

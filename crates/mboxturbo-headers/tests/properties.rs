@@ -1,0 +1,244 @@
+//! Property tests for the plan's invariant I2: no parser panics, every issue offset lies
+//! within the input, and every cap overflow is reported as exactly one `CapExceeded` issue.
+
+#[cfg(test)]
+mod properties {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use mboxturbo_headers::{
+        Cap, Issue, IssueKind, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES,
+        TrustSet, decode_encoded_words, parse_authentication_results, parse_date,
+        parse_dkim_signature, parse_tag_list, tokenize,
+    };
+    use proptest::prelude::*;
+
+    fn config() -> ProptestConfig {
+        ProptestConfig::with_cases(64)
+    }
+
+    fn arbitrary_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..4096)
+    }
+
+    fn from_alphabet(alphabet: &'static [u8]) -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(prop::sample::select(alphabet), 0..4096)
+    }
+
+    fn tokenize_adversarial() -> impl Strategy<Value = Vec<u8>> {
+        from_alphabet(b"(()\\\"<>[]@:;,. \r\nab=")
+    }
+
+    fn encoded_word_adversarial() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(
+            prop::sample::select(vec![
+                &b"=?"[..],
+                b"?=",
+                b"?",
+                b"utf-8",
+                b"iso-8859-1",
+                b"B",
+                b"Q",
+                b"=",
+                b"=C3",
+                b"a",
+                b"_",
+                b" ",
+            ]),
+            0..512,
+        )
+        .prop_map(|parts| parts.concat())
+    }
+
+    fn date_adversarial() -> impl Strategy<Value = Vec<u8>> {
+        from_alphabet(b"0123456789+-:, ()MonTueWdhFriSatunJFbarpyglOctNvDeZGMTESTCDP")
+    }
+
+    fn tag_list_adversarial() -> impl Strategy<Value = Vec<u8>> {
+        from_alphabet(b";;==  \r\nabdhbvsc:/+")
+    }
+
+    fn auth_results_adversarial() -> impl Strategy<Value = Vec<u8>> {
+        from_alphabet(b";;==..  \"()/abdkimspfnoe1")
+    }
+
+    fn ip_text() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(b"0123456789abcdefABCDEF:./%-+ x".as_slice()),
+            0..64,
+        )
+        .prop_map(|bytes| bytes.into_iter().map(char::from).collect())
+    }
+
+    fn assert_offsets_within(issues: &[Issue], len: usize) -> Result<(), TestCaseError> {
+        for issue in issues {
+            prop_assert!(
+                issue.offset() <= len,
+                "issue {:?} points past the {len}-byte input",
+                issue
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_range_error_within(set: &mut TrustSet, range: &str) -> Result<(), TestCaseError> {
+        if let Err(error) = set.add_ip_range(range) {
+            prop_assert!(
+                error.offset() <= range.len(),
+                "range error offset {} points past the {}-byte text",
+                error.offset(),
+                range.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn trusting(id: &str) -> TrustSet {
+        let mut set = TrustSet::new();
+        let _chain = set.add_authserv_id(id);
+        set
+    }
+
+    fn cap_issues(issues: &[Issue], cap: Cap) -> usize {
+        issues
+            .iter()
+            .filter(|issue| issue.kind() == IssueKind::CapExceeded { cap })
+            .count()
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn tokenize_survives_arbitrary_bytes(input in arbitrary_bytes()) {
+            assert_offsets_within(tokenize(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn tokenize_survives_adversarial_delimiters(input in tokenize_adversarial()) {
+            assert_offsets_within(tokenize(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn decode_encoded_words_survives_arbitrary_bytes(input in arbitrary_bytes()) {
+            assert_offsets_within(decode_encoded_words(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn decode_encoded_words_survives_adversarial_runs(input in encoded_word_adversarial()) {
+            assert_offsets_within(decode_encoded_words(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn parse_date_survives_arbitrary_bytes(input in arbitrary_bytes()) {
+            assert_offsets_within(parse_date(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn parse_date_survives_adversarial_digits_signs_and_zones(input in date_adversarial()) {
+            assert_offsets_within(parse_date(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn trust_set_survives_arbitrary_strings(
+            text in any::<String>(),
+            bytes in arbitrary_bytes(),
+        ) {
+            let mut set = TrustSet::new();
+            let _chain = set.add_host(&text).add_authserv_id(&text);
+            assert_range_error_within(&mut set, &text)?;
+            let _by_bytes = set.trusts_host(&bytes);
+            let _id = set.trusts_authserv_id(&bytes);
+            let _by_text = set.trusts_host(text.as_bytes());
+        }
+
+        #[test]
+        fn trust_set_survives_adversarial_ip_ranges(
+            range in ip_text(),
+            v4 in any::<u32>(),
+            v6 in any::<u128>(),
+        ) {
+            let mut set = TrustSet::new();
+            assert_range_error_within(&mut set, &range)?;
+            let _v4 = set.trusts_ip(IpAddr::V4(Ipv4Addr::from(v4)));
+            let _v6 = set.trusts_ip(IpAddr::V6(Ipv6Addr::from(v6)));
+        }
+
+        #[test]
+        fn parse_authentication_results_survives_arbitrary_bytes(
+            input in arbitrary_bytes(),
+            trusted in any::<bool>(),
+        ) {
+            let set = trusting("mx.example.com");
+            let parsed = parse_authentication_results(&input, trusted.then_some(&set));
+            assert_offsets_within(parsed.issues(), input.len())?;
+        }
+
+        #[test]
+        fn parse_authentication_results_survives_adversarial_separators(
+            input in auth_results_adversarial(),
+            trusted in any::<bool>(),
+        ) {
+            let set = trusting("a");
+            let parsed = parse_authentication_results(&input, trusted.then_some(&set));
+            assert_offsets_within(parsed.issues(), input.len())?;
+        }
+
+        #[test]
+        fn tag_list_and_dkim_survive_arbitrary_bytes(input in arbitrary_bytes()) {
+            assert_offsets_within(parse_tag_list(&input).issues(), input.len())?;
+            assert_offsets_within(parse_dkim_signature(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn tag_list_and_dkim_survive_adversarial_separators(input in tag_list_adversarial()) {
+            assert_offsets_within(parse_tag_list(&input).issues(), input.len())?;
+            assert_offsets_within(parse_dkim_signature(&input).issues(), input.len())?;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(8))]
+
+        #[test]
+        fn nesting_past_the_comment_depth_cap_is_reported_once(
+            extra in 1_usize..64,
+            filler in arbitrary_bytes(),
+        ) {
+            let mut input = vec![b'('; MAX_COMMENT_DEPTH.saturating_add(extra)];
+            input.extend(filler.iter().filter(|byte| !matches!(byte, b'(' | b')' | b'\\' | b'"')));
+            let issues = tokenize(&input).issues().to_vec();
+            prop_assert_eq!(cap_issues(&issues, Cap::CommentDepth), 1, "one CommentDepth issue");
+            assert_offsets_within(&issues, input.len())?;
+        }
+
+        #[test]
+        fn more_encoded_words_than_the_cap_are_reported_once(extra in 1_usize..64) {
+            let input = b"=?utf-8?q?a?= ".repeat(MAX_ENCODED_WORDS.saturating_add(extra));
+            let issues = decode_encoded_words(&input).issues().to_vec();
+            prop_assert_eq!(cap_issues(&issues, Cap::EncodedWords), 1, "one EncodedWords issue");
+            assert_offsets_within(&issues, input.len())?;
+        }
+
+        #[test]
+        fn more_auth_entries_than_the_cap_are_reported_once(extra in 1_usize..64) {
+            let mut input = b"mx.example.com".to_vec();
+            input.extend(b"; spf=pass".repeat(MAX_ENTRIES.saturating_add(extra)));
+            let issues = parse_authentication_results(&input, None).issues().to_vec();
+            prop_assert_eq!(cap_issues(&issues, Cap::Entries), 1, "one Entries issue");
+            assert_offsets_within(&issues, input.len())?;
+        }
+
+        #[test]
+        fn a_header_longer_than_the_byte_cap_is_reported_once(
+            extra in 1_usize..64,
+            byte in b'a'..=b'z',
+        ) {
+            let input = vec![byte; MAX_HEADER_BYTES.saturating_add(extra)];
+            let tokens = tokenize(&input).issues().to_vec();
+            prop_assert_eq!(cap_issues(&tokens, Cap::HeaderBytes), 1, "tokenize flags the cap");
+            assert_offsets_within(&tokens, input.len())?;
+            let auth = parse_authentication_results(&input, None).issues().to_vec();
+            prop_assert_eq!(cap_issues(&auth, Cap::HeaderBytes), 1, "auth results flag the cap");
+        }
+    }
+}
