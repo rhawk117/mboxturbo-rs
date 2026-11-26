@@ -66,6 +66,7 @@ mod api {
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write as _};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -120,6 +121,74 @@ fn report(name: &str, expected: u64, pass: impl FnMut() -> Outcome<u64>) -> Outc
     row(name, median(name, expected, pass)?)
 }
 
+/// Times the mbox, EML, JSONL, CSV and IPC exports into `scratch` and prints their rows; the
+/// body is the block `REF` lacks the sinks for, so `REF` times nothing here.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the five passes share one scratch directory and two selections"
+)]
+fn sink_rows(mailbox: &Arc<Mailbox>, scratch: &Path, expected: u64) -> Outcome<()> {
+    // ab:new begin (scripts/bench-ab.sh drops this block from REF, which lacks these sinks)
+    use mboxturbo::{
+        CsvExporter, Destination, EmlExporter, Export, Exporter, FormulaEscaping, IpcExporter,
+        JsonlExporter, MboxExporter, Overwrite,
+    };
+
+    fn export_pass(
+        pipeline: &Arc<Pipeline>,
+        mailbox: &Arc<Mailbox>,
+        destination: Destination,
+        exporter: Box<dyn Exporter>,
+    ) -> Outcome<u64> {
+        let summary = Export::new(Arc::clone(pipeline), Arc::clone(mailbox), destination)
+            .overwrite(Overwrite::Replace)
+            .run(exporter)?;
+        Ok(summary.messages)
+    }
+
+    let raw = Arc::new(Pipeline::new(
+        vec![Column::Raw, Column::Position],
+        BATCH_SIZE,
+    ));
+    let defaults = Arc::new(Pipeline::new(Column::defaults(), BATCH_SIZE));
+    let file = |name: &str| Destination::File(scratch.join(name));
+    report("mbox", expected, || {
+        export_pass(
+            &raw,
+            mailbox,
+            file("export.mbox"),
+            Box::new(MboxExporter::new()),
+        )
+    })?;
+    report("eml", expected, || {
+        let directory = Destination::Directory(scratch.join("eml"));
+        let exporter = EmlExporter::new(mailbox.len());
+        export_pass(&raw, mailbox, directory, Box::new(exporter))
+    })?;
+    report("jsonl", expected, || {
+        export_pass(
+            &defaults,
+            mailbox,
+            file("export.jsonl"),
+            Box::new(JsonlExporter::new()),
+        )
+    })?;
+    report("csv", expected, || {
+        let exporter = CsvExporter::new(FormulaEscaping::Prefix);
+        export_pass(&defaults, mailbox, file("export.csv"), Box::new(exporter))
+    })?;
+    report("ipc", expected, || {
+        export_pass(
+            &defaults,
+            mailbox,
+            file("export.arrows"),
+            Box::new(IpcExporter::new()),
+        )
+    })?;
+    // ab:new end
+    Ok(())
+}
+
 /// Times the select, the Parquet exports and the copy over the fixture and prints their rows.
 fn main() -> Outcome<()> {
     let spec = common::Spec {
@@ -148,5 +217,6 @@ fn main() -> Outcome<()> {
             api::parquet_pass(&raw, &mailbox, &target, Compression::Uncompressed)
         })?;
     }
-    report("copy", mailbox_bytes, || Ok(fs::copy(&path, &copy)?))
+    report("copy", mailbox_bytes, || Ok(fs::copy(&path, &copy)?))?;
+    sink_rows(&mailbox, scratch.path(), expected)
 }
