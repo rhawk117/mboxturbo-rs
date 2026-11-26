@@ -1,5 +1,6 @@
-//! Harness-free timings of the default column select and of the Parquet export over the
-//! synthetic fixture the index bench uses.
+//! Harness-free timings of the default column select, of the Parquet export, of a raw-only
+//! Parquet export and of a plain copy of the mailbox, over the synthetic fixture the index bench
+//! uses. The raw-only export is held to three times the copy.
 //!
 //! The fixture is the index bench's: `MBOXTURBO_BENCH_DIR` moves it, and
 //! `MBOXTURBO_BENCH_MESSAGES` and `MBOXTURBO_BENCH_SEED` override its defaults of one million
@@ -12,6 +13,58 @@
 )]
 mod common;
 
+// ab:api begin (scripts/bench-ab.sh swaps this block for scripts/ab/export_main.rs)
+/// The calls into the library that differ between the export driver and `write_parquet`.
+mod api {
+    #![expect(
+        clippy::redundant_pub_crate,
+        reason = "contradicts rustc's unreachable_pub, which is the lint this workspace keeps"
+    )]
+
+    use std::hint::black_box;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use mboxturbo::{
+        Column, Compression, Destination, Export, Mailbox, Overwrite, ParquetExporter, Pipeline,
+    };
+
+    use super::Outcome;
+
+    /// Passes every batch of the default columns through the reader and returns the rows seen.
+    pub(crate) fn select_pass(pipeline: &Arc<Pipeline>, mailbox: &Arc<Mailbox>) -> Outcome<u64> {
+        let mut rows = 0_usize;
+        for batch in pipeline.reader(mailbox) {
+            rows = rows.saturating_add(black_box(batch?).num_rows());
+        }
+        Ok(u64::try_from(rows)?)
+    }
+
+    /// A pipeline of the raw column alone, which `REF` may lack.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the `REF` variant of this function has no raw column and returns `None`"
+    )]
+    pub(crate) fn raw_pipeline(batch_size: usize) -> Option<Arc<Pipeline>> {
+        Some(Arc::new(Pipeline::new(vec![Column::Raw], batch_size)))
+    }
+
+    /// Writes every message's default columns to a Parquet file at `path` and returns the rows
+    /// written.
+    pub(crate) fn parquet_pass(
+        pipeline: &Arc<Pipeline>,
+        mailbox: &Arc<Mailbox>,
+        path: &Path,
+    ) -> Outcome<u64> {
+        let destination = Destination::File(path.to_path_buf());
+        let summary = Export::new(Arc::clone(pipeline), Arc::clone(mailbox), destination)
+            .overwrite(Overwrite::Replace)
+            .run(Box::new(ParquetExporter::new(Compression::default())))?;
+        Ok(summary.messages)
+    }
+}
+// ab:api end
+
 use std::env::{self, VarError};
 use std::error::Error;
 use std::fs;
@@ -21,7 +74,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mboxturbo::{Column, Compression, Mailbox, Pipeline};
+use mboxturbo::{Column, Mailbox, Pipeline};
 
 /// Messages in the fixture when `MBOXTURBO_BENCH_MESSAGES` is unset.
 const DEFAULT_MESSAGES: u64 = 1_000_000;
@@ -123,21 +176,6 @@ fn ensure_fixture(directory: &Path, spec: &common::Spec) -> Outcome<PathBuf> {
     Ok(path)
 }
 
-/// Passes every batch of the default columns through the reader and returns the rows seen.
-fn select_pass(pipeline: &Arc<Pipeline>, mailbox: &Arc<Mailbox>) -> Outcome<u64> {
-    let mut rows = 0_usize;
-    for batch in pipeline.reader(mailbox) {
-        rows = rows.saturating_add(black_box(batch?).num_rows());
-    }
-    Ok(u64::try_from(rows)?)
-}
-
-/// Writes every message's default columns to a Parquet file at `path` and returns the rows
-/// written.
-fn parquet_pass(pipeline: &Arc<Pipeline>, mailbox: &Arc<Mailbox>, path: &Path) -> Outcome<u64> {
-    Ok(pipeline.write_parquet(mailbox, path, Compression::default())?)
-}
-
 /// Times `RUNS` calls of `pass` and returns the median.
 ///
 /// # Errors
@@ -170,7 +208,12 @@ fn row(name: &str, elapsed: Duration) -> Outcome<()> {
     Ok(())
 }
 
-/// Times the select and the Parquet export over the fixture and prints their rows.
+/// Times `pass` as `name` and prints its row.
+fn report(name: &str, expected: u64, pass: impl FnMut() -> Outcome<u64>) -> Outcome<()> {
+    row(name, median(name, expected, pass)?)
+}
+
+/// Times the select, the Parquet exports and the copy over the fixture and prints their rows.
 fn main() -> Outcome<()> {
     let spec = common::Spec {
         messages: env_number("MBOXTURBO_BENCH_MESSAGES", DEFAULT_MESSAGES)?,
@@ -182,16 +225,18 @@ fn main() -> Outcome<()> {
     let pipeline = Arc::new(Pipeline::new(Column::defaults(), BATCH_SIZE));
     let scratch = tempfile::tempdir_in(&directory)?;
     let target = scratch.path().join("export.parquet");
+    let copy = scratch.path().join("copy.mbox");
+    let mailbox_bytes = fs::metadata(&path)?.len();
     let expected = u64::try_from(mailbox.len())?;
     writeln!(io::stdout().lock(), "messages {expected}")?;
-    row(
-        "select",
-        median("select", expected, || select_pass(&pipeline, &mailbox))?,
-    )?;
-    row(
-        "parquet",
-        median("parquet", expected, || {
-            parquet_pass(&pipeline, &mailbox, &target)
-        })?,
-    )
+    report("select", expected, || api::select_pass(&pipeline, &mailbox))?;
+    report("parquet", expected, || {
+        api::parquet_pass(&pipeline, &mailbox, &target)
+    })?;
+    if let Some(raw) = api::raw_pipeline(BATCH_SIZE) {
+        report("raw-parquet", expected, || {
+            api::parquet_pass(&raw, &mailbox, &target)
+        })?;
+    }
+    report("copy", mailbox_bytes, || Ok(fs::copy(&path, &copy)?))
 }

@@ -4,18 +4,20 @@
 #[cfg(test)]
 mod export {
     use std::fmt::Write as _;
+    use std::fs::{self, File};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::{fs, thread};
+    use std::thread;
 
     use arrow_array::RecordBatch;
     use arrow_array::cast::AsArray as _;
     use arrow_schema::SchemaRef;
     use mboxturbo::{
-        CancelToken, Column, Destination, DestinationKind, Export, Exporter, Mailbox,
-        MboxTurboError, Overwrite, Pipeline, Progress, Selection, Staged,
+        CancelToken, Column, Compression, Destination, DestinationKind, Export, Exporter, Mailbox,
+        MboxTurboError, Overwrite, ParquetExporter, Pipeline, Progress, Selection, Staged,
     };
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::TempDir;
 
     const MESSAGES: usize = 7;
@@ -401,6 +403,97 @@ mod export {
                 "nothing is left at or beside the target"
             );
         }
+    }
+
+    /// The schema and batches of the Parquet file at `path`, read with the Arrow reader.
+    fn read_parquet(path: &Path) -> (SchemaRef, Vec<RecordBatch>) {
+        let file = File::open(path).expect("exported parquet file opens");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet footer is readable");
+        let schema = SchemaRef::clone(builder.schema());
+        let batches = builder
+            .build()
+            .expect("parquet reader builds")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every parquet batch is decoded");
+        (schema, batches)
+    }
+
+    /// A fixture whose pipeline extracts the default columns, and the file the old writer wrote.
+    fn default_columns_fixture() -> (Fixture, PathBuf) {
+        let mut fixture = Fixture::new();
+        fixture.pipeline = Arc::new(Pipeline::new(Column::defaults(), BATCH_SIZE));
+        let expected = fixture.output.path().join("expected.parquet");
+        let rows = fixture
+            .pipeline
+            .write_parquet(&fixture.mailbox, &expected, Compression::Zstd)
+            .expect("the old writer writes the file");
+        assert_eq!(rows, count(MESSAGES), "the old writer saw every message");
+        (fixture, expected)
+    }
+
+    #[test]
+    fn a_parquet_file_from_the_driver_reads_back_as_the_old_writer_wrote_it() {
+        let (fixture, expected) = default_columns_fixture();
+        let summary = fixture
+            .export(Destination::File(fixture.target()))
+            .run(Box::new(ParquetExporter::new(Compression::Zstd)))
+            .expect("the parquet export succeeds");
+
+        let (old_schema, old_batches) = read_parquet(&expected);
+        let (new_schema, new_batches) = read_parquet(&fixture.target());
+        assert_eq!(new_schema, old_schema, "the Arrow schema is unchanged");
+        assert_eq!(new_batches, old_batches, "rows and values are unchanged");
+        assert_eq!(
+            summary.messages,
+            count(MESSAGES),
+            "every message is counted"
+        );
+        let file = fs::read(fixture.target()).expect("exported file is readable");
+        assert!(
+            summary.bytes <= count(file.len()),
+            "the reported bytes never exceed what the file holds"
+        );
+    }
+
+    #[test]
+    fn a_parquet_stream_holds_the_same_rows_as_a_parquet_file() {
+        let (fixture, expected) = default_columns_fixture();
+        let streamed = fixture.output.path().join("streamed.parquet");
+        let summary = fixture
+            .export(Destination::Stream(Box::new(
+                File::create(&streamed).expect("stream file creates"),
+            )))
+            .run(Box::new(ParquetExporter::new(Compression::Zstd)))
+            .expect("the parquet stream export succeeds");
+
+        assert_eq!(
+            read_parquet(&streamed),
+            read_parquet(&expected),
+            "a stream carries the same file as a file destination"
+        );
+        assert_eq!(summary.path, None, "a stream has no path");
+    }
+
+    #[test]
+    fn the_parquet_sink_refuses_a_directory_before_staging_anything() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .export(Destination::Directory(fixture.target()))
+            .run(Box::new(ParquetExporter::new(Compression::Zstd)))
+            .expect_err("parquet cannot fill a directory");
+
+        assert!(
+            matches!(
+                error,
+                MboxTurboError::UnsupportedDestination {
+                    kind: DestinationKind::Directory,
+                    ..
+                }
+            ),
+            "the refused kind is the directory"
+        );
+        assert!(fixture.leftovers().is_empty(), "nothing was staged");
     }
 
     fn count(length: usize) -> u64 {

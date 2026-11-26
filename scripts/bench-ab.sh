@@ -40,7 +40,7 @@ run() {
   fi
   while IFS= read -r line; do
     case ${line} in
-      select* | parquet*) printf '%-22s round %s  %s\n' "${label}" "${round}" "${line}" ;;
+      select* | parquet* | raw-parquet* | copy*) printf '%-22s round %s  %s\n' "${label}" "${round}" "${line}" ;;
     esac
   done <"${out}"
 }
@@ -48,7 +48,13 @@ run() {
 log::step "Extracting ${REF}"
 mkdir "${WORK}/ref"
 git -C "${ROOT}" archive "${REF}" | tar -x -C "${WORK}/ref"
-cp "${ROOT}/crates/mboxturbo/benches/export.rs" "${WORK}/ref/crates/mboxturbo/benches/export.rs"
+# The bench's API block calls the export driver, which REF lacks: give REF's copy the block in
+# scripts/ab/export_main.rs, which calls write_parquet instead.
+awk -v main_side="${ROOT}/scripts/ab/export_main.rs" '
+  /^\/\/ ab:api begin/ { while ((getline line < main_side) > 0) print line; skip = 1; next }
+  /^\/\/ ab:api end/ { skip = 0; next }
+  !skip { print }
+' "${ROOT}/crates/mboxturbo/benches/export.rs" >"${WORK}/ref/crates/mboxturbo/benches/export.rs"
 if ! grep -q 'name = "export"' "${WORK}/ref/crates/mboxturbo/Cargo.toml"; then
   printf '\n[[bench]]\nname = "export"\nharness = false\n' >>"${WORK}/ref/crates/mboxturbo/Cargo.toml"
 fi
