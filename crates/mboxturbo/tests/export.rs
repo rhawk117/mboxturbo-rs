@@ -210,7 +210,12 @@ mod export {
 
         fn raw_messages(&self) -> Vec<Vec<u8>> {
             (0..MESSAGES)
-                .map(|position| self.mailbox.raw(position).expect("message exists").to_vec())
+                .map(|position| {
+                    self.mailbox
+                        .raw(position)
+                        .expect("the message exists at that position")
+                        .to_vec()
+                })
                 .collect()
         }
 
@@ -336,7 +341,7 @@ mod export {
                 .export(Destination::File(fixture.target()))
                 .overwrite(Overwrite::Replace)
                 .run(Box::new(StreamSink))
-                .expect("replacing succeeds"),
+                .expect("replacing the target succeeds"),
         );
         assert_eq!(
             fs::read(fixture.target()).expect("target is readable"),

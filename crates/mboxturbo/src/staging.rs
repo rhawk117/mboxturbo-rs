@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn a_failed_restore_keeps_the_previous_output_at_the_path_the_error_names() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.txt"), b"previous").expect("previous output is written");

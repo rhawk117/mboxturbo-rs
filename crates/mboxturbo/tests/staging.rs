@@ -27,26 +27,28 @@ mod staging {
 
     #[test]
     fn a_staged_file_sits_in_the_parent_and_appears_only_on_commit() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out.parquet");
         let mut staged = Destination::File(target.clone())
             .stage(Overwrite::Refuse)
-            .expect("stages");
+            .expect("staging a target succeeds");
         staged
             .writer()
             .expect("a file has a writer")
             .write_all(b"data")
-            .expect("writes");
+            .expect("writing to the staged file succeeds");
         assert!(!target.exists(), "nothing at the target before commit");
         assert_eq!(
             entries(parent.path()).len(),
             1,
             "one staged file in the parent"
         );
-        let committed = staged.commit().expect("commits");
+        let committed = staged
+            .commit()
+            .expect("committing the staged target succeeds");
         assert_eq!(committed, Some(target.clone()), "commit returns the target");
         assert_eq!(
-            fs::read(&target).expect("target reads"),
+            fs::read(&target).expect("the committed target file is readable"),
             b"data",
             "content is committed"
         );
@@ -59,16 +61,16 @@ mod staging {
 
     #[test]
     fn dropping_a_staged_file_leaves_nothing() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out.parquet");
         let mut staged = Destination::File(target)
             .stage(Overwrite::Refuse)
-            .expect("stages");
+            .expect("staging a target succeeds");
         staged
             .writer()
             .expect("a file has a writer")
             .write_all(b"data")
-            .expect("writes");
+            .expect("writing to the staged file succeeds");
         drop(staged);
         assert!(
             entries(parent.path()).is_empty(),
@@ -78,11 +80,11 @@ mod staging {
 
     #[test]
     fn a_staged_directory_appears_only_on_commit() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
         let staged = Destination::Directory(target.clone())
             .stage(Overwrite::Refuse)
-            .expect("stages");
+            .expect("staging a target succeeds");
         let inner = staged
             .directory()
             .expect("a directory has a path")
@@ -94,9 +96,13 @@ mod staging {
         );
         fs::write(&inner, b"x").expect("fills staging directory");
         assert!(!target.exists(), "nothing at the target before commit");
-        drop(staged.commit().expect("commits"));
+        drop(
+            staged
+                .commit()
+                .expect("committing the staged target succeeds"),
+        );
         assert_eq!(
-            fs::read(target.join("a.eml")).expect("file moved"),
+            fs::read(target.join("a.eml")).expect("the staged file was moved into place"),
             b"x",
             "contents move"
         );
@@ -105,13 +111,13 @@ mod staging {
 
     #[test]
     fn a_failed_directory_replacement_keeps_the_previous_output() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.eml"), b"old").expect("previous output fills");
         let staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
-            .expect("stages");
+            .expect("staging a target succeeds");
         let staging = staged.directory().expect("a directory has a path");
         fs::write(staging.join("new.eml"), b"new").expect("fills staging directory");
         // FC-1: removing the staged directory makes the second rename fail.
@@ -135,16 +141,20 @@ mod staging {
 
     #[test]
     fn a_replaced_directory_leaves_only_the_new_output() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.eml"), b"old").expect("previous output fills");
         let staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
-            .expect("stages");
+            .expect("staging a target succeeds");
         let staging = staged.directory().expect("a directory has a path");
         fs::write(staging.join("new.eml"), b"new").expect("fills staging directory");
-        drop(staged.commit().expect("commits"));
+        drop(
+            staged
+                .commit()
+                .expect("committing the staged target succeeds"),
+        );
         assert_eq!(entries(&target), ["new.eml"], "only the new output remains");
         assert_eq!(
             entries(parent.path()),
@@ -155,10 +165,10 @@ mod staging {
 
     #[test]
     fn dropping_a_staged_directory_leaves_nothing() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let other = Destination::Directory(parent.path().join("gone"))
             .stage(Overwrite::Refuse)
-            .expect("stages");
+            .expect("staging a target succeeds");
         drop(other);
         assert!(
             entries(parent.path()).is_empty(),
@@ -168,9 +178,9 @@ mod staging {
 
     #[test]
     fn an_existing_target_is_refused_before_anything_is_created() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
-        fs::write(&target, b"old").expect("existing target");
+        fs::write(&target, b"old").expect("creating the existing target file succeeds");
         for destination in [
             Destination::File(target.clone()),
             Destination::Directory(target.clone()),
@@ -185,7 +195,7 @@ mod staging {
         }
         assert_eq!(entries(parent.path()), ["out"], "nothing was staged");
         assert_eq!(
-            fs::read(&target).expect("reads"),
+            fs::read(&target).expect("reading the replaced target succeeds"),
             b"old",
             "target untouched"
         );
@@ -193,40 +203,60 @@ mod staging {
 
     #[test]
     fn overwrite_replaces_an_existing_file_on_commit() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
-        fs::write(&target, b"old").expect("existing target");
+        fs::write(&target, b"old").expect("creating the existing target file succeeds");
         let mut staged = Destination::File(target.clone())
             .stage(Overwrite::Replace)
-            .expect("stages");
+            .expect("staging a target succeeds");
         staged
             .writer()
             .expect("a file has a writer")
             .write_all(b"new")
-            .expect("writes");
-        drop(staged.commit().expect("commits"));
-        assert_eq!(fs::read(&target).expect("reads"), b"new", "file replaced");
+            .expect("writing to the staged file succeeds");
+        drop(
+            staged
+                .commit()
+                .expect("committing the staged target succeeds"),
+        );
+        assert_eq!(
+            fs::read(&target).expect("reading the replaced target succeeds"),
+            b"new",
+            "file replaced"
+        );
     }
 
     #[test]
     fn overwrite_replaces_an_existing_directory_on_commit() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
-        fs::create_dir_all(&target).expect("existing directory");
-        fs::write(target.join("old.eml"), b"old").expect("old content");
+        fs::create_dir_all(&target).expect("creating the existing target directory succeeds");
+        fs::write(target.join("old.eml"), b"old")
+            .expect("writing the old directory content succeeds");
         let staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
-            .expect("stages");
-        fs::write(staged.directory().expect("path").join("new.eml"), b"new").expect("fills");
-        drop(staged.commit().expect("commits"));
+            .expect("staging a target succeeds");
+        fs::write(
+            staged
+                .directory()
+                .expect("the staged directory has a path")
+                .join("new.eml"),
+            b"new",
+        )
+        .expect("filling the staged directory succeeds");
+        drop(
+            staged
+                .commit()
+                .expect("committing the staged target succeeds"),
+        );
         assert_eq!(entries(&target), ["new.eml"], "old contents are gone");
     }
 
     #[test]
     fn a_stream_is_written_directly_with_no_staging_or_path() {
-        let parent = TempDir::new().expect("parent creates");
+        let parent = TempDir::new().expect("the parent temp directory is created");
         let sink = parent.path().join("sink");
-        let writer = File::create(&sink).expect("sink creates");
+        let writer = File::create(&sink).expect("the sink file is created");
         let mut staged = Destination::Stream(Box::new(writer))
             .stage(Overwrite::Refuse)
             .expect("a stream always stages");
@@ -234,14 +264,16 @@ mod staging {
             .writer()
             .expect("a stream has a writer")
             .write_all(b"hello")
-            .expect("writes");
+            .expect("writing to the staged file succeeds");
         assert_eq!(
-            fs::read(&sink).expect("sink reads"),
+            fs::read(&sink).expect("the sink file is readable"),
             b"hello",
             "bytes arrive before commit"
         );
         assert_eq!(
-            staged.commit().expect("commits"),
+            staged
+                .commit()
+                .expect("committing the staged target succeeds"),
             None,
             "a stream has no final path"
         );
