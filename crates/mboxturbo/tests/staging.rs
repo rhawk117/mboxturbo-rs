@@ -278,4 +278,39 @@ mod staging {
             "a stream has no final path"
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_committed_directory_has_the_mode_a_created_directory_gets() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = TempDir::new().expect("the parent temp directory is created");
+        let reference = parent.path().join("reference");
+        fs::create_dir_all(&reference).expect("the reference directory is created");
+        let target = parent.path().join("out");
+        let staged = Destination::Directory(target.clone())
+            .stage(Overwrite::Refuse)
+            .expect("the directory stages");
+        let committed = staged
+            .commit()
+            .expect("committing the staged directory succeeds");
+        assert_eq!(
+            committed,
+            Some(target.clone()),
+            "the directory commits at the target"
+        );
+
+        let mode = |path: &Path| {
+            fs::metadata(path)
+                .expect("the directory has metadata")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(
+            mode(&target),
+            mode(&reference),
+            "the committed directory must not keep tempfile's private 0700 mode"
+        );
+    }
 }

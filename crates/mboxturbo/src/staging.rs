@@ -145,7 +145,7 @@ impl Destination {
         match self {
             Self::Directory(target) => {
                 refuse_existing(&target, overwrite)?;
-                let directory = TempDir::new_in(parent_of(&target))
+                let directory = staging_directory(parent_of(&target))
                     .map_err(|source| MboxTurboError::io(&target, source))?;
                 Ok(Staged {
                     kind: Kind::Directory(directory),
@@ -270,33 +270,73 @@ fn commit_directory_with(
         Overwrite::Refuse => None,
     };
     let staged = directory.keep();
-    if let Err(source) = rename(&staged, &target) {
-        // The rename error is the one worth reporting; leftovers are cleaned up best effort.
-        drop(fs::remove_dir_all(&staged));
-        if let Some(holder) = set_aside {
-            let previous = holder.path().join(SET_ASIDE);
-            if let Err(restore) = rename(&previous, &target) {
-                // Dropping the holder would delete the previous output; keep it instead.
-                drop(holder.keep());
-                return Err(MboxTurboError::io(
-                    &previous,
-                    io::Error::new(
-                        restore.kind(),
-                        format!(
-                            "restoring the previous output to {} failed ({restore}) after \
-                             the new output could not be moved there ({source}); the \
-                             previous output is at this path",
-                            target.display()
-                        ),
-                    ),
-                ));
-            }
-        }
-        return Err(MboxTurboError::io(&target, source));
+    let Err(source) = rename(&staged, &target) else {
+        // The new output is in place; a leftover set-aside copy is not worth failing the commit.
+        drop(set_aside);
+        return Ok(target);
+    };
+    // The rename error is the one worth reporting; leftovers are cleaned up best effort.
+    drop(fs::remove_dir_all(&staged));
+    Err(match set_aside {
+        Some(holder) => restore_previous(holder, &target, source, rename),
+        None => MboxTurboError::io(&target, source),
+    })
+}
+
+/// Moves the set-aside previous output back to `target` after the new output could not be put
+/// there, and returns the error to report: `source` when the restore worked, otherwise an
+/// error naming where the previous output is kept.
+fn restore_previous(
+    holder: TempDir,
+    target: &Path,
+    source: io::Error,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> MboxTurboError {
+    let previous = holder.path().join(SET_ASIDE);
+    let Err(restore) = rename(&previous, target) else {
+        return MboxTurboError::io(target, source);
+    };
+    // Dropping the holder would delete the previous output; keep it instead.
+    drop(holder.keep());
+    restore_failure(&previous, target, &restore, &source)
+}
+
+/// The error for a restore that failed after the commit rename failed; its path is where the
+/// previous output now sits.
+fn restore_failure(
+    previous: &Path,
+    target: &Path,
+    restore: &io::Error,
+    source: &io::Error,
+) -> MboxTurboError {
+    MboxTurboError::io(
+        previous,
+        io::Error::new(
+            restore.kind(),
+            format!(
+                "restoring the previous output to {} failed ({restore}) after the new output \
+                 could not be moved there ({source}); the previous output is at this path",
+                target.display()
+            ),
+        ),
+    )
+}
+
+/// Creates a staging directory in `parent` with the mode `fs::create_dir` would give it (the
+/// umask still applies) rather than tempfile's private 0700, because it is renamed into
+/// place as the committed export.
+fn staging_directory(parent: &Path) -> io::Result<TempDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o777))
+            .tempdir_in(parent)
     }
-    // The new output is in place; a leftover set-aside copy is not worth failing the commit.
-    drop(set_aside);
-    Ok(target)
+    #[cfg(not(unix))]
+    {
+        TempDir::new_in(parent)
+    }
 }
 
 /// Moves an existing file or directory at `target` into a fresh holder directory in the same
