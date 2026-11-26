@@ -1,6 +1,8 @@
-//! Harness-free timings of the default column select, of the Parquet export, of a raw-only
-//! Parquet export and of a plain copy of the mailbox, over the synthetic fixture the index bench
-//! uses. The raw-only export is held to three times the copy.
+//! Harness-free timings of the default column select, of the Parquet export, of raw-only Parquet
+//! exports and of a plain copy of the mailbox, over the synthetic fixture the index bench uses.
+//! The raw-only export with compression off (`raw-parquet-uncompressed`) is the row held to three
+//! times the copy; the zstd `raw-parquet` row is reported only, because compressing the raw bytes
+//! is work a copy does not do.
 //!
 //! The fixture is the index bench's: `MBOXTURBO_BENCH_DIR` moves it, and
 //! `MBOXTURBO_BENCH_MESSAGES` and `MBOXTURBO_BENCH_SEED` override its defaults of one million
@@ -49,17 +51,18 @@ mod api {
         Some(Arc::new(Pipeline::new(vec![Column::Raw], batch_size)))
     }
 
-    /// Writes every message's default columns to a Parquet file at `path` and returns the rows
-    /// written.
+    /// Writes every message's columns of `pipeline` to a Parquet file at `path` compressed with
+    /// `compression` and returns the rows written.
     pub(crate) fn parquet_pass(
         pipeline: &Arc<Pipeline>,
         mailbox: &Arc<Mailbox>,
         path: &Path,
+        compression: Compression,
     ) -> Outcome<u64> {
         let destination = Destination::File(path.to_path_buf());
         let summary = Export::new(Arc::clone(pipeline), Arc::clone(mailbox), destination)
             .overwrite(Overwrite::Replace)
-            .run(Box::new(ParquetExporter::new(Compression::default())))?;
+            .run(Box::new(ParquetExporter::new(compression)))?;
         Ok(summary.messages)
     }
 }
@@ -74,7 +77,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mboxturbo::{Column, Mailbox, Pipeline};
+use mboxturbo::{Column, Compression, Mailbox, Pipeline};
 
 /// Messages in the fixture when `MBOXTURBO_BENCH_MESSAGES` is unset.
 const DEFAULT_MESSAGES: u64 = 1_000_000;
@@ -204,7 +207,7 @@ fn row(name: &str, elapsed: Duration) -> Outcome<()> {
         micros.div_euclid(1000),
         micros.rem_euclid(1000).div_euclid(10)
     );
-    writeln!(io::stdout().lock(), "{name:<14} {text:>12} ms")?;
+    writeln!(io::stdout().lock(), "{name:<26} {text:>12} ms")?;
     Ok(())
 }
 
@@ -231,11 +234,14 @@ fn main() -> Outcome<()> {
     writeln!(io::stdout().lock(), "messages {expected}")?;
     report("select", expected, || api::select_pass(&pipeline, &mailbox))?;
     report("parquet", expected, || {
-        api::parquet_pass(&pipeline, &mailbox, &target)
+        api::parquet_pass(&pipeline, &mailbox, &target, Compression::default())
     })?;
     if let Some(raw) = api::raw_pipeline(BATCH_SIZE) {
         report("raw-parquet", expected, || {
-            api::parquet_pass(&raw, &mailbox, &target)
+            api::parquet_pass(&raw, &mailbox, &target, Compression::default())
+        })?;
+        report("raw-parquet-uncompressed", expected, || {
+            api::parquet_pass(&raw, &mailbox, &target, Compression::Uncompressed)
         })?;
     }
     report("copy", mailbox_bytes, || Ok(fs::copy(&path, &copy)?))

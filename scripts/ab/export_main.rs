@@ -27,13 +27,14 @@ mod api {
         None
     }
 
-    /// Writes every message's default columns to a Parquet file at `path` and returns the rows
-    /// written.
+    /// Writes every message's columns of `pipeline` to a Parquet file at `path` compressed with
+    /// `compression` and returns the rows written.
     pub(crate) fn parquet_pass(
         pipeline: &Arc<Pipeline>,
         mailbox: &Arc<Mailbox>,
         path: &Path,
+        compression: Compression,
     ) -> Outcome<u64> {
-        Ok(pipeline.write_parquet(mailbox, path, Compression::default())?)
+        Ok(pipeline.write_parquet(mailbox, path, compression)?)
     }
 }
