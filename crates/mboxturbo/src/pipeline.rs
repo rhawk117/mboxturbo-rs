@@ -638,7 +638,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::io::Write as _;
+    use std::io::{Write as _, sink};
     use std::iter;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -648,8 +648,8 @@ mod tests {
 
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray as _;
-    use arrow_array::{Array as _, ListArray};
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_array::{Array as _, ListArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use mail_parser::{HeaderForm, HeaderName, MessageParser};
     use tempfile::NamedTempFile;
 
@@ -660,8 +660,11 @@ mod tests {
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
+    use crate::export::{Export, Exporter};
     use crate::fields::Mail;
     use crate::mailbox::Mailbox;
+    use crate::selection::Selection;
+    use crate::staging::{Destination, DestinationKind, Staged};
 
     /// A bound only a broken implementation reaches: it turns a hang into a failure.
     const STUCK: Duration = Duration::from_secs(60);
@@ -700,6 +703,36 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
     impl Probe for Started {
         fn started(&self, _runs: &[Range<usize>]) {
             let _previous = self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Accepts any destination and writes nothing, so only the reader can fail an export.
+    #[derive(Debug)]
+    struct Discard;
+
+    impl Exporter for Discard {
+        fn accepts(&self, _kind: DestinationKind) -> bool {
+            true
+        }
+
+        fn begin(
+            &mut self,
+            _schema: &SchemaRef,
+            _staged: &mut Staged,
+        ) -> Result<(), MboxTurboError> {
+            Ok(())
+        }
+
+        fn finish(&mut self, _staged: &mut Staged) -> Result<u64, MboxTurboError> {
+            Ok(0)
+        }
+
+        fn write(
+            &mut self,
+            _batch: &RecordBatch,
+            _staged: &mut Staged,
+        ) -> Result<u64, MboxTurboError> {
+            Ok(0)
         }
     }
 
@@ -988,6 +1021,27 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert!(
             matches!(&error, MboxTurboError::Arrow { positions, .. } if *positions == (0..1)),
             "the error names the positions clamped to the one message that exists"
+        );
+    }
+
+    // Only a batch that cannot be assembled fails a reader once `select` has succeeded, and
+    // the public API cannot build one, so the schema is replaced here as in the test above.
+    #[test]
+    fn a_reader_error_reaches_the_export_caller_as_its_own_variant_and_positions() {
+        let (_file, mailbox) = numbered_mailbox(3);
+        let mut pipeline = Pipeline::new(vec![Column::Position], 2);
+        pipeline.schema = Arc::new(Schema::new(Vec::<Field>::new()));
+        let error = Export::new(
+            Arc::new(pipeline),
+            mailbox,
+            Destination::Stream(Box::new(sink())),
+        )
+        .selection(Selection::Positions(vec![1, 2]))
+        .run(Box::new(Discard))
+        .expect_err("a batch that cannot be assembled fails the export");
+        assert!(
+            matches!(&error, MboxTurboError::Arrow { positions, .. } if *positions == (1..3)),
+            "the driver returns the reader's error naming the selected positions: {error:?}"
         );
     }
 

@@ -214,6 +214,32 @@ mod tests {
         pool.install(|| ());
     }
 
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test observes the panic Ordered::next raises for a job that sent nothing"
+    )]
+    fn a_job_that_ends_without_a_result_panics_next_instead_of_ending_the_stream() {
+        let pool = pool(1);
+        let mut stream = Ordered::new();
+        pool.install(|| stream.submit(|| 0_u32));
+        assert_eq!(
+            stream.next(),
+            Some(0),
+            "the job before cancellation is delivered"
+        );
+        // the state a drop leaves behind, reached here without dropping so next can still run
+        stream.cancelled.store(true, Ordering::Relaxed);
+        pool.install(|| stream.submit(|| 1));
+        let payload = catch_unwind(AssertUnwindSafe(|| stream.next()))
+            .expect_err("a job that vanished must not read as a shorter stream");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("extraction job 1 ended without sending a result"),
+            "the panic names the job that sent nothing"
+        );
+    }
+
     /// A job that counts itself, announces its start and then waits, bounded, for `gate`.
     fn gated_job(
         ran: &Arc<AtomicUsize>,

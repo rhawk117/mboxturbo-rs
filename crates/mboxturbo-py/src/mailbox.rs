@@ -78,10 +78,12 @@ impl Cursor {
 
 /// An mbox file mapped read-only and indexed in parallel.
 ///
-/// ``index`` names a cache file: it is reused while it matches the mailbox and rebuilt and
-/// rewritten when it is missing or stale. The file must not be modified while the mailbox, or
-/// any message taken from it, is alive. Parallel work uses a thread pool that does not survive
-/// ``os.fork()``; use the ``forkserver`` or ``spawn`` start method for multiprocessing.
+/// Without ``index``, the index is saved beside the mailbox as ``<path>.mbxidx`` and reused
+/// while it matches; a directory that cannot be written leaves nothing behind and the index stays
+/// in memory. ``index`` names a cache file instead: it is reused while it matches the mailbox
+/// and rebuilt and rewritten when it is missing or stale. The file must not be modified while the
+/// mailbox, or any message taken from it, is alive. Parallel work uses a thread pool that does not
+/// survive ``os.fork()``; use the ``forkserver`` or ``spawn`` start method for multiprocessing.
 #[pyclass(frozen, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct Mailbox {
@@ -158,7 +160,7 @@ impl Mailbox {
         self.slot.clear();
     }
 
-    /// Opens ``path``, reusing or rewriting the cache at ``index`` when one is given.
+    /// Opens ``path`` with its index, kept where the class documentation says.
     #[new]
     #[pyo3(signature = (path, *, index = None))]
     fn new(py: Python<'_>, path: PathBuf, index: Option<PathBuf>) -> PyResult<Self> {

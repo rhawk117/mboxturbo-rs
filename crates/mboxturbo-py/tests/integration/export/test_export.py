@@ -1,6 +1,7 @@
 """Columnar selections: Arrow consumers, Parquet output and agreement with Message."""
 
 import hashlib
+import sysconfig
 import threading
 import time
 from collections.abc import Sequence
@@ -231,9 +232,16 @@ class TestParquetOverwrite:
         assert pq.read_table(target).to_pylist() == [{'subject': 's'}]
 
 
+@pytest.mark.skipif(
+    bool(sysconfig.get_config_var('Py_GIL_DISABLED')),
+    reason='free-threaded build: the counter runs whether or not to_parquet detaches',
+)
 class TestGilRelease:
-    MESSAGES = 20_000
-    MIN_TICKS = 3
+    # Without py.detach the counter lands exactly 1 tick inside the export, whatever
+    # the core count or fixture size. With it, 100k messages gave at least 10 ticks on
+    # 12 cores and 15 to 17 on 2 to 4 cores, where 20k messages gave as few as 4.
+    MESSAGES = 100_000
+    MIN_TICKS = 5
 
     @pytest.fixture
     def selection(self, mailbox_writer: MailboxWriter) -> Selection:
