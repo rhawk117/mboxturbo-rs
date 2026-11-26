@@ -114,7 +114,8 @@ impl Pipeline {
     ///
     /// # Panics
     ///
-    /// Re-raises a panic from the producer thread on the calling thread.
+    /// Re-raises a panic from the producer thread on the calling thread, which includes the panic
+    /// of an extraction job the producer was reading.
     fn encode_parquet(
         self: &Arc<Self>,
         mailbox: &Arc<Mailbox>,

@@ -1,7 +1,9 @@
 //! Ordered hand-off of parallel work: jobs run on rayon threads and their results come back in
 //! submission order, each as soon as it and every job before it has finished.
 
+use std::any::Any;
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, TryRecvError, sync_channel};
@@ -10,15 +12,23 @@ use std::thread;
 /// Jobs in flight on the rayon pool, whose results are read back in the order they were submitted.
 ///
 /// Dropping the stream cancels the jobs that have not started yet; a job already running finishes
-/// and its result is discarded. A job that panics aborts the process (`rayon::spawn` has no panic
-/// handler here), so jobs must contain their own panics.
+/// and its result is discarded. A job that panics does not abort the process: the panic is caught
+/// on the pool thread and [`Ordered::next`] re-raises it on the reading thread.
 #[derive(Debug)]
 pub(crate) struct Ordered<T> {
     /// Set on drop so queued jobs skip their work.
     cancelled: Arc<AtomicBool>,
-    /// One receiver per submitted job, oldest first.
-    pending: VecDeque<Receiver<T>>,
+    /// One receiver per submitted job with its submission number, oldest first.
+    pending: VecDeque<PendingJob<T>>,
+    /// Number of jobs submitted so far.
+    submitted: usize,
 }
+
+/// What a job sent back: its result, or the payload of the panic it raised.
+type JobOutcome<T> = Result<T, Box<dyn Any + Send>>;
+
+/// A submitted job's number and the receiver of its outcome.
+type PendingJob<T> = (usize, Receiver<JobOutcome<T>>);
 
 impl<T: Send + 'static> Ordered<T> {
     /// A stream with nothing in flight.
@@ -26,6 +36,7 @@ impl<T: Send + 'static> Ordered<T> {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             pending: VecDeque::new(),
+            submitted: 0,
         }
     }
 
@@ -36,14 +47,23 @@ impl<T: Send + 'static> Ordered<T> {
 
     /// Blocks until the oldest submitted job has finished and returns its result, or `None` when
     /// nothing is in flight.
+    ///
+    /// # Panics
+    ///
+    /// Re-raises the panic of the job whose result is taken, on the calling thread. Also panics,
+    /// naming the job, if that job ended without sending anything, which only a cancelled job
+    /// does and cancellation happens only when the stream is dropped.
+    #[expect(
+        clippy::panic,
+        reason = "a job that vanished without a result must not read as a shorter stream"
+    )]
     pub(crate) fn next(&mut self) -> Option<T> {
-        let receiver = self.pending.pop_front()?;
-        // A job sends nothing only when it was cancelled, and that happens only after this
-        // stream is dropped.
-        let Ok(result) = wait_for(&receiver) else {
-            return None;
-        };
-        Some(result)
+        let (job, receiver) = self.pending.pop_front()?;
+        match wait_for(&receiver) {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(payload)) => resume_unwind(payload),
+            Err(RecvError) => panic!("extraction job {job} ended without sending a result"),
+        }
     }
 
     /// Queues `job` on the rayon pool; its result is returned by a later [`Ordered::next`] after
@@ -58,17 +78,23 @@ impl<T: Send + 'static> Ordered<T> {
             if cancelled.load(Ordering::Relaxed) {
                 return;
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "rayon::spawn aborts on a panic; Ordered::next re-raises the payload"
+            )]
+            let outcome = catch_unwind(AssertUnwindSafe(job));
             // The channel holds one result, so the send never blocks; it fails only when the
             // stream was dropped, and then nobody wants the result.
-            drop(sender.send(job()));
+            drop(sender.send(outcome));
         });
-        self.pending.push_back(receiver);
+        self.pending.push_back((self.submitted, receiver));
+        self.submitted = self.submitted.saturating_add(1);
     }
 }
 
 /// Waits for the result on `receiver`. On a rayon worker thread the wait runs other queued jobs
 /// instead of blocking, because the awaited job may sit in this very thread's queue.
-fn wait_for<T>(receiver: &Receiver<T>) -> Result<T, RecvError> {
+fn wait_for<T>(receiver: &Receiver<JobOutcome<T>>) -> Result<JobOutcome<T>, RecvError> {
     if rayon::current_thread_index().is_none() {
         return receiver.recv();
     }
@@ -93,6 +119,7 @@ impl<T> Drop for Ordered<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::panic_any;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc::channel;
@@ -151,6 +178,40 @@ mod tests {
         release.send(()).expect("the first job is still waiting");
         assert_eq!(stream.next(), Some(0), "the older job is returned first");
         assert_eq!(stream.next(), Some(1), "the younger job follows");
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test observes the panic Ordered::next re-raises"
+    )]
+    fn a_job_panic_is_re_raised_by_next_and_the_stream_still_drops_cleanly() {
+        let pool = pool(2);
+        let mut stream = Ordered::new();
+        pool.install(|| {
+            stream.submit(|| 0_u32);
+            stream.submit(|| -> u32 { panic_any("job two failed") });
+            stream.submit(|| 2);
+        });
+        assert_eq!(
+            stream.next(),
+            Some(0),
+            "the job before the panic is unaffected"
+        );
+        let payload = catch_unwind(AssertUnwindSafe(|| stream.next()))
+            .expect_err("the panicking job's result re-raises on the reader");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"job two failed"),
+            "the original payload is re-raised, not a wrapper"
+        );
+        assert_eq!(
+            stream.next(),
+            Some(2),
+            "the job after the panic is still delivered"
+        );
+        drop(stream);
+        pool.install(|| ());
     }
 
     #[test]
