@@ -1,8 +1,6 @@
 //! Columnar extraction: parse only what the selected columns need, in parallel, into Arrow
-//! record batches, and stream them to a consumer or a Parquet file.
-
-#[path = "stream.rs"]
-mod stream;
+//! record batches, and stream them to a consumer. See [`Export`](crate::Export) and
+//! [`ParquetExporter`](crate::ParquetExporter) for files.
 
 use std::borrow::Cow;
 #[cfg(test)]
@@ -18,7 +16,6 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
 use sha2::{Digest as _, Sha256};
-use stream::Ordered;
 
 use crate::columns::Column;
 use crate::error::MboxTurboError;
@@ -27,6 +24,7 @@ use crate::fields::{
 };
 use crate::mailbox::Mailbox;
 use crate::selection::{Plan, Selection};
+use crate::stream::Ordered;
 use crate::width::widen;
 
 /// Parquet page compression.

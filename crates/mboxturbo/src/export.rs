@@ -2,7 +2,6 @@
 //! refusal and staging, so a format only has to write batches.
 
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -14,58 +13,8 @@ use crate::error::MboxTurboError;
 use crate::mailbox::Mailbox;
 use crate::pipeline::{BatchReader, Pipeline};
 use crate::selection::Selection;
-use crate::staging::{Destination, ExportSummary, Overwrite, Staged};
+use crate::staging::{Destination, DestinationKind, ExportSummary, Overwrite, Staged};
 use crate::width::widen;
-
-/// The kind of place an export writes to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DestinationKind {
-    /// A directory of files.
-    Directory,
-    /// A single file.
-    File,
-    /// A caller-owned writer.
-    Stream,
-}
-
-impl fmt::Display for DestinationKind {
-    #[expect(
-        clippy::renamed_function_params,
-        reason = "the trait calls it `f`, a one-letter name the min_ident_chars lint bans"
-    )]
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Directory => "directory",
-            Self::File => "file",
-            Self::Stream => "stream",
-        })
-    }
-}
-
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "the destination kind is the driver's concept; staging.rs does not know it"
-)]
-impl Destination {
-    /// Which kind of destination this is.
-    #[must_use]
-    pub const fn kind(&self) -> DestinationKind {
-        match self {
-            Self::Directory(_) => DestinationKind::Directory,
-            Self::File(_) => DestinationKind::File,
-            Self::Stream(_) => DestinationKind::Stream,
-        }
-    }
-
-    /// The path this destination will be committed to; `None` for a stream.
-    fn path(&self) -> Option<PathBuf> {
-        match self {
-            Self::Directory(path) | Self::File(path) => Some(path.clone()),
-            Self::Stream(_) => None,
-        }
-    }
-}
 
 /// A flag that asks a running export to stop, shared between clones and threads.
 #[derive(Debug, Clone, Default)]

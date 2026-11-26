@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use parquet::errors::ParquetError;
 
-use crate::export::DestinationKind;
 use crate::index::BlockSize;
+use crate::staging::DestinationKind;
 
 /// Why an index file was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

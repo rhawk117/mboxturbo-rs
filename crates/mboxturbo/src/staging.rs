@@ -9,7 +9,6 @@ use std::time::Duration;
 use tempfile::{NamedTempFile, TempDir};
 
 use crate::error::MboxTurboError;
-use crate::export::DestinationKind;
 
 /// Name of the previous output inside its set-aside holder directory.
 const SET_ASIDE: &str = "previous";
@@ -26,6 +25,32 @@ pub enum Destination {
     File(PathBuf),
     /// A caller-owned writer; nothing is staged and nothing is checked for existence.
     Stream(Box<dyn Write + Send>),
+}
+
+/// The kind of place an export writes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DestinationKind {
+    /// A directory of files.
+    Directory,
+    /// A single file.
+    File,
+    /// A caller-owned writer.
+    Stream,
+}
+
+impl fmt::Display for DestinationKind {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "the trait calls it `f`, a one-letter name the min_ident_chars lint bans"
+    )]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Directory => "directory",
+            Self::File => "file",
+            Self::Stream => "stream",
+        })
+    }
 }
 
 /// The destination a sink writes to, by the kind it accepted.
@@ -130,6 +155,24 @@ impl fmt::Debug for Staged {
 }
 
 impl Destination {
+    /// Which kind of destination this is.
+    #[must_use]
+    pub const fn kind(&self) -> DestinationKind {
+        match self {
+            Self::Directory(_) => DestinationKind::Directory,
+            Self::File(_) => DestinationKind::File,
+            Self::Stream(_) => DestinationKind::Stream,
+        }
+    }
+
+    /// The path this destination will be committed to; `None` for a stream.
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Directory(path) | Self::File(path) => Some(path.clone()),
+            Self::Stream(_) => None,
+        }
+    }
+
     /// Prepares the destination for writing.
     ///
     /// A file or directory is staged in the target's parent directory, never the system
@@ -323,8 +366,8 @@ fn restore_failure(
 }
 
 /// Creates a staging directory in `parent` with the mode `fs::create_dir` would give it (the
-/// umask still applies) rather than tempfile's private 0700, because it is renamed into
-/// place as the committed export.
+/// umask still applies). The mode is pinned rather than left to tempfile's default, so the
+/// committed directory, which is the staging directory renamed into place, does not depend on it.
 fn staging_directory(parent: &Path) -> io::Result<TempDir> {
     #[cfg(unix)]
     {

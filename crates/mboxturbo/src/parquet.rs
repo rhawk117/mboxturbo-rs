@@ -8,9 +8,9 @@ use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::error::MboxTurboError;
-use crate::export::{DestinationKind, Exporter};
+use crate::export::Exporter;
 use crate::pipeline::Compression;
-use crate::staging::{Output, Staged};
+use crate::staging::{DestinationKind, Output, Staged};
 use crate::width::widen;
 
 /// Rows per row group: 16 batches of the default 8192.
