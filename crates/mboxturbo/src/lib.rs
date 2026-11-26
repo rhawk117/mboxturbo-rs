@@ -29,6 +29,7 @@ mod mapping;
 mod message;
 mod pipeline;
 mod scan;
+mod selection;
 mod width;
 
 pub use builder::{IndexPolicy, IndexSource, MailboxBuilder};
@@ -39,3 +40,4 @@ pub use index::{BlockSize, Index, IndexBytes};
 pub use mailbox::{Mailbox, ParsedBatch};
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use pipeline::{BatchReader, Compression, Pipeline};
+pub use selection::Selection;

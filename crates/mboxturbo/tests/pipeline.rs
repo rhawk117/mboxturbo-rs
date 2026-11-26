@@ -10,7 +10,7 @@ mod pipeline {
     use arrow_array::RecordBatch;
     use arrow_array::cast::AsArray as _;
     use arrow_array::types::UInt64Type;
-    use mboxturbo::{Column, Compression, Mailbox, Pipeline};
+    use mboxturbo::{Column, Compression, Mailbox, MboxTurboError, Pipeline, Selection};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use proptest::prelude::*;
     use sha2::{Digest as _, Sha256};
@@ -253,6 +253,125 @@ AAEC\n\
             subjects,
             vec![Some("first".to_owned()), Some("second".to_owned())],
             "the file round-trips both subjects in order"
+        );
+    }
+
+    fn numbered(count: usize) -> Fixture {
+        let contents = (0..count)
+            .map(|index| format!("From x Mon Jan  1 00:00:00 2024\nSubject: {index}\n\nb\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        Fixture::with(&contents)
+    }
+
+    fn selected(
+        fixture: &Fixture,
+        selection: &Selection,
+        batch_size: usize,
+        threads: usize,
+    ) -> Vec<usize> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("thread pool is built");
+        let pipeline = Arc::new(Pipeline::new(vec![Column::Position], batch_size));
+        pool.install(|| {
+            pipeline
+                .select(&fixture.mailbox, selection.clone())
+                .expect("selection is within the mailbox")
+                .map(|batch| batch.expect("every batch is assembled"))
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .to_vec()
+                })
+                .map(|position| usize::try_from(position).expect("position fits in usize"))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn selections_yield_exactly_their_positions_in_order_at_any_batch_size_and_thread_count() {
+        let fixture = numbered(20);
+        let ranges = Selection::Ranges(vec![15..18, 2..5, 3..4, 7..7, 0..2]);
+        let listed = Selection::Positions(vec![9, 9, 4, 3, 2, 19, 0, 1, 2]);
+        for (batch_size, threads) in [(1, 1), (2, 3), (4, 2), (7, 4), (100, 2)] {
+            assert_eq!(
+                selected(&fixture, &Selection::All, batch_size, threads),
+                (0..20).collect::<Vec<_>>(),
+                "All yields every message at batch {batch_size}, {threads} threads"
+            );
+            assert_eq!(
+                selected(&fixture, &ranges, batch_size, threads),
+                [15, 16, 17, 2, 3, 4, 3, 0, 1],
+                "ranges keep their order and repeats at batch {batch_size}, {threads} threads"
+            );
+            assert_eq!(
+                selected(&fixture, &listed, batch_size, threads),
+                [9, 9, 4, 3, 2, 19, 0, 1, 2],
+                "listed positions keep order and repeats at batch {batch_size}, {threads} threads"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reader_reports_the_selection_size_before_reading() {
+        let fixture = numbered(10);
+        let pipeline = Arc::new(Pipeline::new(vec![Column::Position], 3));
+        let total = |selection| {
+            pipeline
+                .select(&fixture.mailbox, selection)
+                .expect("selection is within the mailbox")
+                .total()
+        };
+        assert_eq!(total(Selection::All), 10, "All covers the mailbox");
+        assert_eq!(
+            total(Selection::Ranges(vec![0..4, 2..3, 5..5])),
+            5,
+            "range lengths add up"
+        );
+        assert_eq!(
+            total(Selection::Positions(vec![7, 7, 1])),
+            3,
+            "repeats count"
+        );
+        assert_eq!(
+            pipeline.reader(&fixture.mailbox).total(),
+            10,
+            "reader() selects all"
+        );
+    }
+
+    #[test]
+    fn a_position_past_the_last_message_is_rejected_naming_it_and_the_length() {
+        let fixture = numbered(5);
+        let pipeline = Arc::new(Pipeline::new(vec![Column::Position], 2));
+        let rejected = |selection| {
+            pipeline
+                .select(&fixture.mailbox, selection)
+                .expect_err("the selection reaches past the mailbox")
+        };
+        assert!(
+            matches!(
+                rejected(Selection::Positions(vec![0, 5, 9])),
+                MboxTurboError::PositionOutOfRange {
+                    position: 5,
+                    len: 5
+                }
+            ),
+            "a listed position equal to the length is out of range"
+        );
+        assert!(
+            matches!(
+                rejected(Selection::Ranges(vec![0..2, 3..8])),
+                MboxTurboError::PositionOutOfRange {
+                    position: 5,
+                    len: 5
+                }
+            ),
+            "a range ending past the length names the first missing position"
         );
     }
 

@@ -32,6 +32,7 @@ use crate::fields::{
     self, Mail, builtin_table_with_raw_received, contain_parser_panic, strip_separator,
 };
 use crate::mailbox::Mailbox;
+use crate::selection::{Plan, Selection};
 use crate::width::widen;
 
 /// Parquet page compression.
@@ -85,15 +86,15 @@ struct Record<'mail> {
     span: Range<usize>,
 }
 
-/// Batches over a whole mailbox, produced a window at a time on all rayon threads.
+/// Batches over a selection of a mailbox, produced a window at a time on all rayon threads.
 #[derive(Debug)]
 pub struct BatchReader {
     /// Mailbox being read.
     mailbox: Arc<Mailbox>,
-    /// Position of the first message not yet scheduled for extraction.
-    next: usize,
     /// Plan that decides columns, schema and batch size.
     pipeline: Arc<Pipeline>,
+    /// The selected positions not yet scheduled for extraction.
+    plan: Plan,
     /// Extracted batches, in mailbox order, awaiting delivery.
     ready: VecDeque<Result<RecordBatch, MboxTurboError>>,
 }
@@ -148,12 +149,28 @@ impl Pipeline {
         positions: Range<usize>,
     ) -> Result<RecordBatch, MboxTurboError> {
         let clamped = mailbox.clamped(positions);
+        self.extract_runs(mailbox, &[clamped])
+    }
+
+    /// Extracts the messages of each run in `runs`, in order, into one batch. Every run must lie
+    /// within the mailbox.
+    ///
+    /// # Errors
+    ///
+    /// [`MboxTurboError::Arrow`], naming the smallest range covering every run, if the columns
+    /// cannot be assembled into a batch.
+    fn extract_runs(
+        &self,
+        mailbox: &Mailbox,
+        runs: &[Range<usize>],
+    ) -> Result<RecordBatch, MboxTurboError> {
+        let rows = runs.iter().map(Range::len).fold(0, usize::saturating_add);
         let mut slots: Vec<Slot> = self
             .columns
             .iter()
-            .map(|column| Slot::new(column, clamped.len()))
+            .map(|column| Slot::new(column, rows))
             .collect();
-        for (position, span, raw) in mailbox.rows(clamped.clone()) {
+        for (position, span, raw) in runs.iter().flat_map(|run| mailbox.rows(run.clone())) {
             let parsed = self.parse(raw);
             let record = Record {
                 position,
@@ -167,7 +184,7 @@ impl Pipeline {
         }
         let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
         RecordBatch::try_new(self.schema(), arrays).map_err(|source| MboxTurboError::Arrow {
-            positions: clamped,
+            positions: covering(runs),
             source,
         })
     }
@@ -202,7 +219,7 @@ impl Pipeline {
         BatchReader {
             pipeline: Arc::clone(self),
             mailbox: Arc::clone(mailbox),
-            next: 0,
+            plan: Plan::whole(mailbox.len()),
             ready: VecDeque::new(),
         }
     }
@@ -213,17 +230,36 @@ impl Pipeline {
         Arc::clone(&self.schema)
     }
 
-    /// Splits the span of messages from `from` onward that all threads can work on at once (two
-    /// batches per thread) into batch-sized position ranges. Empty when `from` is at or past
-    /// the end of `mailbox`; the last range may be shorter than the batch size.
-    fn window(&self, from: usize, mailbox: &Mailbox) -> Vec<Range<usize>> {
-        let span = self
-            .batch_size
-            .saturating_mul(rayon::current_num_threads().saturating_mul(2));
-        let end = from.saturating_add(span).min(mailbox.len());
-        (from..end)
-            .step_by(self.batch_size)
-            .map(|start| start..start.saturating_add(self.batch_size).min(end))
+    /// Streams batches over the messages `selection` names, in the order it gives them,
+    /// extracting several batches in parallel at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`MboxTurboError::PositionOutOfRange`] naming the first position at or past the end of
+    /// `mailbox`; no message is read in that case.
+    pub fn select(
+        self: &Arc<Self>,
+        mailbox: &Arc<Mailbox>,
+        selection: Selection,
+    ) -> Result<BatchReader, MboxTurboError> {
+        Ok(BatchReader {
+            pipeline: Arc::clone(self),
+            mailbox: Arc::clone(mailbox),
+            plan: selection.plan(mailbox.len())?,
+            ready: VecDeque::new(),
+        })
+    }
+
+    /// Takes from `plan` the span of positions that all threads can work on at once (two batches
+    /// per thread) as batches of positions. Empty when `plan` is exhausted; the last batch may be
+    /// shorter than the batch size.
+    fn window(&self, plan: &mut Plan) -> Vec<Vec<Range<usize>>> {
+        let batches = rayon::current_num_threads().saturating_mul(2);
+        (0..batches)
+            .map_while(|_| {
+                let runs = plan.take(self.batch_size);
+                (!runs.is_empty()).then_some(runs)
+            })
             .collect()
     }
 
@@ -270,17 +306,23 @@ impl BatchReader {
     /// The next batch, keeping the typed error so callers can read the positions it covers.
     fn next_batch(&mut self) -> Option<Result<RecordBatch, MboxTurboError>> {
         if self.ready.is_empty() {
-            let window = self.pipeline.window(self.next, &self.mailbox);
-            self.next = window.last().map_or(self.next, |last| last.end);
-            self.mailbox
-                .prefetch(self.next..self.next.saturating_add(self.pipeline.batch_size));
+            let window = self.pipeline.window(&mut self.plan);
+            for ahead in self.plan.clone().take(self.pipeline.batch_size) {
+                self.mailbox.prefetch(ahead);
+            }
             let extracted: Vec<_> = window
                 .into_par_iter()
-                .map(|positions| self.pipeline.extract(&self.mailbox, positions))
+                .map(|runs| self.pipeline.extract_runs(&self.mailbox, &runs))
                 .collect();
             self.ready.extend(extracted);
         }
         self.ready.pop_front()
+    }
+
+    /// The number of messages the selection yields in total, whatever has been read so far.
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.plan.total()
     }
 }
 
@@ -510,6 +552,13 @@ impl Slot {
 /// Empty builder for a list of nullable strings.
 fn text_list() -> ListBuilder<StringBuilder> {
     ListBuilder::new(StringBuilder::new())
+}
+
+/// The smallest range covering every run in `runs`.
+fn covering(runs: &[Range<usize>]) -> Range<usize> {
+    let start = runs.iter().map(|run| run.start).min().unwrap_or(0);
+    let end = runs.iter().map(|run| run.end).max().unwrap_or(0);
+    start..end
 }
 
 /// Sends `batches` to `sender` in order until they run out or the receiver is gone.

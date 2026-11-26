@@ -104,6 +104,14 @@ pub enum MboxTurboError {
         #[source]
         source: ParquetError,
     },
+    /// A selection named a message position past the last message.
+    #[error("message position {position} is out of range for a mailbox of {len} messages")]
+    PositionOutOfRange {
+        /// The first position at or past the end of the mailbox.
+        position: usize,
+        /// The number of messages in the mailbox.
+        len: usize,
+    },
     /// The index file was built for a different version of the mailbox, or by an older
     /// index format.
     #[error("index file {} no longer matches the mailbox", path.display())]
