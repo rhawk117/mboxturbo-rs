@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 arrow-array = { version = "60.1", features = ["ffi"] }
+arrow-ipc = "60.1"
 arrow-schema = "60.1"
 base64 = "0.23.1"
 mail-parser = { version = "=1.0.1", features = ["full_encoding"] }
