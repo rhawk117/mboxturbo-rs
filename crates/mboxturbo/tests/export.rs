@@ -15,7 +15,7 @@ mod export {
     use arrow_schema::SchemaRef;
     use mboxturbo::{
         CancelToken, Column, Compression, Destination, DestinationKind, Export, Exporter, Mailbox,
-        MboxTurboError, Overwrite, ParquetExporter, Pipeline, Progress, Selection, Staged,
+        MboxTurboError, Output, Overwrite, ParquetExporter, Pipeline, Progress, Selection, Staged,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::TempDir;
@@ -52,9 +52,9 @@ mod export {
             batch: &RecordBatch,
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
-            let directory = staged
-                .directory()
-                .expect("a directory destination is staged");
+            let Output::Directory(directory) = staged.output() else {
+                return Ok(0);
+            };
             let mut bytes = 0_u64;
             for raw in batch.column(0).as_binary::<i64>().iter().flatten() {
                 let path = directory.join(format!("{:04}.eml", self.written));
@@ -91,8 +91,10 @@ mod export {
             batch: &RecordBatch,
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
-            let target = staged.target().map_or_else(PathBuf::new, Path::to_path_buf);
-            let writer = staged.writer().expect("a file or stream is staged");
+            let target = staged.target_label().to_path_buf();
+            let Output::Writer(writer) = staged.output() else {
+                return Ok(0);
+            };
             let mut bytes = 0_u64;
             for raw in batch.column(0).as_binary::<i64>().iter().flatten() {
                 writer.write_all(raw).map_err(|source| MboxTurboError::Io {

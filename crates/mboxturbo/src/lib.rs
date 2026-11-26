@@ -46,4 +46,4 @@ pub use message::{Address, Attachment, Message, Timestamp};
 pub use parquet::ParquetExporter;
 pub use pipeline::{BatchReader, Compression, Pipeline};
 pub use selection::Selection;
-pub use staging::{Destination, ExportSummary, Overwrite, Staged};
+pub use staging::{Destination, ExportSummary, Output, Overwrite, Staged};

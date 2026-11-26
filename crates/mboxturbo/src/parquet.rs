@@ -1,8 +1,5 @@
 //! The Parquet sink of the export driver.
 
-use std::io;
-use std::path::Path;
-
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use parquet::arrow::ArrowWriter;
@@ -13,14 +10,11 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use crate::error::MboxTurboError;
 use crate::export::{DestinationKind, Exporter};
 use crate::pipeline::Compression;
-use crate::staging::Staged;
+use crate::staging::{Output, Staged};
 use crate::width::widen;
 
 /// Rows per row group: 16 batches of the default 8192.
 const ROW_GROUP_ROWS: usize = 0x0002_0000;
-
-/// Where a Parquet failure is reported when the destination is a stream.
-const STREAM: &str = "<stream>";
 
 /// Writes the exported columns as one Parquet file.
 ///
@@ -110,17 +104,12 @@ impl Exporter for ParquetExporter {
 fn drain(writer: &mut ArrowWriter<Vec<u8>>, staged: &mut Staged) -> Result<u64, MboxTurboError> {
     let pending = writer.inner_mut();
     let bytes = widen(pending.len());
-    let target = staged.target().map(ToOwned::to_owned);
-    let path = target.as_deref().unwrap_or_else(|| Path::new(STREAM));
-    let Some(destination) = staged.writer() else {
-        return Err(MboxTurboError::io(
-            path,
-            io::Error::other("a Parquet file needs a file or stream destination"),
-        ));
+    let Output::Writer(destination) = staged.output() else {
+        // `accepts` refused directory destinations, so the driver never stages one for this sink
+        return Ok(0);
     };
-    destination
-        .write_all(pending)
-        .map_err(|source| MboxTurboError::io(path, source))?;
+    let written = destination.write_all(pending);
+    written.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
     pending.clear();
     Ok(bytes)
 }
@@ -138,9 +127,7 @@ fn parquet_compression(compression: Compression) -> ParquetCompression {
 /// A Parquet failure on the destination `staged` writes to.
 fn parquet_failure(staged: &Staged, source: ParquetError) -> MboxTurboError {
     MboxTurboError::Parquet {
-        path: staged
-            .target()
-            .map_or_else(|| Path::new(STREAM).to_path_buf(), Path::to_path_buf),
+        path: staged.target_label().to_path_buf(),
         source,
     }
 }

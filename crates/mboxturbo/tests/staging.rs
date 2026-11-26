@@ -5,10 +5,27 @@
 mod staging {
     use std::fs;
     use std::fs::File;
+    use std::io::Write;
     use std::path::Path;
 
-    use mboxturbo::{Destination, MboxTurboError, Overwrite};
+    use mboxturbo::{Destination, MboxTurboError, Output, Overwrite, Staged};
     use tempfile::TempDir;
+
+    /// The staged file or stream writer.
+    fn staged_writer(staged: &mut Staged) -> &mut (dyn Write + Send) {
+        match staged.output() {
+            Output::Writer(writer) => writer,
+            Output::Directory(_) => panic!("a file or stream is staged"),
+        }
+    }
+
+    /// The staging directory.
+    fn staged_directory(staged: &mut Staged) -> &Path {
+        match staged.output() {
+            Output::Directory(path) => path,
+            Output::Writer(_) => panic!("a directory is staged"),
+        }
+    }
 
     fn entries(directory: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(directory)
@@ -32,9 +49,7 @@ mod staging {
         let mut staged = Destination::File(target.clone())
             .stage(Overwrite::Refuse)
             .expect("staging a target succeeds");
-        staged
-            .writer()
-            .expect("a file has a writer")
+        staged_writer(&mut staged)
             .write_all(b"data")
             .expect("writing to the staged file succeeds");
         assert!(!target.exists(), "nothing at the target before commit");
@@ -66,9 +81,7 @@ mod staging {
         let mut staged = Destination::File(target)
             .stage(Overwrite::Refuse)
             .expect("staging a target succeeds");
-        staged
-            .writer()
-            .expect("a file has a writer")
+        staged_writer(&mut staged)
             .write_all(b"data")
             .expect("writing to the staged file succeeds");
         drop(staged);
@@ -82,13 +95,10 @@ mod staging {
     fn a_staged_directory_appears_only_on_commit() {
         let parent = TempDir::new().expect("the parent temp directory is created");
         let target = parent.path().join("out");
-        let staged = Destination::Directory(target.clone())
+        let mut staged = Destination::Directory(target.clone())
             .stage(Overwrite::Refuse)
             .expect("staging a target succeeds");
-        let inner = staged
-            .directory()
-            .expect("a directory has a path")
-            .join("a.eml");
+        let inner = staged_directory(&mut staged).join("a.eml");
         assert_eq!(
             inner.parent().and_then(Path::parent),
             Some(parent.path()),
@@ -115,10 +125,10 @@ mod staging {
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.eml"), b"old").expect("previous output fills");
-        let staged = Destination::Directory(target.clone())
+        let mut staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
             .expect("staging a target succeeds");
-        let staging = staged.directory().expect("a directory has a path");
+        let staging = staged_directory(&mut staged);
         fs::write(staging.join("new.eml"), b"new").expect("fills staging directory");
         // FC-1: removing the staged directory makes the second rename fail.
         fs::remove_dir_all(staging).expect("staging directory is removed");
@@ -145,10 +155,10 @@ mod staging {
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.eml"), b"old").expect("previous output fills");
-        let staged = Destination::Directory(target.clone())
+        let mut staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
             .expect("staging a target succeeds");
-        let staging = staged.directory().expect("a directory has a path");
+        let staging = staged_directory(&mut staged);
         fs::write(staging.join("new.eml"), b"new").expect("fills staging directory");
         drop(
             staged
@@ -209,9 +219,7 @@ mod staging {
         let mut staged = Destination::File(target.clone())
             .stage(Overwrite::Replace)
             .expect("staging a target succeeds");
-        staged
-            .writer()
-            .expect("a file has a writer")
+        staged_writer(&mut staged)
             .write_all(b"new")
             .expect("writing to the staged file succeeds");
         drop(
@@ -233,17 +241,11 @@ mod staging {
         fs::create_dir_all(&target).expect("creating the existing target directory succeeds");
         fs::write(target.join("old.eml"), b"old")
             .expect("writing the old directory content succeeds");
-        let staged = Destination::Directory(target.clone())
+        let mut staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
             .expect("staging a target succeeds");
-        fs::write(
-            staged
-                .directory()
-                .expect("the staged directory has a path")
-                .join("new.eml"),
-            b"new",
-        )
-        .expect("filling the staged directory succeeds");
+        fs::write(staged_directory(&mut staged).join("new.eml"), b"new")
+            .expect("filling the staged directory succeeds");
         drop(
             staged
                 .commit()
@@ -260,9 +262,7 @@ mod staging {
         let mut staged = Destination::Stream(Box::new(writer))
             .stage(Overwrite::Refuse)
             .expect("a stream always stages");
-        staged
-            .writer()
-            .expect("a stream has a writer")
+        staged_writer(&mut staged)
             .write_all(b"hello")
             .expect("writing to the staged file succeeds");
         assert_eq!(

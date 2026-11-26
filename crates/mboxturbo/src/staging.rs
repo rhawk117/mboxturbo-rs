@@ -13,6 +13,9 @@ use crate::error::MboxTurboError;
 /// Name of the previous output inside its set-aside holder directory.
 const SET_ASIDE: &str = "previous";
 
+/// Where an error about a stream destination says it happened.
+const STREAM_LABEL: &str = "<stream>";
+
 /// Where an export goes.
 #[non_exhaustive]
 pub enum Destination {
@@ -22,6 +25,18 @@ pub enum Destination {
     File(PathBuf),
     /// A caller-owned writer; nothing is staged and nothing is checked for existence.
     Stream(Box<dyn Write + Send>),
+}
+
+/// The destination a sink writes to, by the kind it accepted.
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "a sink matches every output kind and must not need a wildcard arm"
+)]
+pub enum Output<'staged> {
+    /// The staging directory of a directory destination; the sink creates its files inside it.
+    Directory(&'staged Path),
+    /// The writer of a file or stream destination; the sink writes its bytes to it.
+    Writer(&'staged mut (dyn Write + Send)),
 }
 
 /// What to do when the export target already exists.
@@ -82,6 +97,19 @@ impl fmt::Debug for Destination {
             Self::Directory(path) => formatter.debug_tuple("Directory").field(path).finish(),
             Self::File(path) => formatter.debug_tuple("File").field(path).finish(),
             Self::Stream(_) => formatter.debug_tuple("Stream").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl fmt::Debug for Output<'_> {
+    #[expect(
+        clippy::renamed_function_params,
+        reason = "the trait calls it `f`, a one-letter name the min_ident_chars lint bans"
+    )]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directory(path) => formatter.debug_tuple("Directory").field(path).finish(),
+            Self::Writer(_) => formatter.debug_tuple("Writer").finish_non_exhaustive(),
         }
     }
 }
@@ -167,19 +195,22 @@ impl Staged {
             (Kind::Stream(mut writer), _) => {
                 writer
                     .flush()
-                    .map_err(|source| MboxTurboError::io(Path::new("<stream>"), source))?;
+                    .map_err(|source| MboxTurboError::io(Path::new(STREAM_LABEL), source))?;
                 Ok(None)
             },
             (Kind::Directory(_) | Kind::File(_), None) => Ok(None),
         }
     }
 
-    /// The staging directory to fill for a directory destination; `None` otherwise.
-    #[must_use]
-    pub fn directory(&self) -> Option<&Path> {
-        match &self.kind {
-            Kind::Directory(directory) => Some(directory.path()),
-            Kind::File(_) | Kind::Stream(_) => None,
+    /// The destination to write to, matching the kind this sink accepted.
+    ///
+    /// A directory destination yields [`Output::Directory`]; a file or stream destination
+    /// yields [`Output::Writer`].
+    pub fn output(&mut self) -> Output<'_> {
+        match &mut self.kind {
+            Kind::Directory(directory) => Output::Directory(directory.path()),
+            Kind::File(file) => Output::Writer(file),
+            Kind::Stream(writer) => Output::Writer(writer.as_mut()),
         }
     }
 
@@ -189,13 +220,10 @@ impl Staged {
         self.target.as_deref()
     }
 
-    /// The writer for a file or stream destination; `None` for a directory.
-    pub fn writer(&mut self) -> Option<&mut (dyn Write + Send)> {
-        match &mut self.kind {
-            Kind::Directory(_) => None,
-            Kind::File(file) => Some(file),
-            Kind::Stream(writer) => Some(writer.as_mut()),
-        }
+    /// The path an error about this destination names: the target, or `<stream>` for a stream.
+    #[must_use]
+    pub fn target_label(&self) -> &Path {
+        self.target().unwrap_or_else(|| Path::new(STREAM_LABEL))
     }
 }
 
