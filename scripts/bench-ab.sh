@@ -33,7 +33,12 @@ bench() {
 run() {
   local label=$1 tree=$2 target=$3 round=$4 line
   local out="${WORK}/out.txt" err="${WORK}/err.txt"
-  if ! bench "${tree}" "${target}" >"${out}" 2>"${err}"; then
+  local status=0
+  set +e
+  bench "${tree}" "${target}" >"${out}" 2>"${err}"
+  status=$?
+  set -e
+  if ((status != 0)); then
     log::error "bench run failed (${label}, round ${round}):"
     cat "${err}" >&2
     exit 1
@@ -41,6 +46,7 @@ run() {
   while IFS= read -r line; do
     case ${line} in
       select* | parquet* | raw-parquet* | copy*) printf '%-22s round %s  %s\n' "${label}" "${round}" "${line}" ;;
+      *) ;;
     esac
   done <"${out}"
 }
