@@ -8,7 +8,8 @@ mod properties {
     use mboxturbo_headers::{
         ArcHeader, Cap, Issue, IssueKind, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES,
         MAX_HEADER_BYTES, TrustSet, decode_encoded_words, parse_arc_sets,
-        parse_authentication_results, parse_date, parse_dkim_signature, parse_tag_list, tokenize,
+        parse_authentication_results, parse_date, parse_dkim_signature, parse_received_spf,
+        parse_tag_list, tokenize,
     };
     use proptest::prelude::*;
 
@@ -59,6 +60,10 @@ mod properties {
 
     fn auth_results_adversarial() -> impl Strategy<Value = Vec<u8>> {
         from_alphabet(b";;==..  \"()/abdkimspfnoe1")
+    }
+
+    fn received_spf_adversarial() -> impl Strategy<Value = Vec<u8>> {
+        from_alphabet(b";;==  \r\n\"()passfilnetrk-ip.:1a0")
     }
 
     fn arc_adversarial() -> impl Strategy<Value = Vec<(u8, Vec<u8>)>> {
@@ -207,6 +212,16 @@ mod properties {
         }
 
         #[test]
+        fn parse_received_spf_survives_arbitrary_bytes(input in arbitrary_bytes()) {
+            assert_offsets_within(parse_received_spf(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn parse_received_spf_survives_adversarial_separators(input in received_spf_adversarial()) {
+            assert_offsets_within(parse_received_spf(&input).issues(), input.len())?;
+        }
+
+        #[test]
         fn tag_list_and_dkim_survive_arbitrary_bytes(input in arbitrary_bytes()) {
             assert_offsets_within(parse_tag_list(&input).issues(), input.len())?;
             assert_offsets_within(parse_dkim_signature(&input).issues(), input.len())?;
@@ -285,6 +300,15 @@ mod properties {
             let mut input = b"mx.example.com".to_vec();
             input.extend(b"; spf=pass".repeat(MAX_ENTRIES.saturating_add(extra)));
             let issues = parse_authentication_results(&input, None).issues().to_vec();
+            prop_assert_eq!(cap_issues(&issues, Cap::Entries), 1, "one Entries issue");
+            assert_offsets_within(&issues, input.len())?;
+        }
+
+        #[test]
+        fn more_received_spf_pairs_than_the_cap_are_reported_once(extra in 1_usize..64) {
+            let mut input = b"pass".to_vec();
+            input.extend(b"; k=v".repeat(MAX_ENTRIES.saturating_add(extra)));
+            let issues = parse_received_spf(&input).issues().to_vec();
             prop_assert_eq!(cap_issues(&issues, Cap::Entries), 1, "one Entries issue");
             assert_offsets_within(&issues, input.len())?;
         }

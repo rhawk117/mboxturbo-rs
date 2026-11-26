@@ -13,6 +13,7 @@ mod date;
 mod dkim;
 mod encoded_word;
 mod issue;
+mod received_spf;
 mod tokenize;
 mod trust;
 
@@ -28,5 +29,6 @@ pub use date::{Instant, parse_date};
 pub use dkim::{DkimSignature, RequiredTag, Tag, TagList, parse_dkim_signature, parse_tag_list};
 pub use encoded_word::decode_encoded_words;
 pub use issue::{ArcPart, ArcProblem, Issue, IssueKind, Parsed};
+pub use received_spf::{ReceivedSpf, SpfPair, SpfResult, parse_received_spf};
 pub use tokenize::{Token, TokenKind, tokenize};
 pub use trust::{InvalidIpRange, TrustSet};
