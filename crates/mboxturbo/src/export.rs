@@ -125,12 +125,13 @@ pub trait Exporter: Send {
     /// Any [`MboxTurboError`]; the driver discards the staged output and returns it.
     fn begin(&mut self, schema: &SchemaRef, staged: &mut Staged) -> Result<(), MboxTurboError>;
 
-    /// Completes the output after the last batch, for example by writing a footer.
+    /// Completes the output after the last batch, for example by writing a footer, and
+    /// returns the bytes it added to the output.
     ///
     /// # Errors
     ///
     /// Any [`MboxTurboError`]; the driver discards the staged output and returns it.
-    fn finish(&mut self, staged: &mut Staged) -> Result<(), MboxTurboError>;
+    fn finish(&mut self, staged: &mut Staged) -> Result<u64, MboxTurboError>;
 
     /// Writes one batch and returns the bytes it added to the output.
     ///
@@ -252,7 +253,8 @@ impl Export {
         };
         run.exporter.begin(&schema, &mut run.staged)?;
         run.drain()?;
-        run.exporter.finish(&mut run.staged)?;
+        let trailing = run.exporter.finish(&mut run.staged)?;
+        run.bytes = run.bytes.saturating_add(trailing);
         let path = run.staged.commit()?;
         Ok(ExportSummary {
             bytes: run.bytes,

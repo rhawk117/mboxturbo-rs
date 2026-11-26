@@ -43,8 +43,8 @@ mod export {
             Ok(())
         }
 
-        fn finish(&mut self, _staged: &mut Staged) -> Result<(), MboxTurboError> {
-            Ok(())
+        fn finish(&mut self, _staged: &mut Staged) -> Result<u64, MboxTurboError> {
+            Ok(0)
         }
 
         fn write(
@@ -82,8 +82,8 @@ mod export {
             Ok(())
         }
 
-        fn finish(&mut self, _staged: &mut Staged) -> Result<(), MboxTurboError> {
-            Ok(())
+        fn finish(&mut self, _staged: &mut Staged) -> Result<u64, MboxTurboError> {
+            Ok(0)
         }
 
         fn write(
@@ -120,7 +120,7 @@ mod export {
             self.inner.begin(schema, staged)
         }
 
-        fn finish(&mut self, staged: &mut Staged) -> Result<(), MboxTurboError> {
+        fn finish(&mut self, staged: &mut Staged) -> Result<u64, MboxTurboError> {
             self.inner.finish(staged)
         }
 
@@ -450,9 +450,10 @@ mod export {
             "every message is counted"
         );
         let file = fs::read(fixture.target()).expect("exported file is readable");
-        assert!(
-            summary.bytes <= count(file.len()),
-            "the reported bytes never exceed what the file holds"
+        assert_eq!(
+            summary.bytes,
+            count(file.len()),
+            "the reported bytes are the committed file's length"
         );
     }
 
@@ -473,6 +474,12 @@ mod export {
             "a stream carries the same file as a file destination"
         );
         assert_eq!(summary.path, None, "a stream has no path");
+        let written = fs::read(&streamed).expect("streamed file is readable");
+        assert_eq!(
+            summary.bytes,
+            count(written.len()),
+            "the reported bytes are the streamed buffer's length"
+        );
     }
 
     #[test]

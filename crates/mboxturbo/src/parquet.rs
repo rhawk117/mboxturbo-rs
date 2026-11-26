@@ -77,12 +77,12 @@ impl Exporter for ParquetExporter {
         Ok(())
     }
 
-    fn finish(&mut self, staged: &mut Staged) -> Result<(), MboxTurboError> {
+    fn finish(&mut self, staged: &mut Staged) -> Result<u64, MboxTurboError> {
         let writer = self.encoder(staged)?;
         let _metadata = writer
             .finish()
             .map_err(|source| parquet_failure(staged, source))?;
-        drain(writer, staged).map(|_bytes| ())
+        drain(writer, staged)
     }
 
     fn write(&mut self, batch: &RecordBatch, staged: &mut Staged) -> Result<u64, MboxTurboError> {
