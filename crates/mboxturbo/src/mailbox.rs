@@ -8,7 +8,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::builder::{IndexPolicy, IndexSource, MailboxBuilder};
+use crate::builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
@@ -28,6 +28,8 @@ pub struct Mailbox {
     contents: Arc<Mmap>,
     /// Start offsets of the messages within `contents`.
     index: Index,
+    /// Whether opening loaded `index` or built it, as reported by [`Mailbox::index_origin`].
+    origin: IndexOrigin,
     /// Where `index` came from, as reported by [`Mailbox::index_source`].
     source: IndexSource,
 }
@@ -118,11 +120,17 @@ impl Mapped {
     }
 
     /// Attaches an index that was already validated against this mapping's fingerprint.
-    pub(crate) fn with_index(self, index: Index, source: IndexSource) -> Mailbox {
+    pub(crate) fn with_index(
+        self,
+        index: Index,
+        source: IndexSource,
+        origin: IndexOrigin,
+    ) -> Mailbox {
         Mailbox {
             contents: self.contents,
             index,
             source,
+            origin,
         }
     }
 }
@@ -184,6 +192,13 @@ impl Mailbox {
     #[must_use]
     pub const fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Whether opening this mailbox loaded its index from a file or rebuilt it. A block rebuilt
+    /// later by a lookup does not change the answer.
+    #[must_use]
+    pub const fn index_origin(&self) -> IndexOrigin {
+        self.origin
     }
 
     /// Where the index being served came from: the file it was read from or written to, or

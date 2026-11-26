@@ -40,7 +40,7 @@ mod structured;
 mod verdict;
 mod width;
 
-pub use builder::{IndexPolicy, IndexSource, MailboxBuilder};
+pub use builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
 pub use error::{Corruption, MboxTurboError, PredicateFault};
 pub use export::{CancelToken, Export, Exporter, Progress};
