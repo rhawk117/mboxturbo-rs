@@ -9,7 +9,8 @@ mod export_mbox {
 
     use arrow_schema::ArrowError;
     use mboxturbo::{
-        Column, Destination, Export, Mailbox, MboxExporter, MboxTurboError, Pipeline, Selection,
+        CancelToken, Column, Destination, Export, Mailbox, MboxExporter, MboxTurboError, Pipeline,
+        Selection,
     };
     use tempfile::TempDir;
 
@@ -156,5 +157,55 @@ mod export_mbox {
         };
         assert!(message.contains("`raw`"), "the raw column is named");
         assert!(!fixture.target().exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_cancelled_export_fails_with_cancelled_and_leaves_nothing_at_the_target() {
+        let fixture = Fixture::new();
+        let token = CancelToken::new();
+        let hook_token = token.clone();
+        let error = fixture
+            .export(vec![Column::Raw], Destination::File(fixture.target()))
+            .cancel_token(token)
+            .on_progress(move |_progress| hook_token.cancel())
+            .run(Box::new(MboxExporter::new()))
+            .expect_err("the export is cancelled");
+
+        assert!(
+            matches!(error, MboxTurboError::Cancelled { .. }),
+            "cancellation is its own error"
+        );
+        assert!(
+            fs::read_dir(fixture.output.path())
+                .expect("the output directory is readable")
+                .next()
+                .is_none(),
+            "nothing is left at or beside the target"
+        );
+    }
+
+    #[test]
+    fn a_failing_export_leaves_nothing_at_the_target() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .export(vec![Column::Raw], Destination::File(fixture.target()))
+            .selection(Selection::Positions(vec![0, 1, 99]))
+            .run(Box::new(MboxExporter::new()))
+            .expect_err("a position past the end fails the export");
+
+        assert!(
+            matches!(
+                error,
+                MboxTurboError::PositionOutOfRange { position: 99, .. }
+            ),
+            "the bad position is named"
+        );
+        assert!(
+            fs::read_dir(fixture.output.path())
+                .expect("the output directory is readable")
+                .next()
+                .is_none(),
+            "nothing is left at or beside the target"
+        );
     }
 }
