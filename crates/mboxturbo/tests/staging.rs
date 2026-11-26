@@ -104,6 +104,56 @@ mod staging {
     }
 
     #[test]
+    fn a_failed_directory_replacement_keeps_the_previous_output() {
+        let parent = TempDir::new().expect("parent creates");
+        let target = parent.path().join("out");
+        fs::create_dir_all(&target).expect("previous output creates");
+        fs::write(target.join("old.eml"), b"old").expect("previous output fills");
+        let staged = Destination::Directory(target.clone())
+            .stage(Overwrite::Replace)
+            .expect("stages");
+        let staging = staged.directory().expect("a directory has a path");
+        fs::write(staging.join("new.eml"), b"new").expect("fills staging directory");
+        // FC-1: removing the staged directory makes the second rename fail.
+        fs::remove_dir_all(staging).expect("staging directory is removed");
+        let error = staged.commit().expect_err("the rename cannot succeed");
+        assert!(
+            matches!(&error, MboxTurboError::Io { path, .. } if path == &target),
+            "the error names the target",
+        );
+        assert_eq!(
+            fs::read(target.join("old.eml")).expect("previous output survives"),
+            b"old",
+            "the previous output is back at the target"
+        );
+        assert_eq!(
+            entries(parent.path()),
+            ["out"],
+            "no staged or set-aside leftovers"
+        );
+    }
+
+    #[test]
+    fn a_replaced_directory_leaves_only_the_new_output() {
+        let parent = TempDir::new().expect("parent creates");
+        let target = parent.path().join("out");
+        fs::create_dir_all(&target).expect("previous output creates");
+        fs::write(target.join("old.eml"), b"old").expect("previous output fills");
+        let staged = Destination::Directory(target.clone())
+            .stage(Overwrite::Replace)
+            .expect("stages");
+        let staging = staged.directory().expect("a directory has a path");
+        fs::write(staging.join("new.eml"), b"new").expect("fills staging directory");
+        drop(staged.commit().expect("commits"));
+        assert_eq!(entries(&target), ["new.eml"], "only the new output remains");
+        assert_eq!(
+            entries(parent.path()),
+            ["out"],
+            "no leftovers in the parent"
+        );
+    }
+
+    #[test]
     fn dropping_a_staged_directory_leaves_nothing() {
         let parent = TempDir::new().expect("parent creates");
         let other = Destination::Directory(parent.path().join("gone"))
