@@ -79,8 +79,7 @@ impl Exporter for JsonlExporter {
 ///
 /// # Errors
 ///
-/// An [`MboxTurboError::Arrow`] schema error when the array's type is not one the columns
-/// produce.
+/// An [`MboxTurboError::Arrow`] schema error for an array type the columns never produce.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "Arrow has dozens of types and only the ones the columns produce are encoded"
