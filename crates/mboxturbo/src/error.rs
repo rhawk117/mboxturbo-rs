@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use parquet::errors::ParquetError;
 
+use crate::export::DestinationKind;
 use crate::index::BlockSize;
 
 /// Why an index file was rejected.
@@ -132,6 +133,17 @@ pub enum MboxTurboError {
     TargetExists {
         /// The existing file or directory.
         path: PathBuf,
+    },
+    /// The exporter cannot write to this kind of destination.
+    #[error(
+        "this export format cannot write to a {kind} destination (target: {})",
+        target_label(target.as_deref())
+    )]
+    UnsupportedDestination {
+        /// The kind of destination that was refused.
+        kind: DestinationKind,
+        /// The file or directory that would have been written; `None` for a stream.
+        target: Option<PathBuf>,
     },
 }
 

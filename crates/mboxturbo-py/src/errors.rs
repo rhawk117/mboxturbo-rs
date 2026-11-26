@@ -27,10 +27,6 @@ create_exception!(
 /// `MboxTurboError` subclass for a damaged or stale index, `FileExistsError` (with `filename`)
 /// for an existing export target, the base class otherwise (Arrow,
 /// Parquet and out-of-range position errors included).
-#[expect(
-    clippy::match_same_arms,
-    reason = "the named variants are explicit decisions; the wildcard is the required fallback"
-)]
 pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> PyErr {
     let message = error.to_string();
     match error {
@@ -51,7 +47,10 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> P
         mboxturbo::MboxTurboError::Arrow { .. }
         | mboxturbo::MboxTurboError::Cancelled { .. }
         | mboxturbo::MboxTurboError::Parquet { .. }
-        | mboxturbo::MboxTurboError::PositionOutOfRange { .. } => MboxTurboError::new_err(message),
+        | mboxturbo::MboxTurboError::PositionOutOfRange { .. }
+        | mboxturbo::MboxTurboError::UnsupportedDestination { .. } => {
+            MboxTurboError::new_err(message)
+        },
         // The Python API is frozen (plan invariant I2): the non-exhaustive remainder raises the
         // base class. A new core variant needs an explicit decision about its Python exception,
         // not this fallback.

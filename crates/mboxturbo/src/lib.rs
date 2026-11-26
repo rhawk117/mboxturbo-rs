@@ -20,6 +20,7 @@
 mod builder;
 mod columns;
 mod error;
+mod export;
 mod fields;
 mod fingerprint;
 mod hint;
@@ -36,6 +37,7 @@ mod width;
 pub use builder::{IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
 pub use error::{Corruption, MboxTurboError};
+pub use export::{CancelToken, DestinationKind, Export, Exporter, Progress};
 pub use fingerprint::Fingerprint;
 pub use index::{BlockSize, Index, IndexBytes};
 pub use mailbox::{Mailbox, ParsedBatch};
