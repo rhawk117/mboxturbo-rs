@@ -28,12 +28,14 @@ const STREAM: &str = "<stream>";
 /// back with the same types the pipeline produced. Dictionary encoding is off and statistics are
 /// kept per column chunk.
 ///
-/// The byte count the driver reports covers the row groups written so far; the footer written by
-/// [`Exporter::finish`] is not counted, because only [`Exporter::write`] returns a count.
+/// The byte count the driver reports covers every byte written, the footer included, because
+/// [`Exporter::finish`] returns the footer's size.
 #[derive(Debug)]
 pub struct ParquetExporter {
     /// Page compression.
     compression: Compression,
+    /// The most rows in one row group.
+    row_group_rows: usize,
     /// The encoder, created by `begin` and holding at most the unwritten tail of the file.
     writer: Option<ArrowWriter<Vec<u8>>>,
 }
@@ -54,8 +56,17 @@ impl ParquetExporter {
     pub const fn new(compression: Compression) -> Self {
         Self {
             compression,
+            row_group_rows: ROW_GROUP_ROWS,
             writer: None,
         }
+    }
+
+    /// The same sink with row groups of at most `rows` rows (at least one); the default is
+    /// 131072.
+    #[must_use]
+    pub fn with_row_group_rows(mut self, rows: usize) -> Self {
+        self.row_group_rows = rows.max(1);
+        self
     }
 }
 
@@ -67,7 +78,7 @@ impl Exporter for ParquetExporter {
     fn begin(&mut self, schema: &SchemaRef, staged: &mut Staged) -> Result<(), MboxTurboError> {
         let properties = WriterProperties::builder()
             .set_compression(parquet_compression(self.compression))
-            .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
+            .set_max_row_group_row_count(Some(self.row_group_rows))
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::Chunk)
             .build();

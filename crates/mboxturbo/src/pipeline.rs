@@ -7,13 +7,8 @@ mod stream;
 use std::borrow::Cow;
 #[cfg(test)]
 use std::fmt::Debug;
-use std::fs::File;
 use std::ops::Range;
-use std::panic::resume_unwind;
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, sync_channel};
-use std::{iter, thread};
 
 use arrow_array::builder::{
     Int32Builder, LargeBinaryBuilder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
@@ -22,13 +17,8 @@ use arrow_array::builder::{
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
-use parquet::errors::ParquetError;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use sha2::{Digest as _, Sha256};
 use stream::Ordered;
-use tempfile::NamedTempFile;
 
 use crate::columns::Column;
 use crate::error::MboxTurboError;
@@ -115,44 +105,6 @@ pub struct BatchReader {
 }
 
 impl Pipeline {
-    /// Drains a batch reader on a producer thread into `writer` and closes it, returning the
-    /// number of rows written.
-    ///
-    /// # Errors
-    ///
-    /// [`MboxTurboError::Parquet`] if writing or closing fails, or the first batch error
-    /// ([`MboxTurboError::Arrow`]) the reader yields; extraction stops at that error.
-    ///
-    /// # Panics
-    ///
-    /// Re-raises a panic from the producer thread on the calling thread, which includes the panic
-    /// of an extraction job the producer was reading.
-    fn encode_parquet(
-        self: &Arc<Self>,
-        mailbox: &Arc<Mailbox>,
-        mut writer: ArrowWriter<File>,
-        path: &Path,
-    ) -> Result<u64, MboxTurboError> {
-        let parquet_error = |source| parquet_failure(path, source);
-        let (sender, receiver) = sync_channel(rayon::current_num_threads().saturating_mul(2));
-        let mut batches = self.reader(mailbox);
-        let reader = iter::from_fn(move || batches.next_batch());
-        let produced = thread::scope(|scope| {
-            let reader_thread = scope.spawn(move || forward_batches(reader, &sender));
-            let rows = receiver.into_iter().try_fold(0_u64, |rows, received| {
-                let batch = received?;
-                writer.write(&batch).map_err(parquet_error)?;
-                Ok::<u64, MboxTurboError>(rows.saturating_add(widen(batch.num_rows())))
-            });
-            if let Err(payload) = reader_thread.join() {
-                resume_unwind(payload);
-            }
-            rows
-        })?;
-        writer.close().map(|_metadata| ()).map_err(parquet_error)?;
-        Ok(produced)
-    }
-
     /// Extracts the messages at `positions` (clamped to those that exist) into one batch.
     ///
     /// # Errors
@@ -279,44 +231,6 @@ impl Pipeline {
             plan: selection.plan(mailbox.len())?,
             stream: Ordered::new(),
         })
-    }
-
-    /// Writes every batch to a Parquet file at `path`, atomically, while the next batches are
-    /// extracted on other threads. Returns the number of rows written.
-    ///
-    /// # Errors
-    ///
-    /// [`MboxTurboError::Io`] when the file cannot be created or renamed into place,
-    /// [`MboxTurboError::Parquet`] when encoding fails, and [`MboxTurboError::Arrow`] if a
-    /// batch cannot be assembled.
-    pub fn write_parquet(
-        self: &Arc<Self>,
-        mailbox: &Arc<Mailbox>,
-        path: &Path,
-        compression: Compression,
-    ) -> Result<u64, MboxTurboError> {
-        let directory = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        let staged = NamedTempFile::new_in(directory.unwrap_or_else(|| Path::new(".")))
-            .map_err(|source| MboxTurboError::io(path, source))?;
-        let file = staged
-            .reopen()
-            .map_err(|source| MboxTurboError::io(path, source))?;
-        let properties = WriterProperties::builder()
-            .set_compression(parquet_compression(compression))
-            .set_max_row_group_row_count(Some(self.batch_size.saturating_mul(16)))
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::Chunk)
-            .build();
-        let writer = ArrowWriter::try_new(file, self.schema(), Some(properties))
-            .map_err(|source| parquet_failure(path, source))?;
-        let rows = self.encode_parquet(mailbox, writer, path)?;
-        staged
-            .persist(path)
-            .map(|_persisted| ())
-            .map_err(|failure| MboxTurboError::io(path, failure.error))?;
-        Ok(rows)
     }
 }
 
@@ -590,28 +504,6 @@ fn covering(runs: &[Range<usize>]) -> Range<usize> {
     start..end
 }
 
-/// Sends `batches` to `sender` in order until they run out or the receiver is gone.
-fn forward_batches(
-    batches: impl Iterator<Item = Result<RecordBatch, MboxTurboError>>,
-    sender: &SyncSender<Result<RecordBatch, MboxTurboError>>,
-) {
-    for batch in batches {
-        // A send fails only once the receiver is dropped, and the consumer drops it only after
-        // `try_fold` stopped on an `Err`, which `rows` returns.
-        if sender.send(batch).is_err() {
-            break;
-        }
-    }
-}
-
-/// Wraps a Parquet encoding failure with the output `path` it concerns.
-fn parquet_failure(path: &Path, source: ParquetError) -> MboxTurboError {
-    MboxTurboError::Parquet {
-        path: path.to_path_buf(),
-        source,
-    }
-}
-
 /// Picks the shallowest parse that serves `columns`: whole message if any needs the body, none if
 /// no column needs parsing, otherwise headers only, with just the needed ones decoded.
 fn depth_for(columns: &[Column]) -> Depth {
@@ -657,16 +549,6 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         | Column::AttachmentSizes
         | Column::AttachmentSha256
         | Column::Header(_) => None,
-    }
-}
-
-/// Maps the public [`Compression`] choice to the Parquet writer's codec (Zstd at its default
-/// level).
-fn parquet_compression(compression: Compression) -> ParquetCompression {
-    match compression {
-        Compression::Zstd => ParquetCompression::ZSTD(ZstdLevel::default()),
-        Compression::Snappy => ParquetCompression::SNAPPY,
-        Compression::Uncompressed => ParquetCompression::UNCOMPRESSED,
     }
 }
 
@@ -762,13 +644,13 @@ mod tests {
     use std::iter;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::{Receiver, channel, sync_channel};
+    use std::sync::mpsc::{Receiver, channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray as _;
-    use arrow_array::{Array as _, Int32Array, ListArray, RecordBatch};
+    use arrow_array::{Array as _, ListArray};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use mail_parser::{HeaderForm, HeaderName, MessageParser};
     use tempfile::NamedTempFile;
@@ -776,7 +658,7 @@ mod tests {
     use super::{
         AddressHeader, AttachmentSlot, Depth, Pipeline, Probe, Slot, append_addresses,
         append_header_values, date_micros, date_offset_minutes, depth_for, first_header_value,
-        forward_batches, header_form, html_body, joined, text_body, utc_timestamps,
+        header_form, html_body, joined, text_body, utc_timestamps,
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
@@ -842,37 +724,6 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         let mut builder = ListBuilder::new(StringBuilder::new());
         append_addresses(&mut builder, header, mail);
         list_cells(&builder.finish(), 0)
-    }
-
-    fn batch_of(rows: usize) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![0; rows]))])
-            .expect("fixture batch matches its schema")
-    }
-
-    #[test]
-    fn forwarding_delivers_every_batch_in_order() {
-        let (sender, receiver) = sync_channel(8);
-        forward_batches((1..=3).map(|rows| Ok(batch_of(rows))), &sender);
-        drop(sender);
-        let sizes: Vec<_> = receiver
-            .into_iter()
-            .map(|batch| batch.expect("fixture batches are Ok").num_rows())
-            .collect();
-        assert_eq!(sizes, [1, 2, 3], "batches arrive in production order");
-    }
-
-    #[test]
-    fn forwarding_stops_pulling_once_the_receiver_is_gone() {
-        let (sender, receiver) = sync_channel(1);
-        drop(receiver);
-        let mut pulled = 0_usize;
-        let batches = iter::repeat_with(|| {
-            pulled += 1;
-            Ok::<_, MboxTurboError>(batch_of(1))
-        });
-        forward_batches(batches.take(10), &sender);
-        assert_eq!(pulled, 1, "the failed first send ends extraction");
     }
 
     #[test]

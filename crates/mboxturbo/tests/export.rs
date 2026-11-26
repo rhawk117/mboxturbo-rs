@@ -419,31 +419,41 @@ mod export {
         (schema, batches)
     }
 
-    /// A fixture whose pipeline extracts the default columns, and the file the old writer wrote.
-    fn default_columns_fixture() -> (Fixture, PathBuf) {
+    /// A fixture whose pipeline extracts the default columns, and the batches `Pipeline::select`
+    /// yields for the same columns over the whole mailbox, in one batch so they compare with a
+    /// file read back whole.
+    fn default_columns_fixture() -> (Fixture, Vec<RecordBatch>) {
         let mut fixture = Fixture::new();
         fixture.pipeline = Arc::new(Pipeline::new(Column::defaults(), BATCH_SIZE));
-        let expected = fixture.output.path().join("expected.parquet");
-        let rows = fixture
-            .pipeline
-            .write_parquet(&fixture.mailbox, &expected, Compression::Zstd)
-            .expect("the old writer writes the file");
-        assert_eq!(rows, count(MESSAGES), "the old writer saw every message");
+        let whole = Arc::new(Pipeline::new(Column::defaults(), MESSAGES));
+        let expected = whole
+            .select(&fixture.mailbox, Selection::All)
+            .expect("the whole mailbox is selectable")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every batch is assembled");
+        assert_eq!(
+            expected.len(),
+            1,
+            "the pipeline yields every message in one batch"
+        );
         (fixture, expected)
     }
 
     #[test]
-    fn a_parquet_file_from_the_driver_reads_back_as_the_old_writer_wrote_it() {
+    fn a_parquet_file_from_the_driver_reads_back_as_the_batches_the_pipeline_yields() {
         let (fixture, expected) = default_columns_fixture();
         let summary = fixture
             .export(Destination::File(fixture.target()))
             .run(Box::new(ParquetExporter::new(Compression::Zstd)))
             .expect("the parquet export succeeds");
 
-        let (old_schema, old_batches) = read_parquet(&expected);
-        let (new_schema, new_batches) = read_parquet(&fixture.target());
-        assert_eq!(new_schema, old_schema, "the Arrow schema is unchanged");
-        assert_eq!(new_batches, old_batches, "rows and values are unchanged");
+        let (schema, batches) = read_parquet(&fixture.target());
+        assert_eq!(
+            Some(&schema),
+            expected.first().map(RecordBatch::schema_ref),
+            "the Arrow schema is the pipeline's"
+        );
+        assert_eq!(batches, expected, "rows and values are the pipeline's");
         assert_eq!(
             summary.messages,
             count(MESSAGES),
@@ -458,7 +468,7 @@ mod export {
     }
 
     #[test]
-    fn a_parquet_stream_holds_the_same_rows_as_a_parquet_file() {
+    fn a_parquet_stream_holds_the_same_rows_as_the_pipeline_yields() {
         let (fixture, expected) = default_columns_fixture();
         let streamed = fixture.output.path().join("streamed.parquet");
         let summary = fixture
@@ -469,9 +479,9 @@ mod export {
             .expect("the parquet stream export succeeds");
 
         assert_eq!(
-            read_parquet(&streamed),
-            read_parquet(&expected),
-            "a stream carries the same file as a file destination"
+            read_parquet(&streamed).1,
+            expected,
+            "a stream carries the same rows as the pipeline yields"
         );
         assert_eq!(summary.path, None, "a stream has no path");
         let written = fs::read(&streamed).expect("streamed file is readable");

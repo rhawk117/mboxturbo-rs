@@ -11,7 +11,10 @@ mod pipeline {
     use arrow_array::RecordBatch;
     use arrow_array::cast::AsArray as _;
     use arrow_array::types::UInt64Type;
-    use mboxturbo::{Column, Compression, Mailbox, MboxTurboError, Pipeline, Selection};
+    use mboxturbo::{
+        Column, Compression, Destination, Export, Mailbox, MboxTurboError, ParquetExporter,
+        Pipeline, Selection,
+    };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use proptest::prelude::*;
     use sha2::{Digest as _, Sha256};
@@ -54,6 +57,18 @@ AAEC\n\
                 .reader(&self.mailbox)
                 .collect::<Result<_, _>>()
                 .expect("every batch is assembled")
+        }
+
+        /// Exports every message through the driver into `parquet_path` and returns the row count.
+        fn export_parquet(&self, pipeline: &Arc<Pipeline>) -> u64 {
+            Export::new(
+                Arc::clone(pipeline),
+                Arc::clone(&self.mailbox),
+                Destination::File(self.parquet_path()),
+            )
+            .run(Box::new(ParquetExporter::new(Compression::Zstd)))
+            .expect("parquet file is written")
+            .messages
         }
 
         fn parquet_path(&self) -> PathBuf {
@@ -217,12 +232,10 @@ AAEC\n\
     }
 
     #[test]
-    fn write_parquet_reports_one_row_per_message() {
+    fn a_parquet_export_reports_one_row_per_message() {
         let fixture = Fixture::with(MESSAGES);
         let pipeline = Arc::new(Pipeline::new(Column::defaults(), 1));
-        let rows = pipeline
-            .write_parquet(&fixture.mailbox, &fixture.parquet_path(), Compression::Zstd)
-            .expect("parquet file is written");
+        let rows = fixture.export_parquet(&pipeline);
         assert_eq!(rows, 2, "both fixture messages are counted");
     }
 
@@ -230,9 +243,7 @@ AAEC\n\
     fn the_parquet_file_holds_every_subject_the_reader_yields_in_order() {
         let fixture = Fixture::with(MESSAGES);
         let pipeline = Arc::new(Pipeline::new(Column::defaults(), 1));
-        let rows = pipeline
-            .write_parquet(&fixture.mailbox, &fixture.parquet_path(), Compression::Zstd)
-            .expect("parquet file is written");
+        let rows = fixture.export_parquet(&pipeline);
         assert_eq!(rows, 2, "the writer reports both messages");
         let subjects: Vec<_> = fixture
             .written_batches()

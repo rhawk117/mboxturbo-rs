@@ -11,12 +11,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use mboxturbo::{Column, Compression, Pipeline};
+use mboxturbo::{Column, Compression, Destination, Export, Overwrite, ParquetExporter, Pipeline};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
 use crate::errors::into_py_err;
+
+/// Batches per Parquet row group.
+const ROW_GROUP_BATCHES: usize = 16;
 
 /// Chosen columns over a mailbox. Any Arrow consumer reads it directly (``pyarrow.table``,
 /// ``polars.DataFrame``, ``DuckDB``), and ``to_parquet`` writes it to a file. Each read extracts
@@ -24,6 +27,8 @@ use crate::errors::into_py_err;
 #[pyclass(frozen, module = "mboxturbo")]
 #[derive(Debug)]
 pub(crate) struct Selection {
+    /// Rows per batch; a Parquet row group holds sixteen batches.
+    batch_size: usize,
     /// The mapping the columns are extracted from.
     mailbox: Arc<mboxturbo::Mailbox>,
     /// The column names, in selection order.
@@ -66,14 +71,17 @@ impl Selection {
     #[pyo3(signature = (path, *, compression = "zstd"))]
     fn to_parquet(&self, py: Python<'_>, path: PathBuf, compression: &str) -> PyResult<u64> {
         let codec = parse_compression(compression)?;
-        let mailbox = Arc::clone(&self.mailbox);
-        let pipeline = Arc::clone(&self.pipeline);
-        py.detach(move || {
-            pipeline
-                .write_parquet(&mailbox, &path, codec)
-                .map_err(Box::new)
-        })
-        .map_err(|error| into_py_err(py, *error))
+        let sink = ParquetExporter::new(codec)
+            .with_row_group_rows(self.batch_size.saturating_mul(ROW_GROUP_BATCHES));
+        let export = Export::new(
+            Arc::clone(&self.pipeline),
+            Arc::clone(&self.mailbox),
+            Destination::File(path),
+        )
+        .overwrite(Overwrite::Replace);
+        py.detach(move || export.run(Box::new(sink)).map_err(Box::new))
+            .map(|summary| summary.messages)
+            .map_err(|error| into_py_err(py, *error))
     }
 }
 
@@ -95,6 +103,7 @@ pub(crate) fn select_columns(
         .collect();
     let pipeline = Arc::new(Pipeline::new(columns, batch_size));
     Ok(Selection {
+        batch_size,
         mailbox,
         names,
         pipeline,
