@@ -60,8 +60,8 @@ impl TrustSet {
     }
 
     /// Trusts `name` and every subdomain of it on a label boundary. The match is ASCII
-    /// case-insensitive and ignores one trailing dot on either side; an empty name is
-    /// ignored.
+    /// case-insensitive and ignores one trailing dot on either side. An empty name is
+    /// ignored and trusts nothing.
     pub fn add_host(&mut self, name: &str) -> &mut Self {
         let trimmed = strip_trailing_dot(name.as_bytes());
         if !trimmed.is_empty() {
