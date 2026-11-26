@@ -31,6 +31,11 @@ type JobOutcome<T> = Result<T, Box<dyn Any + Send>>;
 type PendingJob<T> = (usize, Receiver<JobOutcome<T>>);
 
 impl<T: Send + 'static> Ordered<T> {
+    /// Number of submitted jobs whose result has not been taken yet.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.pending.len()
+    }
+
     /// A stream with nothing in flight.
     pub(crate) fn new() -> Self {
         Self {
@@ -38,11 +43,6 @@ impl<T: Send + 'static> Ordered<T> {
             pending: VecDeque::new(),
             submitted: 0,
         }
-    }
-
-    /// Number of submitted jobs whose result has not been taken yet.
-    pub(crate) fn in_flight(&self) -> usize {
-        self.pending.len()
     }
 
     /// Blocks until the oldest submitted job has finished and returns its result, or `None` when
@@ -92,6 +92,12 @@ impl<T: Send + 'static> Ordered<T> {
     }
 }
 
+impl<T> Drop for Ordered<T> {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Waits for the result on `receiver`. On a rayon worker thread the wait runs other queued jobs
 /// instead of blocking, because the awaited job may sit in this very thread's queue.
 fn wait_for<T>(receiver: &Receiver<JobOutcome<T>>) -> Result<JobOutcome<T>, RecvError> {
@@ -111,18 +117,12 @@ fn wait_for<T>(receiver: &Receiver<JobOutcome<T>>) -> Result<JobOutcome<T>, Recv
     }
 }
 
-impl<T> Drop for Ordered<T> {
-    fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::panic::panic_any;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::mpsc::channel;
+    use std::sync::mpsc::{Sender, channel};
     use std::time::Duration;
 
     use super::*;
@@ -214,27 +214,36 @@ mod tests {
         pool.install(|| ());
     }
 
+    /// A job that counts itself, announces its start and then waits, bounded, for `gate`.
+    fn gated_job(
+        ran: &Arc<AtomicUsize>,
+        started: &Sender<()>,
+        gate: &Arc<Mutex<Receiver<()>>>,
+    ) -> impl FnOnce() + Send + 'static {
+        let count = Arc::clone(ran);
+        let signal = started.clone();
+        let held = Arc::clone(gate);
+        move || {
+            let _previous = count.fetch_add(1, Ordering::SeqCst);
+            signal.send(()).expect("the test waits for the start");
+            held.lock()
+                .expect("no job panics while holding the gate")
+                .recv_timeout(STUCK)
+                .expect("the test releases the running job after the drop");
+        }
+    }
+
     #[test]
     fn dropping_the_stream_skips_jobs_that_have_not_started() {
         let pool = pool(1);
         let ran = Arc::new(AtomicUsize::new(0));
-        let (release, released) = channel::<()>();
+        let (release, held) = channel::<()>();
         let (started_sender, started) = channel::<()>();
         let mut stream = Ordered::new();
-        let released = Arc::new(Mutex::new(released));
+        let gate = Arc::new(Mutex::new(held));
         pool.install(|| {
-            for _ in 0..9 {
-                let count = Arc::clone(&ran);
-                let gate = Arc::clone(&released);
-                let signal = started_sender.clone();
-                stream.submit(move || {
-                    let _previous = count.fetch_add(1, Ordering::SeqCst);
-                    signal.send(()).expect("the test waits for the start");
-                    gate.lock()
-                        .expect("no job panics while holding the gate")
-                        .recv_timeout(STUCK)
-                        .expect("the test releases the running job after the drop");
-                });
+            for _ in 0..9_u8 {
+                stream.submit(gated_job(&ran, &started_sender, &gate));
             }
         });
         started.recv_timeout(STUCK).expect("the first job starts");

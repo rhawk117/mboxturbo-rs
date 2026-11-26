@@ -1,7 +1,12 @@
 //! Columnar extraction: parse only what the selected columns need, in parallel, into Arrow
 //! record batches, and stream them to a consumer or a Parquet file.
 
+#[path = "stream.rs"]
+mod stream;
+
 use std::borrow::Cow;
+#[cfg(test)]
+use std::fmt::Debug;
 use std::fs::File;
 use std::ops::Range;
 use std::panic::resume_unwind;
@@ -22,6 +27,7 @@ use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use sha2::{Digest as _, Sha256};
+use stream::Ordered;
 use tempfile::NamedTempFile;
 
 use crate::columns::Column;
@@ -32,11 +38,6 @@ use crate::fields::{
 use crate::mailbox::Mailbox;
 use crate::selection::{Plan, Selection};
 use crate::width::widen;
-
-#[path = "stream.rs"]
-mod stream;
-
-use stream::Ordered;
 
 /// Parquet page compression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,8 +73,18 @@ pub struct Pipeline {
     columns: Box<[Column]>,
     /// Parse depth required by `columns`.
     depth: Depth,
+    /// Called as each extraction job starts, so tests can observe and hold jobs.
+    #[cfg(test)]
+    probe: Option<Arc<dyn Probe>>,
     /// Arrow schema derived from `columns`, shared by every batch.
     schema: SchemaRef,
+}
+
+/// A test hook told which runs each extraction job covers as the job starts.
+#[cfg(test)]
+trait Probe: Debug + Send + Sync {
+    /// Called on the pool thread before the job extracts `runs`; may block to hold the job.
+    fn started(&self, runs: &[Range<usize>]);
 }
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
@@ -203,6 +214,8 @@ impl Pipeline {
             schema: Arc::new(Schema::new(fields)),
             columns: columns.into_boxed_slice(),
             batch_size: batch_size.max(1),
+            #[cfg(test)]
+            probe: None,
         }
     }
 
@@ -227,6 +240,19 @@ impl Pipeline {
             plan: Plan::whole(mailbox.len()),
             stream: Ordered::new(),
         }
+    }
+
+    /// Extracts `runs` on a pool thread; the only entry of an extraction job.
+    fn run_job(
+        &self,
+        mailbox: &Mailbox,
+        runs: &[Range<usize>],
+    ) -> Result<RecordBatch, MboxTurboError> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.started(runs);
+        }
+        self.extract_runs(mailbox, runs)
     }
 
     /// The Arrow schema of every batch this pipeline produces.
@@ -310,7 +336,7 @@ impl BatchReader {
             let pipeline = Arc::clone(&self.pipeline);
             let mailbox = Arc::clone(&self.mailbox);
             self.stream
-                .submit(move || pipeline.extract_runs(&mailbox, &runs));
+                .submit(move || pipeline.run_job(&mailbox, &runs));
         }
     }
 
@@ -734,8 +760,11 @@ mod tests {
     use std::borrow::Cow;
     use std::io::Write as _;
     use std::iter;
-    use std::sync::Arc;
-    use std::sync::mpsc::sync_channel;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, channel, sync_channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray as _;
@@ -745,7 +774,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::{
-        AddressHeader, AttachmentSlot, Depth, Pipeline, Slot, append_addresses,
+        AddressHeader, AttachmentSlot, Depth, Pipeline, Probe, Slot, append_addresses,
         append_header_values, date_micros, date_offset_minutes, depth_for, first_header_value,
         forward_batches, header_form, html_body, joined, text_body, utc_timestamps,
     };
@@ -754,12 +783,45 @@ mod tests {
     use crate::fields::Mail;
     use crate::mailbox::Mailbox;
 
+    /// A bound only a broken implementation reaches: it turns a hang into a failure.
+    const STUCK: Duration = Duration::from_secs(60);
+
     const MULTIPART: &[u8] = b"From: a@example.org\r\nTo: b@example.org, c@example.org\r\n\
 Cc: d@example.org\r\nReply-To: e@example.org\r\nReceived: first\r\nReceived: second\r\n\
 Date: Thu, 01 Jan 1970 00:00:10 +0130\r\n\
 Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
 --b\r\nContent-Type: text/plain\r\n\r\nplain part\r\n--b\r\nContent-Type: text/html\r\n\r\n\
 <p>html part</p>\r\n--b--\r\n";
+
+    /// Holds the extraction job whose first message is `held_start` until the test releases it.
+    #[derive(Debug)]
+    struct Hold {
+        gate: Mutex<Receiver<()>>,
+        held_start: usize,
+    }
+
+    impl Probe for Hold {
+        fn started(&self, runs: &[Range<usize>]) {
+            if runs.first().map(|run| run.start) != Some(self.held_start) {
+                return;
+            }
+            self.gate
+                .lock()
+                .expect("no job panics while holding the gate")
+                .recv_timeout(STUCK)
+                .expect("the test releases the held job after reading the first batch");
+        }
+    }
+
+    /// Counts the extraction jobs that have started.
+    #[derive(Debug, Default)]
+    struct Started(AtomicUsize);
+
+    impl Probe for Started {
+        fn started(&self, _runs: &[Range<usize>]) {
+            let _previous = self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn parse(raw: &[u8]) -> Mail<'_> {
         MessageParser::new()
@@ -1077,6 +1139,80 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert!(
             matches!(&error, MboxTurboError::Arrow { positions, .. } if *positions == (0..1)),
             "the error names the positions clamped to the one message that exists"
+        );
+    }
+
+    fn numbered_mailbox(count: usize) -> (NamedTempFile, Arc<Mailbox>) {
+        let mut file = NamedTempFile::new().expect("temp file is created");
+        for index in 0..count {
+            write!(
+                file,
+                "From x Mon Jan  1 00:00:00 2024\nSubject: s{index}\n\nb\n"
+            )
+            .expect("fixture mbox is written");
+        }
+        let mailbox = Arc::new(Mailbox::open(file.path()).expect("fixture mbox opens"));
+        (file, mailbox)
+    }
+
+    #[test]
+    fn a_reader_returns_the_first_batch_while_a_later_batch_of_its_window_is_unfinished() {
+        let (_file, mailbox) = numbered_mailbox(20);
+        let (release, gate) = channel::<()>();
+        let mut pipeline = Pipeline::new(vec![Column::Position], 1);
+        pipeline.probe = Some(Arc::new(Hold {
+            gate: Mutex::new(gate),
+            held_start: 1,
+        }));
+        let mut reader = Arc::new(pipeline).reader(&mailbox);
+        let first = reader
+            .next()
+            .expect("a first batch exists")
+            .expect("it is assembled");
+        assert_eq!(
+            first.num_rows(),
+            1,
+            "the first batch is returned although the second is still held in its window"
+        );
+        release.send(()).expect("the held job is still waiting");
+        let rest = reader.map(|batch| batch.expect("every batch is assembled").num_rows());
+        assert_eq!(
+            rest.sum::<usize>(),
+            19,
+            "the remaining batches arrive once the held one finishes"
+        );
+    }
+
+    #[test]
+    fn dropping_a_reader_stops_extraction_from_starting_on_its_queued_batches() {
+        let (_file, mailbox) = numbered_mailbox(200);
+        let started = Arc::new(Started::default());
+        let probe: Arc<dyn Probe> = Arc::<Started>::clone(&started);
+        let mut plan = Pipeline::new(vec![Column::Position], 1);
+        plan.probe = Some(probe);
+        let pipeline = Arc::new(plan);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("test thread pool builds");
+        let at_drop = pool.install(|| {
+            let mut reader = pipeline.reader(&mailbox);
+            let _first = reader
+                .next()
+                .expect("a first batch exists")
+                .expect("it is assembled");
+            drop(reader);
+            started.0.load(Ordering::SeqCst)
+        });
+        let (done, finished) = channel::<()>();
+        pool.spawn(move || done.send(()).expect("the test waits for the pool to drain"));
+        finished
+            .recv_timeout(STUCK)
+            .expect("the pool drains its queue after the reader is dropped");
+        assert_eq!(
+            started.0.load(Ordering::SeqCst),
+            at_drop,
+            "no extraction job started after the reader was dropped"
         );
     }
 }

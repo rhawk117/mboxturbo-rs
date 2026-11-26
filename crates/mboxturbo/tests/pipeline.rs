@@ -4,6 +4,7 @@
 #[cfg(test)]
 mod pipeline {
     use std::fs::{self, File};
+    use std::ops::Range;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -394,14 +395,75 @@ AAEC\n\
 
     /// The positions each selection yields, flattened, for a mailbox of `count` messages.
     fn selections(count: usize) -> Vec<(Selection, Vec<usize>)> {
-        let positions = vec![count - 1, 3, 3, 0, 7, 8, 9, 2, 1];
-        let ranges = vec![5..12, 0..0, 20..count, 2..4, 12..5];
+        let positions = vec![count.saturating_sub(1), 3, 3, 0, 7, 8, 9, 2, 1];
+        // The last range is reversed on purpose: it selects nothing.
+        let ranges = vec![5..12, 0..0, 20..count, 2..4, Range { start: 12, end: 5 }];
         let flat_ranges = ranges.iter().cloned().flatten().collect();
         vec![
             (Selection::All, (0..count).collect()),
             (Selection::Positions(positions.clone()), positions),
             (Selection::Ranges(ranges), flat_ranges),
         ]
+    }
+
+    /// The rows of every batch the reader for `selection` yields, read on `pool`.
+    fn read_selection(
+        pool: &rayon::ThreadPool,
+        pipeline: &Arc<Pipeline>,
+        fixture: &Fixture,
+        selection: Selection,
+    ) -> Vec<Vec<(u64, String)>> {
+        pool.install(|| {
+            pipeline
+                .select(&fixture.mailbox, selection)
+                .expect("the selection is within the mailbox")
+                .map(|batch| rows(&batch.expect("every batch is assembled")))
+                .collect()
+        })
+    }
+
+    /// The rows single-batch extraction gives for `expected` positions, `batch_size` at a time.
+    fn extracted_rows(
+        pipeline: &Pipeline,
+        fixture: &Fixture,
+        expected: &[usize],
+        batch_size: usize,
+    ) -> Vec<Vec<(u64, String)>> {
+        expected
+            .chunks(batch_size)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .flat_map(|&position| {
+                        rows(
+                            &pipeline
+                                .extract(&fixture.mailbox, position..position.saturating_add(1))
+                                .expect("one message is extracted"),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Asserts that every selection over `fixture` read on `pool` yields the batches single-batch
+    /// extraction gives.
+    fn assert_batches_match(
+        pool: &rayon::ThreadPool,
+        fixture: &Fixture,
+        columns: &[Column],
+        batch_size: usize,
+    ) {
+        let pipeline = Arc::new(Pipeline::new(columns.to_vec(), batch_size));
+        let count = fixture.mailbox.len();
+        for (selection, expected) in selections(count) {
+            assert_eq!(
+                read_selection(pool, &pipeline, fixture, selection),
+                extracted_rows(&pipeline, fixture, &expected, batch_size),
+                "{} threads, batch size {batch_size}: batches match extraction",
+                pool.current_num_threads()
+            );
+        }
     }
 
     #[test]
@@ -415,35 +477,7 @@ AAEC\n\
                 .build()
                 .expect("test thread pool builds");
             for batch_size in [1, 3, 8, 100] {
-                let pipeline = Arc::new(Pipeline::new(columns.to_vec(), batch_size));
-                for (selection, expected) in selections(count) {
-                    let batches: Vec<Vec<(u64, String)>> = pool.install(|| {
-                        pipeline
-                            .select(&fixture.mailbox, selection)
-                            .expect("the selection is within the mailbox")
-                            .map(|batch| rows(&batch.expect("every batch is assembled")))
-                            .collect()
-                    });
-                    let wanted: Vec<Vec<(u64, String)>> = expected
-                        .chunks(batch_size)
-                        .map(|chunk| {
-                            chunk
-                                .iter()
-                                .flat_map(|&position| {
-                                    rows(
-                                        &pipeline
-                                            .extract(&fixture.mailbox, position..position + 1)
-                                            .expect("one message is extracted"),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .collect();
-                    assert_eq!(
-                        batches, wanted,
-                        "{threads} threads, batch size {batch_size}: batches match extraction"
-                    );
-                }
+                assert_batches_match(&pool, &fixture, &columns, batch_size);
             }
         }
     }
@@ -465,8 +499,8 @@ AAEC\n\
         });
         assert_eq!(first.num_rows(), 2, "the first batch holds batch-size rows");
         assert_eq!(
-            pool.install(|| 1 + 1),
-            2,
+            pool.install(|| 1_i32.saturating_add(1)),
+            2_i32,
             "the pool still runs work after the reader was dropped"
         );
     }
