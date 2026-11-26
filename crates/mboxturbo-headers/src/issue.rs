@@ -11,8 +11,17 @@ pub enum IssueKind {
         /// The bound that was exceeded.
         cap: Cap,
     },
+    /// An encoded word had an encoding other than `B` or `Q`, or text that is not valid
+    /// base64 or Q encoding; the word was left as raw text.
+    InvalidEncoding,
     /// Input was not valid UTF-8 where text was expected; the bytes were decoded lossily.
     InvalidUtf8,
+    /// An encoded word decoded to bytes that are not valid in its charset; they became
+    /// U+FFFD.
+    MalformedBytes,
+    /// An encoded word named a charset that is unknown, or that has no decoder; the word was
+    /// left as raw text.
+    UnknownCharset,
     /// A parenthesised comment was still open at the end of the value.
     UnterminatedComment,
     /// A quoted string was still open at the end of the value.
