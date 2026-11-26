@@ -35,3 +35,7 @@ tempfile = "3.27.0"
 [[bench]]
 name = "index"
 harness = false
+
+[[bench]]
+name = "export"
+harness = false
