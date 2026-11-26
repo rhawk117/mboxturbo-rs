@@ -82,8 +82,7 @@ impl<'src> TagList<'src> {
         self.tags.iter().find(|tag| tag.name() == name)
     }
 
-    /// The tags kept, in order of appearance; a repeated name appears once, at its first
-    /// occurrence.
+    /// The tags kept, in order of appearance; a repeated name keeps its first.
     #[must_use]
     pub fn tags(&self) -> &[Tag<'src>] {
         &self.tags
@@ -376,7 +375,7 @@ mod tests {
         " h=from:to:subject:date;\r\n",
         " z=From:foo@eng.example.net|To:joe@example.com|\r\n",
         " Subject:demo=20run|Date:July=205,=202005=203:44:08=20PM=20-0700;\r\n",
-        " bh=MTIzNDU2Nzg5MDEy\r\n MzQ1Njc4OTAxMjM0NTY3ODkwMTI=;\r\n",
+        " bh=QUJDREVGR0hJSktM\r\n TU5PUFFSU1RVVldYWVowMTIzNDU=;\r\n",
         " b=dzdVyOfAKCdLXdJOc9G2q8LoXSlEniSbav+yuU4zGeeruD00lszZ\r\n",
         "          VoG4ZHRNiYzR"
     );
@@ -429,7 +428,7 @@ mod tests {
         let signature = parsed.value();
         assert_eq!(
             signature.body_hash(),
-            Some("MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI="),
+            Some("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU="),
             "bh is joined across the fold"
         );
         assert_eq!(
