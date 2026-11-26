@@ -19,6 +19,7 @@
 
 mod builder;
 mod columns;
+mod eml_sink;
 mod error;
 mod export;
 mod fields;
@@ -43,6 +44,7 @@ mod width;
 
 pub use builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
+pub use eml_sink::EmlExporter;
 pub use error::{Corruption, MboxTurboError, PredicateFault};
 pub use export::{CancelToken, Export, Exporter, Progress};
 pub use filter::Filter;
