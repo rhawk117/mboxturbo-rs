@@ -24,7 +24,12 @@ create_exception!(
 );
 
 /// The Python exception for a core error: `OSError` (with `filename`) for I/O, the matching
-/// `MboxTurboError` subclass for a damaged or stale index, the base class otherwise.
+/// `MboxTurboError` subclass for a damaged or stale index, the base class otherwise (Arrow,
+/// Parquet and out-of-range position errors included).
+#[expect(
+    clippy::match_same_arms,
+    reason = "the named variants are explicit decisions; the wildcard is the required fallback"
+)]
 pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> PyErr {
     let message = error.to_string();
     match error {
@@ -35,11 +40,11 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> P
         },
         mboxturbo::MboxTurboError::CorruptIndex { .. } => CorruptIndexError::new_err(message),
         mboxturbo::MboxTurboError::StaleIndex { .. } => StaleIndexError::new_err(message),
-        // Naming Arrow and Parquet keeps `clippy::wildcard_enum_match_arm` quiet for the
-        // wildcard below.
-        mboxturbo::MboxTurboError::Arrow { .. } | mboxturbo::MboxTurboError::Parquet { .. } => {
-            MboxTurboError::new_err(message)
-        },
+        // Naming each variant that raises the base class keeps
+        // `clippy::wildcard_enum_match_arm` quiet for the wildcard below.
+        mboxturbo::MboxTurboError::Arrow { .. }
+        | mboxturbo::MboxTurboError::Parquet { .. }
+        | mboxturbo::MboxTurboError::PositionOutOfRange { .. } => MboxTurboError::new_err(message),
         // The Python API is frozen (plan invariant I2): the non-exhaustive remainder raises the
         // base class. A new core variant needs an explicit decision about its Python exception,
         // not this fallback.
