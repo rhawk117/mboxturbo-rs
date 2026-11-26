@@ -6,6 +6,9 @@ use crate::caps::Cap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum IssueKind {
+    /// A date had no time zone, an unknown zone name or a military letter, so UTC was
+    /// assumed; the offset points at the zone, or at the end of the value when it is absent.
+    AssumedZone,
     /// Input exceeded the named cap and was truncated or skipped.
     CapExceeded {
         /// The bound that was exceeded.
@@ -19,13 +22,26 @@ pub enum IssueKind {
     /// An encoded word decoded to bytes that are not valid in its charset; they became
     /// U+FFFD.
     MalformedBytes,
+    /// A date field was outside its range: a leap second (60) was clamped to 59 and any other
+    /// out-of-range field made the date unparsable.
+    OutOfRange,
+    /// Text followed a complete date and was ignored.
+    TrailingText,
     /// An encoded word named a charset that is unknown, or that has no decoder; the word was
     /// left as raw text.
     UnknownCharset,
+    /// A date could not be read at this offset, so no instant was produced.
+    UnparsableDate,
     /// A parenthesised comment was still open at the end of the value.
     UnterminatedComment,
     /// A quoted string was still open at the end of the value.
     UnterminatedQuote,
+    /// A date named a weekday that is not the weekday of its calendar date; the calendar
+    /// date was kept.
+    WeekdayMismatch,
+    /// A two- or three-digit year was widened to four digits (two digits: 00 to 49 is 20xx,
+    /// 50 to 99 is 19xx; three digits add 1900).
+    WidenedYear,
 }
 
 /// One problem found while parsing, located by byte offset.
