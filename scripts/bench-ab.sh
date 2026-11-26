@@ -18,6 +18,14 @@ if [[ ! ${ROUNDS} =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+for marker in 'ab:api begin' 'ab:api end'; do
+  count=$(grep -c "^// ${marker}" "${ROOT}/crates/mboxturbo/benches/export.rs" || true)
+  if ((count != 1)); then
+    log::error "crates/mboxturbo/benches/export.rs must contain '// ${marker}' exactly once"
+    exit 2
+  fi
+done
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/bench-ab.XXXXXX")
 readonly WORK
 trap 'rm -rf "${WORK}"' EXIT
@@ -54,13 +62,18 @@ run() {
 log::step "Extracting ${REF}"
 mkdir "${WORK}/ref"
 git -C "${ROOT}" archive "${REF}" | tar -x -C "${WORK}/ref"
-# The bench's API block calls the export driver, which REF lacks: give REF's copy the block in
-# scripts/ab/export_main.rs, which calls write_parquet instead.
-awk -v main_side="${ROOT}/scripts/ab/export_main.rs" '
-  /^\/\/ ab:api begin/ { while ((getline line < main_side) > 0) print line; skip = 1; next }
-  /^\/\/ ab:api end/ { skip = 0; next }
-  !skip { print }
-' "${ROOT}/crates/mboxturbo/benches/export.rs" >"${WORK}/ref/crates/mboxturbo/benches/export.rs"
+BENCH_SRC=crates/mboxturbo/benches/export.rs
+if git -C "${ROOT}" cat-file -e "${REF}:crates/mboxturbo/src/export.rs" 2>/dev/null; then
+  cp "${ROOT}/${BENCH_SRC}" "${WORK}/ref/${BENCH_SRC}"
+else
+  # REF lacks the export driver the bench's API block calls: give REF's copy the block in
+  # scripts/ab/export_main.rs, which calls write_parquet instead.
+  awk -v main_side="${ROOT}/scripts/ab/export_main.rs" '
+    /^\/\/ ab:api begin/ { while ((getline line < main_side) > 0) print line; skip = 1; next }
+    /^\/\/ ab:api end/ { skip = 0; next }
+    !skip { print }
+  ' "${ROOT}/${BENCH_SRC}" >"${WORK}/ref/${BENCH_SRC}"
+fi
 if ! grep -q 'name = "export"' "${WORK}/ref/crates/mboxturbo/Cargo.toml"; then
   printf '\n[[bench]]\nname = "export"\nharness = false\n' >>"${WORK}/ref/crates/mboxturbo/Cargo.toml"
 fi
