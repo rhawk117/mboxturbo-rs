@@ -24,7 +24,7 @@ with Mailbox('inbox.mbox', index='inbox.mbxidx') as mailbox:
 ```
 
 - Without `index=`, the index is saved beside the mailbox as `<mailbox path>.mbxidx` (`inbox.mbox` gets `inbox.mbox.mbxidx`) and reused while it matches. Anyone who can write the mailbox's directory controls that path, so the file is trusted only when it is a regular file owned by the mailbox's owner: a symlink, FIFO or foreign-owned file is never mapped and is replaced by a rebuilt index. A directory that cannot be written leaves nothing behind and the index stays in memory.
-- `index=` names the cache file explicitly: reused while it matches the mailbox, rebuilt and rewritten when missing or stale, and `CorruptIndexError` (file left untouched) when its header is damaged.
+- `index=` names the cache file explicitly: reused while it matches the mailbox, rebuilt and rewritten when missing, stale or written by an earlier index format, and `CorruptIndexError` (file left untouched) when its header is damaged.
 - The index is mapped rather than loaded: each block is verified on first use, and a damaged block triggers a rescan and a rewrite instead of an error.
 - Header fields (`subject`, `from_`, `to`, `cc`, `date`, `message_id`, `get`, `get_all`) parse the header block only. Bodies and attachments trigger the full MIME parse.
 - `batches()` decodes bodies and attachments in parallel. For header-only passes, plain iteration is faster.
@@ -50,8 +50,8 @@ selection.to_parquet('inbox.parquet', compression='zstd')
 
 - `select` returns a reusable selection that any Arrow consumer reads through `__arrow_c_stream__` (verified with pyarrow 26, polars 2.1, DuckDB 2.0, and pandas 3.1 through `DataFrame.from_arrow`). Every read extracts in parallel in Rust; no Python object is created per message.
 - Parsing follows the projection: `position`, `offset` and `size` read only the index, header columns run a header-only parser that skips every header no column needs, and only body or attachment columns pay for the full MIME parse.
-- Columns: `position`, `offset`, `size`, `from`, `to`, `cc`, `reply_to`, `subject`, `date` (UTC, microseconds), `date_offset_minutes`, `message_id`, `received`, `authentication_results`, `received_spf`, `dkim_signature`, `return_path`, `text`, `html`, `attachment_names`, `attachment_types`, `attachment_sizes`, `attachment_sha256`, and `header:<Name>` for the raw values of any header. With no argument, `select()` takes every column that needs only headers.
-- `to_parquet` writes atomically while the next batches are extracted on other threads; `compression` is `zstd` (default, level 1), `snappy` or `none`.
+- Columns: `position`, `offset`, `size`, `from`, `to`, `cc`, `reply_to`, `subject`, `date` (UTC, microseconds), `date_offset_minutes`, `message_id`, `received`, `authentication_results`, `received_spf`, `dkim_signature`, `return_path`, `text`, `html`, `attachment_names`, `attachment_types`, `attachment_sizes`, `attachment_sha256`, `header:<Name>` for the raw values of any header, and `raw` (each message's stored bytes, as LargeBinary). With no argument, `select()` takes every column that needs only headers; `raw` is never selected unless named.
+- `to_parquet` writes atomically while the next batches are extracted on other threads; `compression` is `zstd` (default, level 1), `snappy` or `none`. An existing file raises `FileExistsError` unless `overwrite=True`.
 
 ## Rust
 
@@ -62,7 +62,7 @@ let message = mailbox.message(0).expect("non-empty");
 let received: Vec<_> = message.header_values("Received").collect();
 ```
 
-`Mailbox::open` keeps the index beside the mailbox by default; `MailboxBuilder` picks the policy (`IndexPolicy::Sidecar`, `Path` or `Memory`) and the block size.
+`Mailbox::open` keeps the index beside the mailbox by default; `MailboxBuilder` picks the policy (`IndexPolicy::Sidecar`, `Path` or `Memory`) and the block size. `Mailbox::date` and `Index::date` return `None` for a message without a parsable `Date` header; a real epoch date is `Some(0)`.
 
 ## Benchmarks
 
