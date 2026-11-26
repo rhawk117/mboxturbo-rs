@@ -382,6 +382,140 @@ mod tests {
 
     const FOLDS: usize = 149_796;
 
+    const GMAIL: &str = concat!(
+        "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n",
+        "        d=example.com; s=20230601;\r\n",
+        "        h=to:subject:message-id:date:from:mime-version:from:to:cc:subject\r\n",
+        "         :date:message-id:reply-to;\r\n",
+        "        bh=Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWo=;\r\n",
+        "        b=QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2\r\n",
+        "         d3h5ejAxMjM0NTY3ODkrL0FCQ0RFRkdISUpLTE1OUFFSU1RVVldYWVo\r\n",
+        "         cXdlcnR5dWlvcGFzZGZnaGprbHp4Y3Zibm0="
+    );
+
+    const GMAIL_TAGS: &[(&str, &str)] = &[
+        ("v", "1"),
+        ("a", "rsa-sha256"),
+        ("c", "relaxed/relaxed"),
+        ("d", "example.com"),
+        ("s", "20230601"),
+        (
+            "h",
+            concat!(
+                "to:subject:message-id:date:from:mime-version:from:to:cc:subject",
+                "\r\n         :date:message-id:reply-to"
+            ),
+        ),
+        ("bh", "Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWo="),
+        (
+            "b",
+            concat!(
+                "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2",
+                "d3h5ejAxMjM0NTY3ODkrL0FCQ0RFRkdISUpLTE1OUFFSU1RVVldYWVo",
+                "cXdlcnR5dWlvcGFzZGZnaGprbHp4Y3Zibm0="
+            ),
+        ),
+    ];
+
+    const MICROSOFT: &str = concat!(
+        "v=1; a=rsa-sha256; c=relaxed/relaxed; d=contoso.onmicrosoft.com;\r\n",
+        " s=selector1-contoso-onmicrosoft-com;\r\n",
+        " h=From:Date:Subject:Message-ID:Content-Type:MIME-Version:",
+        "X-MS-Exchange-SenderADCheck;\r\n",
+        " bh=MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY=;\r\n",
+        " b=cXdlcnR5dWlvcGFzZGZnaGprbHp4Y3Zibm1RV0VSVFlVSU9QQVNERkdISktMWlhDVkJO\r\n",
+        " TTEyMzQ1Njc4OTArLw=="
+    );
+
+    const MICROSOFT_TAGS: &[(&str, &str)] = &[
+        ("v", "1"),
+        ("a", "rsa-sha256"),
+        ("c", "relaxed/relaxed"),
+        ("d", "contoso.onmicrosoft.com"),
+        ("s", "selector1-contoso-onmicrosoft-com"),
+        (
+            "h",
+            concat!(
+                "From:Date:Subject:Message-ID:Content-Type:MIME-Version:",
+                "X-MS-Exchange-SenderADCheck"
+            ),
+        ),
+        ("bh", "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY="),
+        (
+            "b",
+            concat!(
+                "cXdlcnR5dWlvcGFzZGZnaGprbHp4Y3Zibm1RV0VSVFlVSU9QQVNERkdISktMWlhDVkJO",
+                "TTEyMzQ1Njc4OTArLw=="
+            ),
+        ),
+    ];
+
+    const AMAZON_SES: &str = concat!(
+        "v=1; a=rsa-sha256; q=dns/txt; c=relaxed/simple;\r\n",
+        "\ts=abcdefghijklmnopqrstuvwxyz234567; d=amazonses.com; t=1700000000;\r\n",
+        "\tx=1700086400;\r\n",
+        "\th=From:To:Subject:MIME-Version:Content-Type:Message-ID:Date:Feedback-ID;\r\n",
+        "\tbh=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU=;\r\n",
+        "\tb=VVZXWFlaYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTE0NDU2Nzg5\r\n",
+        "\tQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+    );
+
+    const AMAZON_SES_TAGS: &[(&str, &str)] = &[
+        ("v", "1"),
+        ("a", "rsa-sha256"),
+        ("q", "dns/txt"),
+        ("c", "relaxed/simple"),
+        ("s", "abcdefghijklmnopqrstuvwxyz234567"),
+        ("d", "amazonses.com"),
+        ("t", "1700000000"),
+        ("x", "1700086400"),
+        (
+            "h",
+            "From:To:Subject:MIME-Version:Content-Type:Message-ID:Date:Feedback-ID",
+        ),
+        ("bh", "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU="),
+        (
+            "b",
+            concat!(
+                "VVZXWFlaYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTE0NDU2Nzg5",
+                "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+            ),
+        ),
+    ];
+
+    const OPTIONAL_TAGS: &str = concat!(
+        "v=1; a=rsa-sha1; c=simple/simple; d=lists.example.org; s=mail;\r\n",
+        " i=@lists.example.org; l=1234; q=dns/txt;\r\n",
+        " h=From:To:Subject:Date;\r\n",
+        " z=From:alice@example.net|To:bob@example.com|Subject:hello=20there|\r\n",
+        "  Date:Mon,=2013=20Nov=202023=2010:00:00=20+0000;\r\n",
+        " bh=cXdlcnR5dWlvcGFzZGZnaGprbA==;\r\n",
+        " b=QUJDREVGR0hJSktM\r\n",
+        " TU5PUFFSU1RV\r\n",
+        " VldYWVo="
+    );
+
+    const OPTIONAL_TAGS_TAGS: &[(&str, &str)] = &[
+        ("v", "1"),
+        ("a", "rsa-sha1"),
+        ("c", "simple/simple"),
+        ("d", "lists.example.org"),
+        ("s", "mail"),
+        ("i", "@lists.example.org"),
+        ("l", "1234"),
+        ("q", "dns/txt"),
+        ("h", "From:To:Subject:Date"),
+        (
+            "z",
+            concat!(
+                "From:alice@example.net|To:bob@example.com|Subject:hello=20there|",
+                "\r\n  Date:Mon,=2013=20Nov=202023=2010:00:00=20+0000"
+            ),
+        ),
+        ("bh", "cXdlcnR5dWlvcGFzZGZnaGprbA=="),
+        ("b", "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="),
+    ];
+
     fn kinds(input: &[u8]) -> Vec<(IssueKind, usize)> {
         parse_tag_list(input)
             .issues()
@@ -571,5 +705,41 @@ mod tests {
             Some(4 * FOLDS),
             "all of b is kept with its folds removed"
         );
+    }
+
+    fn assert_recovered(input: &str, expected: &[(&str, &str)]) {
+        let parsed = parse_dkim_signature(input.as_bytes());
+        let actual: Vec<(&str, &str)> = parsed
+            .value()
+            .tags()
+            .tags()
+            .iter()
+            .map(|tag| (tag.name(), tag.value()))
+            .collect();
+        assert_eq!(actual, expected, "every tag in order with its value");
+        assert!(
+            parsed.issues().is_empty(),
+            "a real signature is well formed"
+        );
+    }
+
+    #[test]
+    fn a_gmail_style_signature_with_long_folded_h_and_b_is_recovered() {
+        assert_recovered(GMAIL, GMAIL_TAGS);
+    }
+
+    #[test]
+    fn a_microsoft_style_signature_is_recovered() {
+        assert_recovered(MICROSOFT, MICROSOFT_TAGS);
+    }
+
+    #[test]
+    fn an_amazon_ses_style_signature_with_t_and_x_is_recovered() {
+        assert_recovered(AMAZON_SES, AMAZON_SES_TAGS);
+    }
+
+    #[test]
+    fn a_signature_with_i_l_q_and_z_is_recovered() {
+        assert_recovered(OPTIONAL_TAGS, OPTIONAL_TAGS_TAGS);
     }
 }
