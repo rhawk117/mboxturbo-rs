@@ -149,7 +149,9 @@ impl Staged {
     ///
     /// With [`Overwrite::Replace`], an existing file or directory at the target is replaced.
     /// A directory is set aside and restored if the staged one cannot be moved into place, so
-    /// a failed commit leaves the previous output at the target.
+    /// a failed commit leaves the previous output at the target. If the restore fails too, the
+    /// previous output is kept at `previous` inside a holder directory next to the target, and
+    /// the error's path names that location.
     ///
     /// # Errors
     ///
@@ -198,11 +200,25 @@ impl Staged {
 }
 
 /// Renames the staged directory onto `target`. When replacing, the existing output is set
-/// aside first and restored if the staged directory cannot be put in place.
+/// aside first and restored if the staged directory cannot be put in place. If the restore
+/// fails as well, the holder directory is kept and the error's path is where the previous
+/// output now sits.
 fn commit_directory(
     directory: TempDir,
     target: PathBuf,
     overwrite: Overwrite,
+) -> Result<PathBuf, MboxTurboError> {
+    commit_directory_with(directory, target, overwrite, |from, to| {
+        fs::rename(from, to)
+    })
+}
+
+/// [`commit_directory`] with the rename injectable, so a failing restore can be tested.
+fn commit_directory_with(
+    directory: TempDir,
+    target: PathBuf,
+    overwrite: Overwrite,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<PathBuf, MboxTurboError> {
     refuse_existing(&target, overwrite)?;
     let set_aside = match overwrite {
@@ -210,11 +226,27 @@ fn commit_directory(
         Overwrite::Refuse => None,
     };
     let staged = directory.keep();
-    if let Err(source) = fs::rename(&staged, &target) {
+    if let Err(source) = rename(&staged, &target) {
         // The rename error is the one worth reporting; leftovers are cleaned up best effort.
         drop(fs::remove_dir_all(&staged));
         if let Some(holder) = set_aside {
-            drop(fs::rename(holder.path().join(SET_ASIDE), &target));
+            let previous = holder.path().join(SET_ASIDE);
+            if let Err(restore) = rename(&previous, &target) {
+                // Dropping the holder would delete the previous output; keep it instead.
+                drop(holder.keep());
+                return Err(MboxTurboError::io(
+                    &previous,
+                    io::Error::new(
+                        restore.kind(),
+                        format!(
+                            "restoring the previous output to {} failed ({restore}) after \
+                             the new output could not be moved there ({source}); the \
+                             previous output is at this path",
+                            target.display()
+                        ),
+                    ),
+                ));
+            }
         }
         return Err(MboxTurboError::io(&target, source));
     }
@@ -287,4 +319,38 @@ fn refuse_existing(target: &Path, overwrite: Overwrite) -> Result<(), MboxTurboE
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, io};
+
+    use tempfile::TempDir;
+
+    use super::{Overwrite, commit_directory_with};
+    use crate::error::MboxTurboError;
+
+    #[test]
+    fn a_failed_restore_keeps_the_previous_output_at_the_path_the_error_names() {
+        let parent = TempDir::new().expect("parent creates");
+        let target = parent.path().join("out");
+        fs::create_dir_all(&target).expect("previous output creates");
+        fs::write(target.join("old.txt"), b"previous").expect("previous output is written");
+        let staged = TempDir::new_in(parent.path()).expect("staged directory creates");
+
+        let error = commit_directory_with(staged, target.clone(), Overwrite::Replace, |_, _| {
+            Err(io::Error::other("injected rename failure"))
+        })
+        .expect_err("both renames fail");
+
+        let MboxTurboError::Io { path, .. } = error else {
+            panic!("a failed restore reports an I/O error");
+        };
+        assert_eq!(
+            fs::read(path.join("old.txt")).expect("previous output survives at the named path"),
+            b"previous",
+            "the previous output is kept, not deleted with its holder",
+        );
+        assert!(!target.exists(), "nothing was restored at the target");
+    }
 }
