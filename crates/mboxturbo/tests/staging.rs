@@ -278,22 +278,4 @@ mod staging {
             "a stream has no final path"
         );
     }
-
-    #[test]
-    fn cancelled_carries_the_target_and_the_count() {
-        let error = MboxTurboError::Cancelled {
-            target: None,
-            written: 7,
-        };
-        assert!(
-            matches!(
-                error,
-                MboxTurboError::Cancelled {
-                    target: None,
-                    written: 7
-                }
-            ),
-            "a stream cancellation reports no path and the count",
-        );
-    }
 }

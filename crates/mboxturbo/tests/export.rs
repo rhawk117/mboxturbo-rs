@@ -140,6 +140,36 @@ mod export {
         }
     }
 
+    /// Delegates to another sink, but fails when it finishes.
+    struct FailFinish {
+        inner: Box<dyn Exporter>,
+    }
+
+    impl Exporter for FailFinish {
+        fn accepts(&self, kind: DestinationKind) -> bool {
+            self.inner.accepts(kind)
+        }
+
+        fn begin(&mut self, schema: &SchemaRef, staged: &mut Staged) -> Result<(), MboxTurboError> {
+            self.inner.begin(schema, staged)
+        }
+
+        fn finish(&mut self, _staged: &mut Staged) -> Result<u64, MboxTurboError> {
+            Err(MboxTurboError::Io {
+                path: PathBuf::from("finish"),
+                source: io::Error::other("injected finish failure"),
+            })
+        }
+
+        fn write(
+            &mut self,
+            batch: &RecordBatch,
+            staged: &mut Staged,
+        ) -> Result<u64, MboxTurboError> {
+            self.inner.write(batch, staged)
+        }
+    }
+
     /// A writer whose bytes the test can read after the export has consumed it.
     #[derive(Clone)]
     struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -309,6 +339,7 @@ mod export {
     #[test]
     fn a_sink_that_does_not_accept_the_destination_fails_before_staging() {
         let fixture = Fixture::new();
+        fs::write(fixture.target(), b"previous").expect("existing target is written");
         let error = fixture
             .export(Destination::File(fixture.target()))
             .run(Box::new(DirectorySink { written: 0 }))
@@ -319,7 +350,11 @@ mod export {
         };
         assert_eq!(kind, DestinationKind::File, "the refused kind is named");
         assert_eq!(target, Some(fixture.target()), "the target is named");
-        assert!(fixture.leftovers().is_empty(), "nothing was staged");
+        assert_eq!(
+            fixture.leftovers(),
+            ["target"],
+            "nothing was staged beside the target"
+        );
     }
 
     #[test]
@@ -410,6 +445,33 @@ mod export {
         }
     }
 
+    #[test]
+    fn a_sink_error_from_finish_is_returned_and_leaves_nothing() {
+        let cases: [Case; 2] = [
+            (Destination::File, Box::new(StreamSink)),
+            (
+                Destination::Directory,
+                Box::new(DirectorySink { written: 0 }),
+            ),
+        ];
+        for (destination, inner) in cases {
+            let fixture = Fixture::new();
+            let error = fixture
+                .export(destination(fixture.target()))
+                .run(Box::new(FailFinish { inner }))
+                .expect_err("the sink fails when it finishes");
+
+            assert!(
+                matches!(&error, MboxTurboError::Io { path, .. } if path == Path::new("finish")),
+                "the sink's own error is returned"
+            );
+            assert!(
+                fixture.leftovers().is_empty(),
+                "nothing is left at or beside the target"
+            );
+        }
+    }
+
     /// The schema and batches of the Parquet file at `path`, read with the Arrow reader.
     fn read_parquet(path: &Path) -> (SchemaRef, Vec<RecordBatch>) {
         let file = File::open(path).expect("exported parquet file opens");
@@ -483,9 +545,14 @@ mod export {
             .run(Box::new(ParquetExporter::new(Compression::Zstd)))
             .expect("the parquet stream export succeeds");
 
+        let (schema, batches) = read_parquet(&streamed);
         assert_eq!(
-            read_parquet(&streamed).1,
-            expected,
+            Some(&schema),
+            expected.first().map(RecordBatch::schema_ref),
+            "the Arrow schema is the pipeline's"
+        );
+        assert_eq!(
+            batches, expected,
             "a stream carries the same rows as the pipeline yields"
         );
         assert_eq!(summary.path, None, "a stream has no path");
@@ -500,6 +567,7 @@ mod export {
     #[test]
     fn the_parquet_sink_refuses_a_directory_before_staging_anything() {
         let fixture = Fixture::new();
+        fs::create_dir_all(fixture.target()).expect("existing target is created");
         let error = fixture
             .export(Destination::Directory(fixture.target()))
             .run(Box::new(ParquetExporter::new(Compression::Zstd)))
@@ -515,7 +583,11 @@ mod export {
             ),
             "the refused kind is the directory"
         );
-        assert!(fixture.leftovers().is_empty(), "nothing was staged");
+        assert_eq!(
+            fixture.leftovers(),
+            ["target"],
+            "nothing was staged beside the target"
+        );
     }
 
     fn count(length: usize) -> u64 {
