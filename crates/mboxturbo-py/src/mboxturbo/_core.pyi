@@ -73,6 +73,9 @@ class Selection:
 
 @final
 class Mailbox:
+    # Without `index`, the index is saved beside the mailbox as `<path>.mbxidx` and
+    # reused while it matches; a directory that cannot be written leaves nothing behind
+    # and the index stays in memory.
     def __init__(self, path: StrPath, *, index: StrPath | None = None) -> None: ...
     def __len__(self) -> int: ...
     @overload
