@@ -2,7 +2,9 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write as _};
-use std::path::Path;
+use std::panic::resume_unwind;
+use std::path::{Path, PathBuf};
+use std::thread;
 
 use arrow_array::cast::AsArray as _;
 use arrow_array::types::{TimestampMicrosecondType, UInt64Type};
@@ -29,6 +31,10 @@ const FROM: &[u8] = b"From ";
 const MICROS_PER_SECOND: i64 = 1_000_000;
 /// The manifest's file name.
 const MANIFEST: &str = "manifest.jsonl";
+/// The most threads that write files at once.
+const MAX_WORKERS: usize = 8;
+/// The fewest files a worker is given, so a small batch is not spread over threads.
+const MIN_FILES_PER_WORKER: usize = 64;
 
 /// Writes each selected message to its own `.eml` file in a directory, plus a `manifest.jsonl`.
 ///
@@ -114,17 +120,37 @@ impl Exporter for EmlExporter {
             // `accepts` refuses every other destination
             return Err(staged.unsupported());
         };
-        let mut bytes = 0_u64;
+        let mut files = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let (position, eml) = columns.message(row)?;
             let name = self.file_name(position);
-            let path = directory.join(&name);
-            fs::write(&path, &eml).map_err(|source| MboxTurboError::io(&path, source))?;
-            bytes = bytes.saturating_add(widen(eml.len()));
-            self.write_entry(&columns.entry(row, position, &name), &label)?;
+            files.push(EmlFile {
+                eml,
+                path: directory.join(&name),
+                name,
+                position,
+            });
+        }
+        write_files(&files)?;
+        let mut bytes = 0_u64;
+        for (row, file) in files.iter().enumerate() {
+            bytes = bytes.saturating_add(widen(file.eml.len()));
+            self.write_entry(&columns.entry(row, file.position, &file.name), &label)?;
         }
         Ok(bytes)
     }
+}
+
+/// One message's file, ready to write.
+struct EmlFile {
+    /// The unquoted message bytes.
+    eml: Vec<u8>,
+    /// The file name, as the manifest lists it.
+    name: String,
+    /// Where the file goes.
+    path: PathBuf,
+    /// The message's position.
+    position: u64,
 }
 
 /// The columns of a batch that the sink reads.
@@ -244,4 +270,38 @@ fn is_quoted_from(line: &[u8]) -> bool {
         && line
             .get(quotes..)
             .is_some_and(|rest| rest.starts_with(FROM))
+}
+
+/// Writes each file of `files` (path first, bytes second) from up to [`MAX_WORKERS`] scoped
+/// threads, each taking a contiguous chunk, and returns the first error by position order.
+///
+/// Every thread is joined before this returns, so no write is in flight afterwards; a chunk after
+/// the failing one may still have written its files.
+fn write_files(files: &[EmlFile]) -> Result<(), MboxTurboError> {
+    let available = thread::available_parallelism().map_or(1, usize::from);
+    let workers = available
+        .min(MAX_WORKERS)
+        .min(files.len().div_ceil(MIN_FILES_PER_WORKER))
+        .max(1);
+    let write_chunk = |chunk: &[EmlFile]| {
+        chunk.iter().try_for_each(|file| {
+            fs::write(&file.path, &file.eml)
+                .map_err(|source| MboxTurboError::io(&file.path, source))
+        })
+    };
+    if workers == 1 {
+        return write_chunk(files);
+    }
+    thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(files.len().div_ceil(workers))
+            .map(|chunk| scope.spawn(move || write_chunk(chunk)))
+            .collect();
+        let mut first = Ok(());
+        for handle in handles {
+            let result = handle.join().unwrap_or_else(|panic| resume_unwind(panic));
+            first = first.and(result);
+        }
+        first
+    })
 }

@@ -44,15 +44,7 @@ mod export_eml {
         }
 
         fn new() -> Self {
-            let mbox: Vec<u8> = (0..MESSAGES).flat_map(message).collect();
-            let input = tempfile::tempdir().expect("input directory creates");
-            let path = input.path().join("inbox.mbox");
-            fs::write(&path, &mbox).expect("fixture mbox is written");
-            Self {
-                mailbox: Arc::new(Mailbox::open(&path).expect("fixture mbox opens")),
-                _input: input,
-                output: tempfile::tempdir().expect("output directory creates"),
-            }
+            Self::with_messages(MESSAGES)
         }
 
         fn raw(&self, position: usize) -> Vec<u8> {
@@ -64,6 +56,18 @@ mod export_eml {
 
         fn target(&self) -> PathBuf {
             self.output.path().join("eml")
+        }
+
+        fn with_messages(count: usize) -> Self {
+            let mbox: Vec<u8> = (0..count).flat_map(message).collect();
+            let input = tempfile::tempdir().expect("input directory creates");
+            let path = input.path().join("inbox.mbox");
+            fs::write(&path, &mbox).expect("fixture mbox is written");
+            Self {
+                mailbox: Arc::new(Mailbox::open(&path).expect("fixture mbox opens")),
+                _input: input,
+                output: tempfile::tempdir().expect("output directory creates"),
+            }
         }
     }
 
@@ -218,6 +222,38 @@ mod export_eml {
             fixture.manifest()[0]["file"],
             "03.eml",
             "the manifest names the position file"
+        );
+    }
+
+    #[test]
+    fn a_batch_spread_over_several_workers_writes_the_same_files_as_a_one_worker_run() {
+        let count = 600;
+        let mut runs = Vec::new();
+        for batch_size in [4, count] {
+            let fixture = Fixture::with_messages(count);
+            drop(
+                Export::new(
+                    Arc::new(Pipeline::new(all_columns(), batch_size)),
+                    Arc::clone(&fixture.mailbox),
+                    Destination::Directory(fixture.target()),
+                )
+                .run(Box::new(EmlExporter::new(count)))
+                .expect("the export succeeds"),
+            );
+            let files: Vec<(String, Vec<u8>)> = names(&fixture)
+                .into_iter()
+                .map(|name| {
+                    let bytes = fs::read(fixture.target().join(&name)).expect("the file reads");
+                    (name, bytes)
+                })
+                .collect();
+            runs.push(files);
+        }
+
+        assert_eq!(runs[0].len(), count + 1, "every message and the manifest");
+        assert_eq!(
+            runs[0], runs[1],
+            "the same names and bytes whatever the worker count"
         );
     }
 
