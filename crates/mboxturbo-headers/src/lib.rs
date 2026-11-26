@@ -6,6 +6,7 @@
 //! problem starts. Input that exceeds one of the caps, such as [`MAX_HEADER_BYTES`], is
 //! truncated or skipped and reported as [`IssueKind::CapExceeded`].
 
+mod arc;
 mod auth_results;
 mod caps;
 mod date;
@@ -15,6 +16,7 @@ mod issue;
 mod tokenize;
 mod trust;
 
+pub use arc::{ArcHeader, ArcSet, ChainValidation, parse_arc_sets};
 pub use auth_results::{
     AuthMethod, AuthProperty, AuthResult, AuthenticationResults, ResInfo, TrustStatus,
     parse_authentication_results,
@@ -25,6 +27,6 @@ pub use caps::{
 pub use date::{Instant, parse_date};
 pub use dkim::{DkimSignature, RequiredTag, Tag, TagList, parse_dkim_signature, parse_tag_list};
 pub use encoded_word::decode_encoded_words;
-pub use issue::{Issue, IssueKind, Parsed};
+pub use issue::{ArcPart, ArcProblem, Issue, IssueKind, Parsed};
 pub use tokenize::{Token, TokenKind, tokenize};
 pub use trust::{InvalidIpRange, TrustSet};

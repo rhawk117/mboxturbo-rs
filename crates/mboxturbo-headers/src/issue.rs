@@ -3,10 +3,55 @@
 use crate::caps::Cap;
 use crate::dkim::RequiredTag;
 
+/// Which of the three ARC headers of a set an [`ArcProblem`] concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ArcPart {
+    /// The `ARC-Authentication-Results` header.
+    AuthenticationResults,
+    /// The `ARC-Message-Signature` header.
+    MessageSignature,
+    /// The `ARC-Seal` header.
+    Seal,
+}
+
+/// What is wrong with the ARC set an [`IssueKind::ArcInstance`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ArcProblem {
+    /// The same header kind appeared again for the instance; the first was kept and the
+    /// offset is 0 of the repeated header.
+    DuplicatePart {
+        /// The header kind that repeated.
+        part: ArcPart,
+    },
+    /// No set carries this instance although a higher one exists; the offset is 0.
+    Gap,
+    /// The `i=` instance is 0 or above 50 (RFC 8617 section 4.2.1); the header was dropped
+    /// and the offset points at the `i` tag, or at the number in an `ARC-Authentication-Results`.
+    InstanceOutOfRange,
+    /// The header has no `i=` instance, so it could not be placed in a set; the offset is the
+    /// end of the value and the instance is 0.
+    MissingInstance,
+    /// The set has no header of this kind; the offset is 0.
+    MissingPart {
+        /// The header kind that is absent.
+        part: ArcPart,
+    },
+}
+
 /// What went wrong at an [`Issue`]'s offset. New kinds are added as parsers are added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum IssueKind {
+    /// An ARC set has a problem; `instance` is the `i=` number, 255 when it is larger than
+    /// that, and 0 when there is none.
+    ArcInstance {
+        /// The instance the problem concerns.
+        instance: u8,
+        /// What is wrong with it.
+        problem: ArcProblem,
+    },
     /// A date had no time zone, an unknown zone name or a military letter, so UTC was
     /// assumed; the offset points at the zone, or at the end of the value when it is absent.
     AssumedZone,

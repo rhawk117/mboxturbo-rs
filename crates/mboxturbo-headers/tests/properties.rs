@@ -6,9 +6,9 @@ mod properties {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use mboxturbo_headers::{
-        Cap, Issue, IssueKind, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES,
-        TrustSet, decode_encoded_words, parse_authentication_results, parse_date,
-        parse_dkim_signature, parse_tag_list, tokenize,
+        ArcHeader, Cap, Issue, IssueKind, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES,
+        MAX_HEADER_BYTES, TrustSet, decode_encoded_words, parse_arc_sets,
+        parse_authentication_results, parse_date, parse_dkim_signature, parse_tag_list, tokenize,
     };
     use proptest::prelude::*;
 
@@ -59,6 +59,29 @@ mod properties {
 
     fn auth_results_adversarial() -> impl Strategy<Value = Vec<u8>> {
         from_alphabet(b";;==..  \"()/abdkimspfnoe1")
+    }
+
+    fn arc_adversarial() -> impl Strategy<Value = Vec<(u8, Vec<u8>)>> {
+        prop::collection::vec(
+            (
+                0_u8..3,
+                prop::collection::vec(
+                    prop::sample::select(b"i=;;0123456789 \r\nabcdv=pasnoe.".as_slice()),
+                    0..96,
+                ),
+            ),
+            0..64,
+        )
+    }
+
+    fn arc_headers(raw: &[(u8, Vec<u8>)]) -> Vec<ArcHeader<'_>> {
+        raw.iter()
+            .map(|(kind, value)| match kind {
+                0 => ArcHeader::Seal(value),
+                1 => ArcHeader::MessageSignature(value),
+                _ => ArcHeader::AuthenticationResults(value),
+            })
+            .collect()
     }
 
     fn ip_text() -> impl Strategy<Value = String> {
@@ -197,7 +220,45 @@ mod properties {
     }
 
     proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn parse_arc_sets_survives_arbitrary_header_lists(raw in arc_adversarial()) {
+            let headers = arc_headers(&raw);
+            let parsed = parse_arc_sets(&headers, None);
+            let longest = raw.iter().map(|(_, value)| value.len()).max().unwrap_or(0);
+            assert_offsets_within(parsed.issues(), longest)?;
+            prop_assert!(
+                parsed.value().iter().all(|set| (1..=50).contains(&set.instance())),
+                "every set carries an instance from 1 to 50"
+            );
+        }
+
+        #[test]
+        fn parse_arc_sets_survives_arbitrary_bytes(
+            kind in 0_u8..3,
+            value in arbitrary_bytes(),
+        ) {
+            let raw = vec![(kind, value)];
+            let headers = arc_headers(&raw);
+            let len = raw.first().map_or(0, |(_, bytes)| bytes.len());
+            assert_offsets_within(parse_arc_sets(&headers, None).issues(), len)?;
+        }
+    }
+
+    proptest! {
         #![proptest_config(ProptestConfig::with_cases(8))]
+
+        #[test]
+        fn more_arc_headers_than_the_cap_are_reported_once(
+            extra in 1_usize..64,
+            instance in 1_u8..=50,
+        ) {
+            let value = format!("i={instance}; cv=none").into_bytes();
+            let headers = vec![ArcHeader::Seal(&value); MAX_ENTRIES.saturating_add(extra)];
+            let issues = parse_arc_sets(&headers, None).issues().to_vec();
+            prop_assert_eq!(cap_issues(&issues, Cap::Entries), 1, "one Entries issue");
+        }
 
         #[test]
         fn nesting_past_the_comment_depth_cap_is_reported_once(
