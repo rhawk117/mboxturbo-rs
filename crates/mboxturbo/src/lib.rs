@@ -19,6 +19,7 @@
 
 mod builder;
 mod columns;
+mod csv_sink;
 mod eml_sink;
 mod error;
 mod export;
@@ -45,6 +46,7 @@ mod width;
 
 pub use builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
+pub use csv_sink::{CsvExporter, FormulaEscaping};
 pub use eml_sink::EmlExporter;
 pub use error::{Corruption, MboxTurboError, PredicateFault};
 pub use export::{CancelToken, Export, Exporter, Progress};
