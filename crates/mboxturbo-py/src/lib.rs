@@ -9,6 +9,7 @@ mod errors;
 mod export;
 mod mailbox;
 mod message;
+mod predicates;
 
 use pyo3::prelude::*;
 
@@ -23,4 +24,6 @@ mod _core {
     use super::mailbox::Mailbox;
     #[pymodule_export]
     use super::message::{Address, Attachment, Message};
+    #[pymodule_export]
+    use super::predicates::{HeaderBuilder, Predicate, Trust, VerdictBuilder, header, verdict};
 }
