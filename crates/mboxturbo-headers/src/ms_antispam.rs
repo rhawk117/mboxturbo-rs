@@ -12,6 +12,7 @@ use std::str::FromStr;
 
 use crate::caps::{Cap, MAX_ENTRIES};
 use crate::issue::{Issue, IssueKind, Parsed};
+use crate::tokenize::bound;
 
 /// One `KEY:VALUE` entry, such as `SCL:1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,11 +150,12 @@ impl MsAntispam<'_> {
 /// (`SCL:abc`, `CIP:999.1.1.1`) stays in the list as text and is reported the same way at its
 /// key. Bytes that are not UTF-8 are decoded lossily and reported as [`IssueKind::InvalidUtf8`]
 /// at the entry. More than [`MAX_ENTRIES`] entries are dropped and reported once as
-/// [`IssueKind::CapExceeded`]. Work is linear in the length of `value`.
+/// [`IssueKind::CapExceeded`]. Input past [`crate::caps::MAX_HEADER_BYTES`] is dropped and reported
+/// once as [`IssueKind::CapExceeded`]. Work is linear in the length of `value`.
 #[must_use]
 pub fn parse_ms_antispam(value: &[u8]) -> Parsed<MsAntispam<'_>> {
-    let mut issues = Vec::new();
-    let entries = read_entries(value, &mut issues);
+    let (head, mut issues) = bound(value);
+    let entries = read_entries(head, &mut issues);
     let scl = typed(&entries, "SCL", &mut issues);
     let bcl = typed(&entries, "BCL", &mut issues);
     let client_ip = typed(&entries, "CIP", &mut issues);
@@ -249,7 +251,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::parse_ms_antispam;
-    use crate::caps::{Cap, MAX_ENTRIES};
+    use crate::caps::{Cap, MAX_ENTRIES, MAX_HEADER_BYTES};
     use crate::issue::{Issue, IssueKind};
 
     const FOREFRONT: &str = concat!(
@@ -454,6 +456,25 @@ mod tests {
             kinds(parsed.issues()),
             vec![(IssueKind::InvalidUtf8, 0)],
             "issue"
+        );
+    }
+
+    #[test]
+    fn a_value_one_byte_over_the_header_cap_is_cut_and_reported_at_the_cap() {
+        let mut input = b"SCL:1;K:".to_vec();
+        input.resize(MAX_HEADER_BYTES + 1, b'a');
+        let parsed = parse_ms_antispam(&input);
+        assert_eq!(parsed.value().entries().len(), 2, "entries before the cut");
+        assert_eq!(parsed.value().scl(), Some(1), "typed fields survive");
+        assert_eq!(
+            kinds(parsed.issues()),
+            vec![(
+                IssueKind::CapExceeded {
+                    cap: Cap::HeaderBytes
+                },
+                MAX_HEADER_BYTES
+            )],
+            "one issue at the cap"
         );
     }
 

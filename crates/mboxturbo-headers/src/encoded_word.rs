@@ -10,6 +10,7 @@ use encoding_rs::{Encoding, REPLACEMENT};
 
 use crate::caps::{Cap, MAX_ENCODED_WORDS};
 use crate::issue::{Issue, IssueKind, Parsed};
+use crate::tokenize::bound;
 
 /// The output being built.
 struct Decoder {
@@ -128,15 +129,19 @@ fn decode_base64(text: &[u8]) -> Option<Vec<u8>> {
 /// not valid in the charset and became U+FFFD. Words beyond [`MAX_ENCODED_WORDS`] stay raw
 /// and are reported once as [`IssueKind::CapExceeded`] at the first such word.
 ///
+/// Input past [`crate::caps::MAX_HEADER_BYTES`] is dropped and reported once as
+/// [`IssueKind::CapExceeded`].
+///
 /// The result borrows `value` when it is valid UTF-8 and holds no encoded word.
 #[must_use]
 pub fn decode_encoded_words(value: &[u8]) -> Parsed<Cow<'_, str>> {
-    let found = find_words(value);
+    let (head, cut) = bound(value);
+    let found = find_words(head);
     if found.words.is_empty()
         && found.cap_offset.is_none()
-        && let Ok(text) = str::from_utf8(value)
+        && let Ok(text) = str::from_utf8(head)
     {
-        return Parsed::new(Cow::Borrowed(text), Vec::new());
+        return Parsed::new(Cow::Borrowed(text), cut);
     }
     let mut decoder = Decoder {
         after_word: false,
@@ -153,6 +158,7 @@ pub fn decode_encoded_words(value: &[u8]) -> Parsed<Cow<'_, str>> {
         };
         decoder.issues.push(Issue::new(kind, offset));
     }
+    decoder.issues.extend(cut);
     Parsed::new(Cow::Owned(decoder.out), decoder.issues)
 }
 
@@ -294,7 +300,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::decode_encoded_words;
-    use crate::caps::{Cap, MAX_ENCODED_WORDS};
+    use crate::caps::{Cap, MAX_ENCODED_WORDS, MAX_HEADER_BYTES};
     use crate::issue::IssueKind;
 
     /// An issue as `(kind, offset)`.
@@ -434,6 +440,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(IssueKind::InvalidUtf8, 2)],
             "reported at the bad byte",
+        );
+    }
+
+    #[test]
+    fn a_value_one_byte_over_the_header_cap_is_cut_and_reported_at_the_cap() {
+        let word = "=?utf-8?q?b?=";
+        let input = format!("{word}{}", "a".repeat(MAX_HEADER_BYTES - word.len() + 1));
+        let (text, issues) = decode(&input);
+        assert_eq!(
+            text,
+            format!("b{}", "a".repeat(MAX_HEADER_BYTES - word.len())),
+            "the word before the cut is decoded and the text after it is dropped"
+        );
+        assert_eq!(
+            issues,
+            vec![(
+                IssueKind::CapExceeded {
+                    cap: Cap::HeaderBytes
+                },
+                MAX_HEADER_BYTES
+            )],
+            "one issue at the cap"
         );
     }
 

@@ -315,7 +315,11 @@ const fn ends_atom(byte: u8) -> bool {
 }
 
 /// Truncates `value` to [`MAX_HEADER_BYTES`], reporting the cut.
-fn bound(value: &[u8]) -> (&[u8], Vec<Issue>) {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "shared with sibling parsers; `pub` would trip unreachable_pub"
+)]
+pub(crate) fn bound(value: &[u8]) -> (&[u8], Vec<Issue>) {
     match value.split_at_checked(MAX_HEADER_BYTES) {
         Some((head, tail)) if !tail.is_empty() => {
             let cap = IssueKind::CapExceeded {

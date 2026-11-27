@@ -10,6 +10,7 @@ use std::str::from_utf8;
 
 use crate::caps::{Cap, MAX_ENTRIES};
 use crate::issue::{Issue, IssueKind, Parsed};
+use crate::tokenize::bound;
 
 /// Tags every `DKIM-Signature` must carry (RFC 6376 section 3.5).
 const REQUIRED_TAGS: [RequiredTag; 7] = [
@@ -292,12 +293,15 @@ impl<'src> Pair<'src> {
 /// [`IssueKind::MalformedEntry`] at the segment. A repeated name keeps its first value and
 /// reports [`IssueKind::RepeatedTag`] at the repeat. Text that is not UTF-8 is decoded lossily
 /// with [`IssueKind::InvalidUtf8`]. Tags beyond [`MAX_ENTRIES`] are dropped and reported once as
-/// [`IssueKind::CapExceeded`] at the first dropped tag.
+/// [`IssueKind::CapExceeded`] at the first dropped tag. Input past
+/// [`crate::caps::MAX_HEADER_BYTES`] is dropped and reported once as [`IssueKind::CapExceeded`] at
+/// that offset.
 #[must_use]
 pub fn parse_tag_list(value: &[u8]) -> Parsed<TagList<'_>> {
+    let (head, cut) = bound(value);
     let mut scan = Scan::default();
     let mut offset = 0_usize;
-    let mut segments = value.split(|byte| *byte == b';').peekable();
+    let mut segments = head.split(|byte| *byte == b';').peekable();
     while let Some(segment) = segments.next() {
         let trailing = segments.peek().is_none() && trim(segment, offset).0.is_empty();
         if trailing || !scan.segment(segment, offset) {
@@ -305,6 +309,7 @@ pub fn parse_tag_list(value: &[u8]) -> Parsed<TagList<'_>> {
         }
         offset = offset.saturating_add(segment.len()).saturating_add(1);
     }
+    scan.issues.extend(cut);
     Parsed::new(TagList { tags: scan.tags }, scan.issues)
 }
 
@@ -365,7 +370,7 @@ const fn trim(bytes: &[u8], base: usize) -> (&[u8], usize) {
 #[cfg(test)]
 mod tests {
     use super::{RequiredTag, parse_dkim_signature, parse_tag_list};
-    use crate::caps::{Cap, MAX_ENTRIES};
+    use crate::caps::{Cap, MAX_ENTRIES, MAX_HEADER_BYTES};
     use crate::issue::IssueKind;
 
     const RFC_6376_SECTION_3_5: &str = concat!(
@@ -671,6 +676,32 @@ mod tests {
             kinds(b"d=ex\xffample"),
             [(IssueKind::InvalidUtf8, 4)],
             "at the byte"
+        );
+    }
+
+    #[test]
+    fn a_value_one_byte_over_the_header_cap_is_cut_and_reported_at_the_cap() {
+        let input = format!("v=1;x={}", "a".repeat(MAX_HEADER_BYTES - 5));
+        let parsed = parse_tag_list(input.as_bytes());
+        assert_eq!(
+            names(input.as_bytes()),
+            ["v", "x"],
+            "the tags before the cut are kept"
+        );
+        assert_eq!(
+            parsed.value().get("x").map(|tag| tag.value().len()),
+            Some(MAX_HEADER_BYTES - 6),
+            "the last value stops at the cap"
+        );
+        assert_eq!(
+            kinds(input.as_bytes()),
+            [(
+                IssueKind::CapExceeded {
+                    cap: Cap::HeaderBytes
+                },
+                MAX_HEADER_BYTES
+            )],
+            "one issue at the cap"
         );
     }
 
