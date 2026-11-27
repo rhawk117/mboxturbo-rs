@@ -28,7 +28,10 @@ use crate::mailbox::Mailbox;
 use crate::message::Timestamp;
 use crate::selection::{Plan, Selection};
 use crate::stream::Ordered;
-use crate::structured::{ArcSetsColumn, AuthResultsColumn, DkimSignaturesColumn};
+use crate::structured::{
+    ArcSetsColumn, AuthResultsColumn, DkimSignaturesColumn, MicrosoftAntispamColumn,
+    ReceivedHopsColumn, ReceivedSpfColumn,
+};
 use crate::width::widen;
 
 /// Parquet page compression.
@@ -340,12 +343,18 @@ enum Slot {
     Html(StringBuilder),
     /// First Message-ID, null when absent.
     MessageId(StringBuilder),
+    /// Parsed `X-Forefront-Antispam-Report` and `X-Microsoft-Antispam` headers.
+    MicrosoftAntispam(Box<MicrosoftAntispamColumn>),
     /// Byte offset of the message start.
     Offset(UInt64Builder),
     /// Message index.
     Position(UInt64Builder),
     /// The message's stored bytes, separator line included.
     Raw(LargeBinaryBuilder),
+    /// Parsed `Received` chain.
+    ReceivedHops(Box<ReceivedHopsColumn>),
+    /// Parsed `Received-SPF` headers.
+    ReceivedSpfParsed(Box<ReceivedSpfColumn>),
     /// Message length in bytes.
     Size(UInt64Builder),
     /// Decoded subject, null when absent.
@@ -468,6 +477,9 @@ impl Slot {
             Self::AuthResults(column) => column.append(mail, record.trust),
             Self::ArcSets(column) => column.append(mail, record.trust),
             Self::DkimSignatures(column) => column.append(mail),
+            Self::ReceivedHops(column) => column.append(mail, record.trust),
+            Self::ReceivedSpfParsed(column) => column.append(mail),
+            Self::MicrosoftAntispam(column) => column.append(mail),
         }
     }
 
@@ -496,6 +508,9 @@ impl Slot {
             Self::ArcSets(column) => column.finish()?,
             Self::AuthResults(column) => column.finish()?,
             Self::DkimSignatures(column) => column.finish()?,
+            Self::ReceivedHops(column) => column.finish()?,
+            Self::ReceivedSpfParsed(column) => column.finish()?,
+            Self::MicrosoftAntispam(column) => column.finish()?,
         };
         Ok(array)
     }
@@ -512,6 +527,10 @@ impl Slot {
 
     /// Builds the slot matching `column`, preallocating `rows` entries where the builder
     /// supports it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
+    )]
     fn new(column: &Column, rows: usize) -> Self {
         let addresses = |header| Self::Addresses(header, text_list());
         match column {
@@ -542,6 +561,13 @@ impl Slot {
             Column::AuthResults => Self::AuthResults(Box::new(AuthResultsColumn::new())),
             Column::ArcSets => Self::ArcSets(Box::new(ArcSetsColumn::new())),
             Column::DkimSignatures => Self::DkimSignatures(Box::new(DkimSignaturesColumn::new())),
+            Column::ReceivedHops => Self::ReceivedHops(Box::new(ReceivedHopsColumn::new())),
+            Column::ReceivedSpfParsed => {
+                Self::ReceivedSpfParsed(Box::new(ReceivedSpfColumn::new()))
+            },
+            Column::MicrosoftAntispam => {
+                Self::MicrosoftAntispam(Box::new(MicrosoftAntispamColumn::new()))
+            },
         }
     }
 }
@@ -578,6 +604,10 @@ fn depth_for(columns: &[Column]) -> Depth {
 
 /// The header `column` reads and how to decode it, or `None` when the column needs no header
 /// decoded: it reads the raw bytes, offsets, the body, or a header kept as raw text.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
+)]
 const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm)> {
     match column {
         Column::From => Some((HeaderName::From, HeaderForm::Addresses)),
@@ -606,6 +636,9 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         | Column::AuthResults
         | Column::ArcSets
         | Column::DkimSignatures
+        | Column::ReceivedHops
+        | Column::ReceivedSpfParsed
+        | Column::MicrosoftAntispam
         | Column::Header(_) => None,
     }
 }

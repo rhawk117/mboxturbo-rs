@@ -10,7 +10,7 @@ use crate::structured;
 const HEADER_PREFIX: &str = "header:";
 
 /// Public name and variant of every named column; the order is what [`Column::names`] yields.
-const NAMED: [(&str, Column); 26] = [
+const NAMED: [(&str, Column); 29] = [
     ("position", Column::Position),
     ("offset", Column::Offset),
     ("size", Column::Size),
@@ -37,6 +37,9 @@ const NAMED: [(&str, Column); 26] = [
     ("auth_results", Column::AuthResults),
     ("arc_sets", Column::ArcSets),
     ("dkim_signatures", Column::DkimSignatures),
+    ("received_hops", Column::ReceivedHops),
+    ("received_spf_parsed", Column::ReceivedSpfParsed),
+    ("microsoft_antispam", Column::MicrosoftAntispam),
 ];
 
 /// One per-message column the pipeline can extract.
@@ -104,6 +107,18 @@ pub enum Column {
     Html,
     /// `Message-ID:` without angle brackets.
     MessageId,
+    /// Every `X-Forefront-Antispam-Report:` and `X-Microsoft-Antispam:` header parsed from its
+    /// raw bytes, in header order; opt-in, never a default.
+    ///
+    /// A list of one struct per header, empty when the message has none: `header: Utf8`, the
+    /// lowercase header name; `scl: Int8` and `bcl: UInt8`, null when the entry is absent or
+    /// not an integer in range; `client_ip: Utf8`, null when `CIP` is not an address;
+    /// `category`, `country`, `direction`, `helo`, `ip_verdict`, `language`, `ptr`, `safety`,
+    /// `service` and `spam_verdict`, each `Utf8` and null when the entry is absent; `entries:
+    /// List<Struct<key: Utf8, value: Utf8, offset: UInt64>>`, every entry as written; `issues:
+    /// List<Struct<kind: Utf8, offset: UInt64>>` as in [`Column::AuthResults`]. Offsets are
+    /// byte offsets into that header's value.
+    MicrosoftAntispam,
     /// Byte offset of the message in the file.
     Offset,
     /// Zero-based position of the message in the mailbox.
@@ -112,8 +127,37 @@ pub enum Column {
     Raw,
     /// Every raw `Received:` value, newest hop first.
     Received,
+    /// Every `Received:` header parsed from its raw bytes into one hop chain per message;
+    /// opt-in, never a default.
+    ///
+    /// One struct per message, never null: `hops: List<Struct>`, one struct per `Received`
+    /// header and empty when the message has none, oldest hop first, and `issues:
+    /// List<Struct<kind: Utf8, offset: UInt64>>`, every parse issue of the chain. An issue's
+    /// `offset` is a byte offset into the value of the `Received` header it was found in (the
+    /// header is not named, and a cap issue is at 0). A hop has `header_index: UInt64`, the
+    /// position of its header among the message's `Received` headers, newest first; `from_host`,
+    /// `from_comment`, `ip`, `by_host`, `recipient`, `id` and `protocol`, each `Utf8` and null
+    /// when the header lacks the part; `tls: Struct<version: Utf8, cipher: Utf8>`, null when no
+    /// TLS details were found and `cipher` null when none is named; `date:
+    /// Timestamp(Microsecond, "UTC")` and `date_offset_minutes: Int32`, null when the date is
+    /// missing or unreadable; `delay_seconds: Int64` from the previous hop's date, null when
+    /// either date is missing; `first_external: Boolean`, true on the first external hop
+    /// found with the trust set given to
+    /// [`Pipeline::with_trust`](crate::Pipeline::with_trust), false on every other hop and null
+    /// when no trust set was given.
+    ReceivedHops,
     /// Every raw `Received-SPF:` value.
     ReceivedSpf,
+    /// Every `Received-SPF:` header parsed from its raw bytes, in header order; opt-in, never
+    /// a default.
+    ///
+    /// A list of one struct per header, empty when the message has none: `result: Utf8`, the
+    /// verdict word, lowercase for the known ones and as written otherwise; `client_ip: Utf8`, null
+    /// when the `client-ip` pair is not an address; `comment: Utf8`, null when there is none;
+    /// `pairs: List<Struct<key: Utf8, value: Utf8, offset: UInt64>>`, every `key=value` pair in
+    /// header order; `issues: List<Struct<kind: Utf8, offset: UInt64>>` as in
+    /// [`Column::AuthResults`].
+    ReceivedSpfParsed,
     /// Addresses in `Reply-To:`.
     ReplyTo,
     /// First raw `Return-Path:` value.
@@ -144,6 +188,9 @@ impl Column {
             Self::AuthResults => structured::auth_results_type(),
             Self::ArcSets => structured::arc_sets_type(),
             Self::DkimSignatures => structured::dkim_signatures_type(),
+            Self::ReceivedHops => structured::received_hops_type(),
+            Self::ReceivedSpfParsed => structured::received_spf_parsed_type(),
+            Self::MicrosoftAntispam => structured::microsoft_antispam_type(),
             Self::From
             | Self::To
             | Self::Cc
@@ -161,7 +208,8 @@ impl Column {
 
     /// The columns selected when none are named: everything that needs only the header block,
     /// except the opt-in [`Column::Raw`] and the structured columns [`Column::AuthResults`],
-    /// [`Column::ArcSets`] and [`Column::DkimSignatures`].
+    /// [`Column::ArcSets`], [`Column::DkimSignatures`], [`Column::ReceivedHops`],
+    /// [`Column::ReceivedSpfParsed`] and [`Column::MicrosoftAntispam`].
     #[must_use]
     pub fn defaults() -> Vec<Self> {
         NAMED
@@ -193,7 +241,13 @@ impl Column {
     const fn is_opt_in(&self) -> bool {
         matches!(
             self,
-            Self::Raw | Self::AuthResults | Self::ArcSets | Self::DkimSignatures
+            Self::Raw
+                | Self::AuthResults
+                | Self::ArcSets
+                | Self::DkimSignatures
+                | Self::ReceivedHops
+                | Self::ReceivedSpfParsed
+                | Self::MicrosoftAntispam
         )
     }
 
@@ -288,7 +342,14 @@ mod tests {
 
     #[test]
     fn structured_columns_are_opt_in_and_need_no_body() {
-        for name in ["auth_results", "arc_sets", "dkim_signatures"] {
+        for name in [
+            "auth_results",
+            "arc_sets",
+            "dkim_signatures",
+            "received_hops",
+            "received_spf_parsed",
+            "microsoft_antispam",
+        ] {
             let column = Column::from_name(name).expect("a structured column name parses");
             assert!(!column.needs_body(), "{name} reads headers only");
             assert!(column.needs_parsing(), "{name} reads the parsed headers");

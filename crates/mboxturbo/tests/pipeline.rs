@@ -9,8 +9,11 @@ mod pipeline {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray as _;
-    use arrow_array::types::{Int32Type, TimestampMicrosecondType, UInt8Type, UInt64Type};
+    use arrow_array::types::{
+        Int8Type, Int32Type, TimestampMicrosecondType, UInt8Type, UInt64Type,
+    };
     use arrow_array::{Array as _, RecordBatch, StructArray};
+    use mail_parser::MessageParser;
     use mboxturbo::{
         Column, Compression, Destination, Export, Mailbox, MboxTurboError, ParquetExporter,
         Pipeline, Selection, TrustSet,
@@ -87,6 +90,59 @@ Subject: none of these headers\n\
 \n\
 body\n";
 
+    /// Header blocks of messages with varied real-world `Received` forms, newest hop first.
+    const RECEIVED_CORPUS: [&str; 13] = [
+        "Received: from mail.example.org (mail.example.org [203.0.113.7])\n\
+\tby mx.example.com (Postfix) with ESMTPS id 4ABC123\n\
+\tfor <a@example.com>; Mon, 2 Nov 2026 10:00:00 +0000 (UTC)\n",
+        "Received: from [192.0.2.4] (helo=host.example.net)\n\
+\tby mx.example.com with esmtp (Exim 4.96) (envelope-from <s@example.net>)\n\
+\tid 1abc-0002-XY for a@example.com; Tue, 03 Nov 2026 11:00:00 +0100\n",
+        "Received: from AM6PR01MB1234.eurprd01.prod.exchangelabs.com (2603:10a6:20b::22)\n\
+\tby DB8PR01MB5678.eurprd01.prod.exchangelabs.com with Microsoft SMTP Server\n\
+\t(version=TLS1_2, cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.20.1;\n\
+\tWed, 4 Nov 2026 12:00:00 +0000\n",
+        "Received: by 2002:a17:906:1234:0:0:0:0 with SMTP id b1csp123ejc;\n\
+\tThu, 5 Nov 2026 01:00:00 -0800 (PST)\n\
+Received: from mail-sor-f41.google.com (mail-sor-f41.google.com. [209.85.220.41])\n\
+\tby mx.google.com with SMTPS id abc123 for <a@gmail.com>\n\
+\t(Google Transport Security); Thu, 5 Nov 2026 01:00:00 -0800 (PST)\n",
+        "Received: (qmail 4242 invoked by uid 1000); 5 Nov 2026 09:00:00 -0000\n",
+        "Received: from relay.example.org\n\
+\t(relay.example.org\n\
+\t[198.51.100.9])\n\
+\tby mx.example.com\n\
+\twith ESMTP\n\
+\tid Z9; Fri, 6 Nov 2026 09:00:00 +0000\n",
+        "Received: by mx.example.com (Postfix, from userid 0)\n\
+\tid ABC; Sat, 7 Nov 2026 08:00:00 +0000\n",
+        "Received: from a.example.org by mx.example.com with SMTP id 1\n",
+        "Received: ;;;((( not a received header at all\n",
+        "Subject: no received header\n",
+        "Received: from mx.example.net (mx.example.net [192.0.2.1])\n\
+\t(using TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits))\n\
+\tby mx.example.com (Postfix) with ESMTPS id 1; Sun, 8 Nov 2026 07:00:00 +0000\n",
+        "Received: from mx.example.com (mx.example.com [192.0.2.10])\n\
+\tby mx2.example.com with ESMTP id 2; Mon, 9 Nov 2026 07:00:03 +0000\n\
+Received: from edge.example.org (edge.example.org [198.51.100.5])\n\
+\tby mx.example.com with ESMTP id 3; Mon, 9 Nov 2026 07:00:01 +0000\n",
+        "Received: from\n",
+    ];
+
+    const PARSED_HEADERS: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Received-SPF: pass (example.com: domain of a@example.org designates 192.0.2.1 as permitted\n\
+\tsender) client-ip=192.0.2.1; envelope-from=a@example.org;\n\
+X-Forefront-Antispam-Report: CIP:192.0.2.1;SCL:5;CAT:SPM;SFV:SPM;\n\
+X-Microsoft-Antispam: BCL:3;\n\
+Subject: scored\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+Subject: none of these headers\n\
+\n\
+body\n";
+
     struct Fixture {
         directory: TempDir,
         mailbox: Arc<Mailbox>,
@@ -134,6 +190,17 @@ body\n";
                 .collect::<Result<_, _>>()
                 .expect("every parquet batch is decoded")
         }
+    }
+
+    /// The corpus as one mailbox, each header block followed by a one-line body.
+    fn corpus_mbox() -> String {
+        let mut mbox = String::new();
+        for headers in RECEIVED_CORPUS {
+            mbox.push_str("From x Mon Jan  1 00:00:00 2024\n");
+            mbox.push_str(headers);
+            mbox.push_str("\nbody\n\n");
+        }
+        mbox
     }
 
     fn text_lists(batch: &RecordBatch, column: usize) -> Vec<Vec<String>> {
@@ -999,7 +1066,14 @@ body\n",
         let fixture = Fixture::with(STRUCTURED);
         let pipeline = Arc::new(
             Pipeline::new(
-                vec![Column::AuthResults, Column::ArcSets, Column::DkimSignatures],
+                vec![
+                    Column::AuthResults,
+                    Column::ArcSets,
+                    Column::DkimSignatures,
+                    Column::ReceivedHops,
+                    Column::ReceivedSpfParsed,
+                    Column::MicrosoftAntispam,
+                ],
                 2,
             )
             .with_trust(trust_mx()),
@@ -1018,6 +1092,218 @@ body\n",
             rows, 4,
             "the nested columns are read back for every message"
         );
+    }
+
+    fn received_hops_batch(trust: Option<TrustSet>) -> RecordBatch {
+        let fixture = Fixture::with(&corpus_mbox());
+        let base = Pipeline::new(vec![Column::ReceivedHops], 16);
+        let pipeline = Arc::new(match trust {
+            Some(set) => base.with_trust(set),
+            None => base,
+        });
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("thirteen messages fit one batch of sixteen")
+            .expect("the received_hops batch is assembled")
+    }
+
+    /// The hops of message `row` in the `received_hops` struct column 0.
+    fn hops_of(batch: &RecordBatch, row: usize) -> StructArray {
+        batch
+            .column(0)
+            .as_struct()
+            .column_by_name("hops")
+            .expect("received_hops has a hops field")
+            .as_list::<i32>()
+            .value(row)
+            .as_struct()
+            .clone()
+    }
+
+    #[test]
+    fn received_hops_finds_a_hop_wherever_mail_parser_finds_a_host() {
+        let batch = received_hops_batch(None);
+        let ours = (0..RECEIVED_CORPUS.len())
+            .filter(|row| !hops_of(&batch, *row).is_empty())
+            .count();
+        let theirs = RECEIVED_CORPUS
+            .iter()
+            .filter(|headers| {
+                let text = format!("{headers}\nbody\n");
+                MessageParser::new()
+                    .parse(text.as_bytes())
+                    .is_some_and(|message| {
+                        message
+                            .all_received()
+                            .any(|hop| hop.from().is_some() || hop.by().is_some())
+                    })
+            })
+            .count();
+        assert!(
+            theirs >= 8,
+            "mail-parser reads the varied corpus ({theirs} messages)"
+        );
+        assert!(
+            ours >= theirs,
+            "received_hops has a hop for {ours} messages, mail-parser a host for {theirs}"
+        );
+    }
+
+    #[test]
+    fn received_hops_exposes_the_microsoft_tls_details() {
+        let batch = received_hops_batch(None);
+        let exchange = hops_of(&batch, 2);
+        let tls = exchange
+            .column_by_name("tls")
+            .expect("a hop has a tls field")
+            .as_struct();
+        assert_eq!(
+            text_field(tls, "version"),
+            [Some("TLS1_2".to_owned())],
+            "the Microsoft TLS version is exposed"
+        );
+        assert_eq!(
+            text_field(tls, "cipher"),
+            [Some("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".to_owned())],
+            "the Microsoft cipher is exposed"
+        );
+    }
+
+    #[test]
+    fn received_hops_dates_are_utc_microseconds_and_null_when_missing() {
+        let batch = received_hops_batch(None);
+        let exchange = hops_of(&batch, 2);
+        let dates = exchange
+            .column_by_name("date")
+            .expect("a hop has a date field")
+            .as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            dates.value(0),
+            1_793_793_600_000_000,
+            "the hop date is UTC microseconds"
+        );
+        let undated = hops_of(&batch, 7);
+        assert!(
+            undated
+                .column_by_name("date")
+                .expect("a hop has a date field")
+                .is_null(0),
+            "a hop without a date has a null date"
+        );
+    }
+
+    #[test]
+    fn a_message_without_received_headers_gets_empty_hops_never_null() {
+        let batch = received_hops_batch(None);
+        assert!(
+            batch.column(0).as_struct().is_valid(9) && hops_of(&batch, 9).is_empty(),
+            "a message without Received headers gets an empty hops list, not null"
+        );
+    }
+
+    /// The `first_external` flags of `hops`, null without a trust set.
+    fn first_external_flags(hops: &StructArray) -> Vec<Option<bool>> {
+        hops.column_by_name("first_external")
+            .expect("a hop has a first_external field")
+            .as_boolean()
+            .iter()
+            .collect()
+    }
+
+    #[test]
+    fn first_external_is_true_on_exactly_the_hop_from_outside_the_trust_set() {
+        let trust = TrustSet::new()
+            .add_host("mx.example.com")
+            .add_host("mx2.example.com")
+            .clone();
+        let chain = hops_of(&received_hops_batch(Some(trust)), 11);
+        assert_eq!(
+            text_field(&chain, "from_host"),
+            [
+                Some("edge.example.org".to_owned()),
+                Some("mx.example.com".to_owned())
+            ],
+            "the hops are oldest first"
+        );
+        assert_eq!(
+            first_external_flags(&chain),
+            [Some(true), Some(false)],
+            "only the hop received from outside the trust set is first_external"
+        );
+    }
+
+    #[test]
+    fn first_external_is_null_without_a_trust_set() {
+        let chain = hops_of(&received_hops_batch(None), 11);
+        assert_eq!(
+            first_external_flags(&chain),
+            [None, None],
+            "first_external is null on every hop without a trust set"
+        );
+    }
+
+    fn parsed_headers_batch() -> RecordBatch {
+        Fixture::with(PARSED_HEADERS)
+            .batches(&[Column::ReceivedSpfParsed, Column::MicrosoftAntispam], 8)
+            .into_iter()
+            .next()
+            .expect("two messages fit one batch of eight")
+    }
+
+    #[test]
+    fn received_spf_parsed_exposes_the_verdict_and_client_address() {
+        let spf = elements(&parsed_headers_batch(), 0, 0);
+        assert_eq!(
+            text_field(&spf, "result"),
+            [Some("pass".to_owned())],
+            "the SPF verdict is exposed"
+        );
+        assert_eq!(
+            text_field(&spf, "client_ip"),
+            [Some("192.0.2.1".to_owned())],
+            "the SPF client address is exposed"
+        );
+    }
+
+    #[test]
+    fn microsoft_antispam_gives_an_element_per_header_in_header_order() {
+        let antispam = elements(&parsed_headers_batch(), 1, 0);
+        assert_eq!(
+            text_field(&antispam, "header"),
+            [
+                Some("x-forefront-antispam-report".to_owned()),
+                Some("x-microsoft-antispam".to_owned())
+            ],
+            "both Microsoft headers give an element, in header order"
+        );
+        assert_eq!(
+            antispam
+                .column_by_name("scl")
+                .expect("an element has an scl field")
+                .as_primitive::<Int8Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some(5), None],
+            "SCL is read from the header that has it"
+        );
+    }
+
+    #[test]
+    fn a_message_without_the_parsed_headers_gets_empty_lists_never_null() {
+        let batch = parsed_headers_batch();
+        for column in [0, 1] {
+            let list = batch.column(column).as_list::<i32>();
+            assert!(
+                list.is_valid(1),
+                "column {column} is not null for a bare message"
+            );
+            assert_eq!(
+                list.value(1).len(),
+                0,
+                "column {column} is empty for a bare message"
+            );
+        }
     }
 
     proptest! {

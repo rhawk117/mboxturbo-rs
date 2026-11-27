@@ -1,6 +1,8 @@
 //! Nested Arrow columns for the parsed `Authentication-Results`, ARC and `DKIM-Signature`
 //! headers. The field layouts are defined here once and documented on the `Column` variants.
 
+mod received;
+
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -13,6 +15,10 @@ use mboxturbo_headers::{
     ArcHeader, ArcSet, AuthMethod, AuthResult, AuthenticationResults, ChainValidation,
     DkimSignature, Issue, IssueKind, ResInfo, Tag, TagList, TrustSet, TrustStatus, parse_arc_sets,
     parse_authentication_results, parse_dkim_signature,
+};
+pub(crate) use received::{
+    MicrosoftAntispamColumn, ReceivedHopsColumn, ReceivedSpfColumn, microsoft_antispam_type,
+    received_hops_type, received_spf_parsed_type,
 };
 
 use crate::fields::Mail;
