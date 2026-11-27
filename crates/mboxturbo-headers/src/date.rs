@@ -608,6 +608,112 @@ fn day_of(issues: &mut Vec<Issue>, number: Number) -> Option<Number> {
     ranged(issues, number, 1..=31).map(|_| number)
 }
 
+/// The instant of `value` when it is exactly `[Www, ]D[D] Mon YYYY HH:MM[:SS] +ZZZZ` in single
+/// spaces and raises no issue; `None` for every other value, which the general reader handles.
+///
+/// This is the form nearly every message carries, read without building tokens, so the result
+/// and the empty issue list match [`parse_general`] by construction: the calendar and range
+/// checks are the ones the general path runs, and any issue they raise sends the value there.
+fn clean_instant(value: &[u8]) -> Option<Instant> {
+    let mut issues = Vec::new();
+    let fields = clean_fields(value, &mut issues)?;
+    let instant = instant_of(&mut issues, &fields);
+    issues.is_empty().then_some(instant?)
+}
+
+/// The fields of a value in the clean form, with the issues their range checks raise.
+fn clean_fields(value: &[u8], issues: &mut Vec<Issue>) -> Option<Fields> {
+    let mut rest = value;
+    let weekday = if rest.first()?.is_ascii_alphabetic() {
+        Some(clean_weekday(&mut rest)?)
+    } else {
+        None
+    };
+    let (day, month, year) = clean_date(&mut rest, issues)?;
+    let (time, zone_minutes) = clean_clock(rest, issues)?;
+    Some(Fields {
+        day,
+        month,
+        time,
+        weekday,
+        year,
+        zone_minutes,
+    })
+}
+
+/// Reads `D[D] Mon YYYY `.
+fn clean_date(rest: &mut &[u8], issues: &mut Vec<Issue>) -> Option<(Number, i16, i16)> {
+    let day_width = if rest.get(1) == Some(&b' ') { 1 } else { 2 };
+    let day = day_of(issues, clean_number(rest, day_width, b' ')?)?;
+    let month = clean_name(rest, &MONTHS, 1, b' ')?;
+    let year = widen_year(issues, clean_number(rest, 4, b' ')?)?;
+    Some((day, month, year))
+}
+
+/// Reads `HH:MM[:SS] +ZZZZ` through the end of the value.
+fn clean_clock(mut rest: &[u8], issues: &mut Vec<Issue>) -> Option<(Time, i16)> {
+    let hour = ranged(issues, clean_number(&mut rest, 2, b':')?, 0..=23)?;
+    let (minute, second) = clean_minute(&mut rest, issues)?;
+    let zone_minutes = clean_zone(rest, issues)?;
+    Some((
+        Time {
+            hour,
+            minute,
+            second,
+        },
+        zone_minutes,
+    ))
+}
+
+/// The index, plus `first`, of the entry of `table` that the next three bytes spell in any case.
+fn clean_name(rest: &mut &[u8], table: &[&str], first: i16, end: u8) -> Option<i16> {
+    let name = take(rest, 3, end)?;
+    table
+        .iter()
+        .zip(first..)
+        .find(|(entry, _)| entry.as_bytes().eq_ignore_ascii_case(name))
+        .map(|(_, index)| index)
+}
+
+/// Reads `width` digits and the `end` byte after them.
+fn clean_number(rest: &mut &[u8], width: usize, end: u8) -> Option<Number> {
+    number_of(take(rest, width, end)?, 0)
+}
+
+/// Reads `MM ` or `MM:SS `.
+fn clean_minute(rest: &mut &[u8], issues: &mut Vec<Issue>) -> Option<(i16, i16)> {
+    let minute = ranged(issues, number_of(rest.get(..2)?, 0)?, 0..=59)?;
+    let (&separator, tail) = rest.get(2..)?.split_first()?;
+    *rest = tail;
+    match separator {
+        b' ' => Some((minute, 0)),
+        b':' => Some((minute, seconds(issues, clean_number(rest, 2, b' ')?)?)),
+        _ => None,
+    }
+}
+
+/// Reads `Www, `.
+fn clean_weekday(rest: &mut &[u8]) -> Option<Weekday> {
+    let value = clean_name(rest, &WEEKDAYS, 0, b',')?;
+    *rest = rest.strip_prefix(b" ")?;
+    Some(Weekday { offset: 0, value })
+}
+
+/// Reads the whole of `rest` as `+HHMM` or `-HHMM`.
+fn clean_zone(rest: &[u8], issues: &mut Vec<Issue>) -> Option<i16> {
+    let (&sign, digits) = rest.split_first().filter(|(_, digits)| digits.len() == 4)?;
+    let (hours, minutes) = digits.split_at(2);
+    let total = zone_magnitude(issues, number_of(hours, 0)?, Some(number_of(minutes, 0)?))?;
+    Some(Sign::of(sign)?.apply(total))
+}
+
+/// Splits `width` bytes and then the `end` byte off the front of `rest`.
+fn take<'src>(rest: &mut &'src [u8], width: usize, end: u8) -> Option<&'src [u8]> {
+    let (head, tail) = rest.split_at_checked(width)?;
+    *rest = tail.strip_prefix(&[end])?;
+    Some(head)
+}
+
 /// Days from 1970-01-01 to the given proleptic Gregorian date.
 #[expect(
     clippy::arithmetic_side_effects,
@@ -701,6 +807,14 @@ fn number_of(bytes: &[u8], offset: usize) -> Option<Number> {
 /// reading and reported as one [`IssueKind::CapExceeded`] issue at the cap.
 #[must_use]
 pub fn parse_date(value: &[u8]) -> Parsed<Option<Instant>> {
+    if let Some(instant) = clean_instant(value) {
+        return Parsed::new(Some(instant), Vec::new());
+    }
+    parse_general(value)
+}
+
+/// [`parse_date`] without the clean-form shortcut: tokens or bytes, with every issue reported.
+fn parse_general(value: &[u8]) -> Parsed<Option<Instant>> {
     let (head, cut) = bound(value);
     let mut raw = Raw::new(head);
     if raw.looks_iso() {
@@ -773,7 +887,10 @@ fn zone_magnitude(issues: &mut Vec<Issue>, hours: Number, minutes: Option<Number
 mod tests {
     use std::iter::repeat_with;
 
-    use super::{Instant, parse_date};
+    use proptest::option;
+    use proptest::prelude::*;
+
+    use super::{Instant, clean_instant, parse_date, parse_general};
     use crate::caps::{Cap, MAX_HEADER_BYTES};
     use crate::issue::{Issue, IssueKind};
 
@@ -1156,5 +1273,87 @@ mod tests {
             Some(NOON),
             "a date followed by a mebibyte of spaces still parses"
         );
+    }
+
+    /// An RFC 5322 date built from independently varied fields, so most draws are near the clean
+    /// form and the rest break it in one place: a wrong weekday, an out-of-range field, a short
+    /// or long field, another separator or trailing text.
+    fn near_clean_dates() -> impl Strategy<Value = String> {
+        (
+            prop_oneof![
+                Just(String::new()),
+                "(Mon|Tue|Wed|Thu|Fri|Sat|Sun|mon|TUE|Tues|Xyz), ",
+                "(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ",
+            ],
+            "[0-9]{1,3}",
+            "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|feb|DEC|Sept|Xyz)",
+            "[0-9]{1,5}",
+            "[0-9]{1,3}:[0-9]{1,3}(:[0-9]{1,3})?",
+            "[-+][0-9]{2,5}|GMT|Z|[-+][0-9]{2}:[0-9]{2}",
+            "( |  |\t|\\(c\\) |x)?",
+        )
+            .prop_map(|(weekday, day, month, year, time, zone, tail)| {
+                format!("{weekday}{day} {month} {year} {time} {zone}{tail}")
+            })
+    }
+
+    #[test]
+    fn a_dated_rfc_5322_value_with_matching_weekday_takes_the_shortcut() {
+        for text in [
+            "Tue, 03 Feb 2015 10:14:01 +0000",
+            "Tue, 3 Feb 2015 10:14 -0530",
+        ] {
+            assert_eq!(
+                clean_instant(text.as_bytes()),
+                *parse_general(text.as_bytes()).value(),
+                "the shortcut reads {text:?} as the general reader does"
+            );
+            assert!(
+                clean_instant(text.as_bytes()).is_some(),
+                "{text:?} is in the clean form"
+            );
+        }
+        assert_eq!(
+            clean_instant(b"Wed, 03 Feb 2015 10:14:01 +0000"),
+            None,
+            "a wrong weekday is an issue, so it goes to the general reader"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(5_000))]
+
+        #[test]
+        fn the_clean_form_shortcut_gives_the_general_readers_result(text in near_clean_dates()) {
+            prop_assert_eq!(
+                parse_date(text.as_bytes()),
+                parse_general(text.as_bytes()),
+                "the shortcut must not change the instant or the issues of {:?}",
+                text
+            );
+        }
+
+        #[test]
+        fn a_value_the_general_reader_accepts_without_issues_in_the_clean_form_takes_the_shortcut(
+            day in 1_u8..=28,
+            month in "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)",
+            year in 1000_u16..=9999,
+            time in (0_u8..24, 0_u8..60, option::of(0_u8..60)),
+            zone in (prop_oneof![Just('+'), Just('-')], 0_u8..24, 0_u8..60),
+        ) {
+            let seconds = time.2.map_or_else(String::new, |second| format!(":{second:02}"));
+            let text = format!(
+                "{day} {month} {year} {:02}:{:02}{seconds} {}{:02}{:02}",
+                time.0, time.1, zone.0, zone.1, zone.2
+            );
+            let general = parse_general(text.as_bytes());
+            prop_assert!(general.issues().is_empty(), "{:?} is a clean date", text);
+            prop_assert_eq!(
+                clean_instant(text.as_bytes()),
+                *general.value(),
+                "the shortcut reads {:?} as the general reader does",
+                text
+            );
+        }
     }
 }
