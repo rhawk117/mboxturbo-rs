@@ -343,7 +343,7 @@ mod export {
     fn mbox_rewrites_the_selected_messages() {
         let fixture = Fixture::new();
         let target = fixture.target("out.mbox");
-        let output = fixture.export(&["--format", "mbox", "-o", &target, "--columns", "raw"]);
+        let output = fixture.export(&["--format", "mbox", "-o", &target]);
         assert_eq!(
             code(&output),
             0_i32,
@@ -361,14 +361,7 @@ mod export {
     fn eml_writes_a_directory_with_a_file_per_message() {
         let fixture = Fixture::new();
         let target = fixture.target("emls");
-        let output = fixture.export(&[
-            "--format",
-            "eml",
-            "-o",
-            &target,
-            "--columns",
-            "raw,position",
-        ]);
+        let output = fixture.export(&["--format", "eml", "-o", &target]);
         assert_eq!(
             code(&output),
             0_i32,
@@ -385,6 +378,68 @@ mod export {
         assert!(
             second.contains("Subject: two"),
             "each file holds its own message"
+        );
+    }
+
+    #[test]
+    fn eml_manifest_fills_message_id_and_date() {
+        let fixture = Fixture::new();
+        let mbox = concat!(
+            "From a@example.com Mon Jan  1 00:00:00 2024\n",
+            "Message-ID: <m1@example.com>\n",
+            "Date: Mon, 1 Jan 2024 00:00:00 +0000\n",
+            "Subject: one\n\nbody\n\n",
+        );
+        fs::write(&fixture.mbox, mbox).expect("the mailbox is rewritten");
+        let target = fixture.target("emls");
+        let output = fixture.export(&["--format", "eml", "-o", &target]);
+        assert_eq!(code(&output), 0_i32, "eml export: {}", stderr(&output));
+        let manifest = fs::read_to_string(fixture.path("emls").join("manifest.jsonl"))
+            .expect("the manifest exists");
+        assert!(
+            manifest.contains("m1@example.com") && manifest.contains("2024-01-01"),
+            "the manifest names the message id and date: {manifest}"
+        );
+    }
+
+    #[test]
+    fn columns_with_eml_or_mbox_exit_64() {
+        let fixture = Fixture::new();
+        for format in ["eml", "mbox"] {
+            let target = fixture.target(&format!("out-{format}"));
+            let output = fixture.export(&["--format", format, "-o", &target, "--columns", "raw"]);
+            assert_eq!(code(&output), 64_i32, "--columns with {format} is usage");
+            assert_eq!(stderr(&output).lines().count(), 1, "one line on stderr");
+        }
+    }
+
+    #[test]
+    fn an_empty_select_file_exits_64_naming_it() {
+        let fixture = Fixture::new();
+        let target = fixture.target("out.csv");
+        let empty = fixture.target("empty.txt");
+        fs::write(&empty, "\n  \n").expect("the select file is written");
+        let output = fixture.export(&["--format", "csv", "-o", &target, "--select-file", &empty]);
+        assert_eq!(code(&output), 64_i32, "an empty select file is usage");
+        assert!(
+            stderr(&output).contains("empty.txt")
+                && stderr(&output).contains("selects no messages"),
+            "the message names the file: {}",
+            stderr(&output)
+        );
+    }
+
+    #[test]
+    fn an_index_under_a_missing_directory_exits_74() {
+        let fixture = Fixture::new();
+        let target = fixture.target("out.csv");
+        let index = fixture.target("no/such/dir/mail.idx");
+        let output = fixture.export(&["--format", "csv", "-o", &target, "--index", &index]);
+        assert_eq!(
+            code(&output),
+            74_i32,
+            "a missing index directory is I/O, not a missing mailbox: {}",
+            stderr(&output)
         );
     }
 
@@ -642,7 +697,7 @@ mod export {
             4,
             "one jsonl line per message"
         );
-        let mbox = fixture.export(&["--format", "mbox", "-o", "-", "--columns", "raw"]);
+        let mbox = fixture.export(&["--format", "mbox", "-o", "-"]);
         assert_eq!(
             code(&mbox),
             0_i32,

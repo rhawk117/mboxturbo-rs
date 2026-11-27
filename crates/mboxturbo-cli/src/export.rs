@@ -165,7 +165,7 @@ impl Format {
 /// standard output with a format that cannot stream, all found before anything is written; a
 /// [`Failure::Core`] for everything the library refuses.
 pub(crate) fn run(args: &ExportArgs) -> Result<(), Failure> {
-    let columns = columns(args.columns.as_deref())?;
+    let columns = columns(args.format, args.columns.as_deref())?;
     let destination = destination(args.format, &args.output)?;
     let ranges = select::parse_all(&args.select)?;
     let mailbox = open(&args.mailbox, args.index.as_deref())?;
@@ -180,8 +180,27 @@ pub(crate) fn run(args: &ExportArgs) -> Result<(), Failure> {
         .map_err(|error| Failure::after_open(Box::new(error)))
 }
 
-/// The requested columns by name, or the library defaults when none are named.
-fn columns(requested: Option<&[String]>) -> Result<Vec<Column>, Failure> {
+/// The columns to extract: a fixed set for the formats that write whole messages, otherwise the
+/// requested columns by name, or the library defaults when none are named.
+fn columns(format: Format, requested: Option<&[String]>) -> Result<Vec<Column>, Failure> {
+    let whole = match format {
+        Format::Eml => Some(vec![
+            Column::Raw,
+            Column::Position,
+            Column::MessageId,
+            Column::Date,
+        ]),
+        Format::Mbox => Some(vec![Column::Raw]),
+        Format::Arrow | Format::Csv | Format::Jsonl | Format::Parquet => None,
+    };
+    if let Some(fixed) = whole {
+        if requested.is_some() {
+            return Err(Failure::Usage(format!(
+                "--columns cannot be used with {format:?}, which writes whole messages"
+            )));
+        }
+        return Ok(fixed);
+    }
     let Some(names) = requested else {
         return Ok(Column::defaults());
     };
@@ -221,10 +240,27 @@ fn open(path: &Path, index: Option<&Path>) -> Result<Mailbox, Failure> {
     MailboxBuilder::new()
         .index(policy)
         .open(path)
-        .map_err(|error| Failure::Core {
-            error: Box::new(error),
-            stage: Stage::OpeningMailbox,
+        .map_err(|error| {
+            let stage = if is_missing(&error, path) {
+                Stage::OpeningMailbox
+            } else {
+                Stage::AfterOpen
+            };
+            Failure::Core {
+                error: Box::new(error),
+                stage,
+            }
         })
+}
+
+/// Whether `error` is the mailbox at `mailbox` not existing, as opposed to any other missing path
+/// such as the index directory.
+fn is_missing(error: &MboxTurboError, mailbox: &Path) -> bool {
+    matches!(
+        error,
+        MboxTurboError::Io { path, source }
+            if path == mailbox && source.kind() == io::ErrorKind::NotFound
+    )
 }
 
 /// The messages to export: every message when no selection is given, otherwise the union of
@@ -239,6 +275,12 @@ fn selection(
     }
     if let Some(path) = &args.select_file {
         ranges.extend(select_file(path)?);
+        if ranges.is_empty() {
+            return Err(Failure::Usage(format!(
+                "{} selects no messages",
+                path.display()
+            )));
+        }
     }
     Ok(Selection::Positions(select::positions(
         ranges,

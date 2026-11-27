@@ -24,7 +24,7 @@ const INTERRUPTED: u8 = 130;
 pub(crate) enum Stage {
     /// Everything after the mailbox is open, such as writing the export.
     AfterOpen,
-    /// Opening the mailbox: the only stage whose `NotFound` is a missing mailbox.
+    /// The mailbox itself is missing: the only stage whose `NotFound` is exit 66.
     OpeningMailbox,
 }
 
@@ -37,9 +37,9 @@ pub(crate) enum Stage {
 /// | other failure (Arrow, Parquet, unsupported destination, any future variant) | 1 |
 /// | `PositionOutOfRange` (usage) | 64 |
 /// | `CorruptIndex`, `StaleIndex` | 65 |
-/// | `Io` whose source is `NotFound` while opening the mailbox (mailbox missing) | 66 |
+/// | `Io` whose source is `NotFound` for the mailbox path itself (mailbox missing) | 66 |
 /// | `TargetExists` | 73 |
-/// | `Io`, any other kind or any `NotFound` after the mailbox is open | 74 |
+/// | `Io`, any other kind or any other `NotFound`, such as an output or index path | 74 |
 /// | `Cancelled` | 130 |
 ///
 /// Clap usage errors and other usage errors are mapped to 64 by the caller, not here.
@@ -63,8 +63,8 @@ pub(crate) fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
     }
 }
 
-/// `NotFound` while opening the mailbox means the mailbox is missing; every other I/O failure,
-/// including a `NotFound` on an output path, is a plain I/O error.
+/// `NotFound` for the mailbox itself means the mailbox is missing; every other I/O failure,
+/// including a `NotFound` on an output or index path, is a plain I/O error.
 fn io_code(stage: Stage, source: &io::Error) -> u8 {
     if stage == Stage::OpeningMailbox && source.kind() == io::ErrorKind::NotFound {
         NOT_FOUND
