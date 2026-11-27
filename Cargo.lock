@@ -759,8 +759,12 @@ dependencies = [
 name = "mboxturbo-cli"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
  "clap",
  "mboxturbo",
+ "parquet",
+ "tempfile",
 ]
 
 [[package]]

@@ -4,12 +4,10 @@ use std::io;
 
 use mboxturbo::MboxTurboError;
 
-/// Exit code for success.
-const OK: u8 = 0;
 /// Exit code for a failure with no more specific code.
 const OTHER: u8 = 1;
 /// Exit code for a usage error.
-const USAGE: u8 = 64;
+pub(crate) const USAGE: u8 = 64;
 /// Exit code for a corrupt or stale index.
 const CORRUPT: u8 = 65;
 /// Exit code for a missing mailbox.
@@ -25,23 +23,17 @@ const INTERRUPTED: u8 = 130;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stage {
     /// Everything after the mailbox is open, such as writing the export.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the export commands that fail after opening are not built yet"
-        )
-    )]
     AfterOpen,
     /// Opening the mailbox: the only stage whose `NotFound` is a missing mailbox.
     OpeningMailbox,
 }
 
-/// Maps the outcome of a command to its process exit code.
+/// Maps one failure to its process exit code.
 ///
-/// | Outcome | Code |
+/// Success is exit 0 and needs no mapping.
+///
+/// | Failure | Code |
 /// |---------|------|
-/// | `Ok` | 0 |
 /// | other failure (Arrow, Parquet, unsupported destination, any future variant) | 1 |
 /// | `PositionOutOfRange` (usage) | 64 |
 /// | `CorruptIndex`, `StaleIndex` | 65 |
@@ -50,20 +42,12 @@ pub(crate) enum Stage {
 /// | `Io`, any other kind or any `NotFound` after the mailbox is open | 74 |
 /// | `Cancelled` | 130 |
 ///
-/// Clap usage errors are mapped to 64 by `main`, not here.
-pub(crate) fn outcome_code(stage: Stage, outcome: &Result<(), MboxTurboError>) -> u8 {
-    match outcome {
-        Ok(()) => OK,
-        Err(error) => error_code(stage, error),
-    }
-}
-
-/// Maps one failure to its exit code; the table is on [`outcome_code`].
+/// Clap usage errors and other usage errors are mapped to 64 by the caller, not here.
 #[expect(
     clippy::match_same_arms,
     reason = "the variants that mean `other` are named so a new variant is a conscious choice"
 )]
-fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
+pub(crate) fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
     match error {
         MboxTurboError::Arrow { .. }
         | MboxTurboError::Parquet { .. }
@@ -97,21 +81,12 @@ mod tests {
 
     use super::*;
 
-    fn code(error: MboxTurboError) -> u8 {
-        outcome_code(Stage::AfterOpen, &Err(error))
+    fn code(error: &MboxTurboError) -> u8 {
+        error_code(Stage::AfterOpen, error)
     }
 
-    fn opening_code(error: MboxTurboError) -> u8 {
-        outcome_code(Stage::OpeningMailbox, &Err(error))
-    }
-
-    #[test]
-    fn success_exits_zero() {
-        assert_eq!(
-            outcome_code(Stage::AfterOpen, &Ok(())),
-            0,
-            "success is exit 0"
-        );
+    fn opening_code(error: &MboxTurboError) -> u8 {
+        error_code(Stage::OpeningMailbox, error)
     }
 
     #[test]
@@ -119,7 +94,7 @@ mod tests {
         let error = Mailbox::open("/nonexistent/mboxturbo-cli-test.mbox")
             .expect_err("the path does not exist");
         assert_eq!(
-            opening_code(error),
+            opening_code(&error),
             66,
             "a NotFound open is a missing mailbox"
         );
@@ -132,7 +107,7 @@ mod tests {
             source: io::Error::from(io::ErrorKind::NotFound),
         };
         assert_eq!(
-            code(error),
+            code(&error),
             74,
             "a missing output path is not a missing mailbox"
         );
@@ -142,7 +117,7 @@ mod tests {
     fn other_io_errors_exit_74() {
         let source = io::Error::from(io::ErrorKind::PermissionDenied);
         assert_eq!(
-            code(MboxTurboError::Io {
+            code(&MboxTurboError::Io {
                 path: PathBuf::from("mail.mbox"),
                 source
             }),
@@ -158,9 +133,9 @@ mod tests {
             path: path.clone(),
             corruption: Corruption::Checksum,
         };
-        assert_eq!(code(corrupt), 65, "a corrupt index is 65");
+        assert_eq!(code(&corrupt), 65, "a corrupt index is 65");
         assert_eq!(
-            code(MboxTurboError::StaleIndex { path }),
+            code(&MboxTurboError::StaleIndex { path }),
             65,
             "a stale index is 65"
         );
@@ -171,7 +146,7 @@ mod tests {
         let error = MboxTurboError::TargetExists {
             path: PathBuf::from("out.csv"),
         };
-        assert_eq!(code(error), 73, "target exists is 73");
+        assert_eq!(code(&error), 73, "target exists is 73");
     }
 
     #[test]
@@ -180,7 +155,7 @@ mod tests {
             target: None,
             written: 3,
         };
-        assert_eq!(code(error), 130, "interrupted is 130");
+        assert_eq!(code(&error), 130, "interrupted is 130");
     }
 
     #[test]
@@ -189,7 +164,11 @@ mod tests {
             position: 9,
             len: 3,
         };
-        assert_eq!(code(error), 64, "an out-of-range position is a usage error");
+        assert_eq!(
+            code(&error),
+            64,
+            "an out-of-range position is a usage error"
+        );
     }
 
     #[test]
@@ -198,6 +177,6 @@ mod tests {
             kind: DestinationKind::Stream,
             target: None,
         };
-        assert_eq!(code(error), 1, "an unsupported destination is exit 1");
+        assert_eq!(code(&error), 1, "an unsupported destination is exit 1");
     }
 }
