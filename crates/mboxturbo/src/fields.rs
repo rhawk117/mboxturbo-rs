@@ -1,6 +1,7 @@
 //! Field extraction over a parsed message, shared by `Message` and the column pipeline.
 
 use std::borrow::Cow;
+use std::iter;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::LazyLock;
 
@@ -128,6 +129,32 @@ fn date_value(header: &[u8]) -> Option<Cow<'_, str>> {
     let (name, value) = header.split_at_checked(DATE_NAME.len())?;
     name.eq_ignore_ascii_case(DATE_NAME)
         .then(|| unfold(String::from_utf8_lossy(value)))
+}
+
+/// The name and the raw value of every header in the head of `message`, in file order.
+///
+/// `message` is the stored bytes, with or without its leading `From ` line. The walk stops at
+/// the first blank line, so a header-looking line in the body never shows up. The name is the
+/// text before the first colon, as written; the value is everything after that colon, folds
+/// included, without the final line break. A line with no colon is skipped.
+pub(crate) fn raw_headers(message: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    let mut rest = strip_separator(message);
+    iter::from_fn(move || {
+        loop {
+            let (header, remainder) = next_header(rest)?;
+            rest = remainder;
+            if let Some(split) = split_header(header) {
+                return Some(split);
+            }
+        }
+    })
+}
+
+/// The name and the value of `header` around its first colon; `None` when it has no colon.
+fn split_header(header: &[u8]) -> Option<Split<'_>> {
+    let (name, from_colon) = header.split_at_checked(memchr::memchr(b':', header)?)?;
+    let value = from_colon.get(1..)?;
+    Some((name, value.strip_suffix(b"\r").unwrap_or(value)))
 }
 
 /// The offset of the first newline in `bytes`, or its length when there is none.

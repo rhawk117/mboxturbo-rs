@@ -392,7 +392,9 @@ impl AuthResultsColumn {
     /// Appends the list of every `Authentication-Results` header of `mail`, parsed from its raw
     /// bytes in header order; an unparsed message appends an empty list.
     pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>, trust: Option<&TrustSet>) {
-        let decided = mail.map_or_else(Vec::new, |parsed| decide_results(parsed, trust));
+        let decided = mail.map_or_else(Vec::new, |parsed| {
+            decide_results(mail_headers(parsed), trust)
+        });
         for header in &decided {
             self.results.push(&header.results, header.status);
             self.issues.push(header.issues.iter());
@@ -635,17 +637,10 @@ impl VerdictColumn {
     /// `Authentication-Results` of `mail` that has one; null when there is none, the message is
     /// unparsed or no trust set was given.
     pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>, trust: Option<&TrustSet>) {
-        let decided = mail.map_or_else(Vec::new, |parsed| decide_results(parsed, trust));
-        let verdict = decided
-            .iter()
-            .filter(|header| header.status == TrustStatus::Trusted)
-            .find_map(|header| {
-                header
-                    .results
-                    .entries()
-                    .iter()
-                    .find(|entry| *entry.method() == self.method)
-            });
+        let decided = mail.map_or_else(Vec::new, |parsed| {
+            decide_results(mail_headers(parsed), trust)
+        });
+        let verdict = trusted_entry(&decided, &self.method);
         self.builder
             .append_option(verdict.map(|entry| result_name(entry.result())));
     }
@@ -735,21 +730,19 @@ fn chain_validation_name<'status>(status: &'status ChainValidation<'_>) -> &'sta
 /// Every `Authentication-Results` header of `mail` in header order, each with its trust.
 ///
 /// The one place that decides trust for the `auth_results` flag and the verdict columns.
-fn decide_results<'mail>(
-    mail: &'mail Mail<'mail>,
+fn decide_results<'bytes>(
+    headers: impl IntoIterator<Item = (&'bytes [u8], &'bytes [u8])>,
     trust: Option<&TrustSet>,
-) -> Vec<DecidedResults<'mail>> {
+) -> Vec<DecidedResults<'bytes>> {
     let mut received = Vec::new();
     let mut parsed = Vec::new();
-    for (position, header) in mail.headers().iter().enumerate() {
-        let name = header.name();
-        let value = strip_line_break(header.raw_value());
-        if name.as_str().eq_ignore_ascii_case(AUTHENTICATION_RESULTS) {
+    for (position, (name, value)) in headers.into_iter().enumerate() {
+        if name.eq_ignore_ascii_case(AUTHENTICATION_RESULTS.as_bytes()) {
             let (results, issues) = parse_authentication_results(value, trust).into_parts();
             parsed.push((position, results, issues));
             continue;
         }
-        if name.as_str().eq_ignore_ascii_case(RECEIVED) {
+        if name.eq_ignore_ascii_case(RECEIVED.as_bytes()) {
             received.push((position, value));
         }
     }
@@ -767,6 +760,38 @@ fn decide_results<'mail>(
             results,
         })
         .collect()
+}
+
+/// The first `method` entry of the topmost trusted header in `decided` that has one.
+fn trusted_entry<'decided, 'mail>(
+    decided: &'decided [DecidedResults<'mail>],
+    method: &AuthMethod<'_>,
+) -> Option<&'decided ResInfo<'mail>> {
+    decided
+        .iter()
+        .filter(|header| header.status == TrustStatus::Trusted)
+        .find_map(|header| {
+            header
+                .results
+                .entries()
+                .iter()
+                .find(|entry| entry.method() == method)
+        })
+}
+
+/// Whether the topmost trusted `Authentication-Results` entry for `method` among `headers`
+/// (name and raw value pairs, in order) reads `word`, as [`VerdictColumn`] would write it.
+///
+/// Only `Authentication-Results` and `Received` headers are read; other pairs are ignored.
+/// Without a trust set nothing is trusted, so the answer is `false`.
+pub(crate) fn verdict_is<'bytes>(
+    headers: impl IntoIterator<Item = (&'bytes [u8], &'bytes [u8])>,
+    method: &AuthMethod<'_>,
+    trust: Option<&TrustSet>,
+    word: &str,
+) -> bool {
+    let decided = decide_results(headers, trust);
+    trusted_entry(&decided, method).is_some_and(|entry| result_name(entry.result()) == word)
 }
 
 /// The trust of `results`, which sits at header `position`: by authserv-id as the parser says,
@@ -915,6 +940,19 @@ fn raw_values<'mail>(
         .iter()
         .filter(move |header| header.name().as_str().eq_ignore_ascii_case(name))
         .map(|header| strip_line_break(header.raw_value()))
+}
+
+/// The name and raw value of every header of `mail` in header order; the value has no final
+/// line break.
+fn mail_headers<'mail>(
+    mail: &'mail Mail<'mail>,
+) -> impl Iterator<Item = (&'mail [u8], &'mail [u8])> {
+    mail.headers().iter().map(|header| {
+        (
+            header.raw_name().as_bytes(),
+            strip_line_break(header.raw_value()),
+        )
+    })
 }
 
 /// The fields of one parsed `Authentication-Results` value, without its issues.

@@ -25,8 +25,8 @@ create_exception!(
 
 /// The Python exception for a core error: `OSError` (with `filename`) for I/O, the matching
 /// `MboxTurboError` subclass for a damaged or stale index, `FileExistsError` (with `filename`)
-/// for an existing export target, the base class otherwise (Arrow,
-/// Parquet and out-of-range position errors included).
+/// for an existing export target, the base class otherwise (Arrow, Parquet, invalid predicate
+/// and out-of-range position errors included).
 pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> PyErr {
     let message = error.to_string();
     match error {
@@ -46,6 +46,7 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> P
         // `clippy::wildcard_enum_match_arm` quiet for the wildcard below.
         mboxturbo::MboxTurboError::Arrow { .. }
         | mboxturbo::MboxTurboError::Cancelled { .. }
+        | mboxturbo::MboxTurboError::InvalidPredicate { .. }
         | mboxturbo::MboxTurboError::Parquet { .. }
         | mboxturbo::MboxTurboError::PositionOutOfRange { .. }
         | mboxturbo::MboxTurboError::UnsupportedDestination { .. } => {
