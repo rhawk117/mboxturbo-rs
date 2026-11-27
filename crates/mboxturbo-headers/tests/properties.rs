@@ -26,7 +26,7 @@ mod properties {
 
     const BOGUS_PAYLOADS: [&[u8]; 7] = [b"", b"=", b"=C", b"=ZZ", b"!!!!", b"YQ==", b"a_b"];
 
-    const CAP_CASES: [CapCase; 22] = [
+    const CAP_CASES: [CapCase; 25] = [
         (
             "tokenize",
             Cap::HeaderBytes,
@@ -131,6 +131,27 @@ mod properties {
             MAX_COMMENT_DEPTH,
             open_comments,
             received_hops_issues,
+        ),
+        (
+            "parse_authentication_results",
+            Cap::CommentDepth,
+            MAX_COMMENT_DEPTH,
+            open_comments,
+            auth_results_issues,
+        ),
+        (
+            "parse_authentication_results trusted",
+            Cap::CommentDepth,
+            MAX_COMMENT_DEPTH,
+            open_comments,
+            trusted_auth_results_issues,
+        ),
+        (
+            "parse_arc_sets authentication results",
+            Cap::CommentDepth,
+            MAX_COMMENT_DEPTH,
+            arc_open_comments,
+            arc_results_issues,
         ),
         (
             "parse_authentication_results",
@@ -375,12 +396,22 @@ mod properties {
             .to_vec()
     }
 
+    fn arc_results_issues(input: &[u8]) -> Vec<Issue> {
+        parse_arc_sets(&[ArcHeader::AuthenticationResults(input)], None)
+            .issues()
+            .to_vec()
+    }
+
     fn filler(len: usize) -> Vec<u8> {
         vec![b'a'; len]
     }
 
     fn open_comments(depth: usize) -> Vec<u8> {
         vec![b'('; depth]
+    }
+
+    fn arc_open_comments(depth: usize) -> Vec<u8> {
+        [&b"i=1; "[..], &open_comments(depth)].concat()
     }
 
     fn auth_entries(count: usize) -> Vec<u8> {
