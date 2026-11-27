@@ -14,7 +14,7 @@ use std::str::from_utf8;
 use crate::caps::{Cap, MAX_RECEIVED_HOPS};
 use crate::date::{Instant, parse_date};
 use crate::issue::{Issue, IssueKind, Parsed};
-use crate::tokenize::{Token, TokenKind, tokenize};
+use crate::tokenize::{Token, TokenKind, bound, tokenize};
 use crate::trust::TrustSet;
 
 /// Clause keywords, matched ASCII case-insensitively. `via` names a clause nothing reads.
@@ -515,8 +515,10 @@ fn read_date(value: &[u8], semicolon: Option<usize>) -> (Option<Instant>, Vec<Is
     (date, shifted)
 }
 
-/// Reads one header into a hop and the issues found in it.
-fn parse_hop(index: usize, value: &[u8]) -> (Hop<'_>, Vec<Issue>) {
+/// Reads one header into a hop and the issues found in it. Only the first
+/// [`crate::MAX_HEADER_BYTES`] bytes are read, with one issue for the cut.
+fn parse_hop(index: usize, header: &[u8]) -> (Hop<'_>, Vec<Issue>) {
+    let (value, cut) = bound(header);
     let (tokens, mut issues) = tokenize(value).into_parts();
     let (head, semicolon) = split_at_semicolon(&tokens);
     if let Some(offset) = semicolon {
@@ -530,6 +532,7 @@ fn parse_hop(index: usize, value: &[u8]) -> (Hop<'_>, Vec<Issue>) {
     let ip = from_ip(&clauses.from, &mut issues);
     let (date, date_issues) = read_date(value, semicolon);
     issues.extend(date_issues);
+    issues.extend(cut);
     let hop = Hop {
         by_host: first_word(&clauses.by),
         date,
@@ -636,8 +639,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::{Hop, ReceivedHops, parse_received_hops};
-    use crate::caps::{Cap, MAX_RECEIVED_HOPS};
-    use crate::issue::{IssueKind, Parsed};
+    use crate::caps::{Cap, MAX_HEADER_BYTES, MAX_RECEIVED_HOPS};
+    use crate::issue::{Issue, IssueKind, Parsed};
     use crate::trust::TrustSet;
 
     const POSTFIX: &str = concat!(
@@ -1022,5 +1025,35 @@ mod tests {
             })
             .count();
         assert_eq!(caps, 1, "one CapExceeded issue");
+    }
+
+    fn header_cap_offsets(value: &[u8]) -> Vec<usize> {
+        let parsed = parse_received_hops(&[value], None);
+        parsed
+            .issues()
+            .iter()
+            .filter(|issue| {
+                issue.kind()
+                    == IssueKind::CapExceeded {
+                        cap: Cap::HeaderBytes,
+                    }
+            })
+            .map(Issue::offset)
+            .collect()
+    }
+
+    #[test]
+    fn a_header_cut_before_the_semicolon_reports_the_cap_once() {
+        let mut value = b"by mx.example.com ".to_vec();
+        value.resize(MAX_HEADER_BYTES + 1, b'x');
+        value.extend_from_slice(b"; 3 Nov 2026 10:00:00 +0000");
+        assert_eq!(header_cap_offsets(&value), vec![MAX_HEADER_BYTES]);
+    }
+
+    #[test]
+    fn a_header_cut_after_the_semicolon_reports_the_cap_once() {
+        let mut value = b"by mx.example.com; 3 Nov 2026 10:00:00 +0000 ".to_vec();
+        value.resize(MAX_HEADER_BYTES + 1, b' ');
+        assert_eq!(header_cap_offsets(&value), vec![MAX_HEADER_BYTES]);
     }
 }
