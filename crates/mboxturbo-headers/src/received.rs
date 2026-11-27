@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn a_helo_tagged_literal_in_the_comment_is_not_the_recorded_address() {
+    fn a_helo_claim_in_the_comment_cannot_spoof_the_recorded_address_or_the_trust_boundary() {
         let exim = concat!(
             "from [198.51.100.7] (helo=[192.0.2.9]) by mx.example.com; ",
             "3 Nov 2026 10:00:01 +0000"

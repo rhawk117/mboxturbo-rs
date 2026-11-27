@@ -4,11 +4,12 @@ import os
 import signal
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from mboxturbo import Cancelled, CancelToken, Mailbox, MboxTurboError, Selection
+from mboxturbo import ByteSink, Cancelled, CancelToken, Mailbox, MboxTurboError, Selection
 from mboxturbo.tests.drafts import MailboxWriter, MessageDraft
 
 pytestmark = pytest.mark.integration
@@ -143,3 +144,32 @@ class TestProgress:
             )
         assert target.read_bytes() == before
         assert sorted(path.name for path in target.parent.iterdir()) == [target.name]
+
+
+class TestZeroBatchExport:
+    @pytest.fixture
+    def target(self, tmp_path: Path) -> Path:
+        return tmp_path / 'out.txt'
+
+    def test_a_zero_batch_export_keeps_the_bytes_written_in_begin(
+        self, mailbox_writer: MailboxWriter, target: Path
+    ) -> None:
+        drafts = [MessageDraft(sender='a@example.com', subject='s', body=['b'])]
+        empty = Mailbox(mailbox_writer.write(drafts)).select(
+            ['position'], until=datetime(1971, 1, 1, tzinfo=UTC)
+        )
+        recorder = Recorder()
+
+        class HeaderOnly:
+            def begin(self, _schema: object, out: ByteSink, /) -> None:
+                out.write(b'position\n')
+
+            def write_batch(self, _batch: object, _out: ByteSink, /) -> None:
+                pytest.fail('no batch exists to write')
+
+            def finish(self, out: ByteSink, /) -> None:
+                out.write(b'# end\n')
+
+        assert empty.export(HeaderOnly(), target, progress=recorder) == 0
+        assert recorder.calls == []
+        assert target.read_bytes() == b'position\n# end\n'

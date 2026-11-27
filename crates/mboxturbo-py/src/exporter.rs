@@ -213,7 +213,8 @@ impl Exporter for PythonExporter {
     }
 
     fn finish(&mut self, staged: &mut Staged) -> Result<u64, MboxTurboError> {
-        self.call(staged, "finish", None).map_err(|boxed| *boxed)
+        let written = self.call(staged, "finish", None).map_err(|boxed| *boxed)?;
+        Ok(written.saturating_add(take(&mut self.carried)))
     }
 
     fn write(&mut self, batch: &RecordBatch, staged: &mut Staged) -> Result<u64, MboxTurboError> {

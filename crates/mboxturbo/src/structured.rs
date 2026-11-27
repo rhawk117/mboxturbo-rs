@@ -21,7 +21,7 @@ pub(crate) use received::{
     received_hops_type, received_spf_parsed_type,
 };
 
-use crate::fields::Mail;
+use crate::fields::{Mail, strip_line_break};
 use crate::verdict::{decide_results, trusted_entry};
 use crate::width::widen;
 
@@ -801,13 +801,6 @@ fn results_fields() -> Fields {
         struct_list_field("entries", entry_fields()),
         field("trusted", DataType::Boolean),
     ])
-}
-
-/// `raw` without its one final line break.
-fn strip_line_break(raw: &[u8]) -> &[u8] {
-    raw.strip_suffix(b"\r\n")
-        .or_else(|| raw.strip_suffix(b"\n"))
-        .unwrap_or(raw)
 }
 
 /// The nullable list item field holding a struct of `fields`.

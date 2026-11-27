@@ -421,11 +421,19 @@ impl Column {
     }
 
     /// This column's catalogue row; every header column shares one row.
+    #[expect(
+        clippy::expect_used,
+        reason = "the test `every_non_header_variant_has_a_named_row` pins one NAMED row per \
+                  non-header variant, so a miss is a catalogue bug, not an input"
+    )]
     fn spec(&self) -> &'static ColumnSpec {
+        if matches!(self, Self::Header(_)) {
+            return &HEADER_SPEC;
+        }
         NAMED
             .iter()
             .find(|spec| spec.column == *self)
-            .unwrap_or(&HEADER_SPEC)
+            .expect("every non-header column has a row in NAMED")
     }
 }
 
@@ -466,7 +474,63 @@ const fn utf8() -> DataType {
 
 #[cfg(test)]
 mod tests {
-    use super::Column;
+    use super::{Column, NAMED};
+
+    /// Every non-header variant, so a new one without a `NAMED` row fails the test below.
+    static NON_HEADER: [Column; 33] = [
+        Column::ArcSets,
+        Column::AttachmentNames,
+        Column::AttachmentSha256,
+        Column::AttachmentSizes,
+        Column::AttachmentTypes,
+        Column::AuthResults,
+        Column::AuthenticationResults,
+        Column::Cc,
+        Column::Date,
+        Column::DateOffsetMinutes,
+        Column::DkimSignature,
+        Column::DkimSignatures,
+        Column::From,
+        Column::Html,
+        Column::MessageId,
+        Column::MicrosoftAntispam,
+        Column::Offset,
+        Column::Position,
+        Column::Raw,
+        Column::Received,
+        Column::ReceivedHops,
+        Column::ReceivedSpf,
+        Column::ReceivedSpfParsed,
+        Column::ReplyTo,
+        Column::ReturnPath,
+        Column::Size,
+        Column::Subject,
+        Column::Text,
+        Column::To,
+        Column::VerdictCompauth,
+        Column::VerdictDkim,
+        Column::VerdictDmarc,
+        Column::VerdictSpf,
+    ];
+
+    #[test]
+    fn every_non_header_variant_has_its_own_named_row() {
+        assert_eq!(
+            NAMED.len(),
+            NON_HEADER.len(),
+            "NAMED has one row for each non-header variant"
+        );
+        for column in &NON_HEADER {
+            assert!(
+                NAMED.iter().any(|spec| spec.column == *column),
+                "{column:?} has a NAMED row, so spec() never falls back to the header row"
+            );
+            assert!(
+                !matches!(column.spec().column, Column::Header(_)),
+                "{column:?} resolves to its own row, not the header row"
+            );
+        }
+    }
 
     #[test]
     fn every_name_round_trips() {

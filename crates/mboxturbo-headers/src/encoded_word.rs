@@ -226,7 +226,7 @@ fn find_words(value: &[u8]) -> Found<'_> {
         pos = prev_end;
         words.push(word);
     }
-    let tail = slice_checked(value, prev_end, value.len(), &mut issues);
+    let tail = slice_checked(value, 0, prev_end..value.len(), &mut issues);
     Found {
         cap_offset,
         issues,

@@ -92,7 +92,7 @@ where
 }
 
 /// `raw` without its one final line break, which mail-parser keeps on a header's raw value.
-fn strip_line_break(raw: &[u8]) -> &[u8] {
+pub(crate) fn strip_line_break(raw: &[u8]) -> &[u8] {
     raw.strip_suffix(b"\r\n")
         .or_else(|| raw.strip_suffix(b"\n"))
         .unwrap_or(raw)

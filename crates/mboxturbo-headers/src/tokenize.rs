@@ -5,6 +5,7 @@
 //! nesting, so hostile input cannot exhaust the stack.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use crate::caps::{Cap, MAX_COMMENT_DEPTH, MAX_HEADER_BYTES};
 use crate::issue::{Issue, IssueKind, Parsed};
@@ -269,7 +270,7 @@ impl<'src> Scanner<'src> {
 
     /// The bytes in `start..end`, through [`slice_checked`].
     fn slice(&mut self, start: usize, end: usize) -> &'src [u8] {
-        slice_checked(self.bytes, start, end, &mut self.issues)
+        slice_checked(self.bytes, 0, start..end, &mut self.issues)
     }
 
     /// Emits a one-byte special token and moves past it.
@@ -332,19 +333,24 @@ pub(crate) fn bound(value: &[u8]) -> (&[u8], Vec<Issue>) {
 
 /// The bytes of `bytes` in `start..end`. Every caller derives both bounds from the input, so a
 /// range outside it means a broken cursor: it is reported as a [`IssueKind::MalformedEntry`] at
-/// `start` and read as empty, so the parse goes on and the fault shows in the issues.
+/// `base + start`, where `base` is the offset of `bytes` in the whole value, and read as empty, so
+/// the parse goes on and the fault shows in the issues.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "shared with sibling parsers; `pub` would trip unreachable_pub"
 )]
 pub(crate) fn slice_checked<'bytes>(
     bytes: &'bytes [u8],
-    start: usize,
-    end: usize,
+    base: usize,
+    range: Range<usize>,
     issues: &mut Vec<Issue>,
 ) -> &'bytes [u8] {
-    let Some(slice) = bytes.get(start..end) else {
-        issues.push(Issue::new(IssueKind::MalformedEntry, start));
+    let start = range.start;
+    let Some(slice) = bytes.get(range) else {
+        issues.push(Issue::new(
+            IssueKind::MalformedEntry,
+            base.saturating_add(start),
+        ));
         return &[];
     };
     slice
@@ -394,7 +400,7 @@ mod tests {
     use std::borrow::Cow;
     use std::iter::repeat_n;
 
-    use super::{Token, TokenKind, tokenize};
+    use super::{Token, TokenKind, slice_checked, tokenize};
     use crate::caps::{Cap, MAX_COMMENT_DEPTH, MAX_HEADER_BYTES};
     use crate::issue::{Issue, IssueKind};
 
@@ -420,6 +426,25 @@ mod tests {
         value.extend(repeat_n(b')', depth));
         value.extend_from_slice(b" b");
         value
+    }
+
+    #[test]
+    fn slice_checked_reports_an_impossible_range_at_the_absolute_offset() {
+        let mut issues = Vec::new();
+        let slice = slice_checked(b"+01", 10, 5..9, &mut issues);
+        assert!(slice.is_empty(), "an impossible range reads as empty");
+        assert_eq!(
+            issues,
+            vec![Issue::new(IssueKind::MalformedEntry, 15)],
+            "the issue is at base plus start, not at start alone"
+        );
+        let mut clean = Vec::new();
+        assert_eq!(
+            slice_checked(b"+01", 10, 1..3, &mut clean),
+            b"01",
+            "a valid range returns its bytes"
+        );
+        assert!(clean.is_empty(), "a valid range raises no issue");
     }
 
     #[test]

@@ -172,7 +172,7 @@ impl<'tok> Cursor<'tok> {
         self.bump();
         let offset = token.offset();
         let text = token.text().as_bytes();
-        let digits = slice_checked(text, 1, text.len(), &mut self.issues);
+        let digits = slice_checked(text, offset, 1..text.len(), &mut self.issues);
         let digits_offset = offset.saturating_add(1);
         let pieces = match digits.len() {
             4 => number_of(digits.get(..2)?, digits_offset).zip(Some(number_of(
@@ -450,8 +450,8 @@ impl<'src> Raw<'src> {
         self.skip_space();
         let rest = slice_checked(
             self.value,
-            self.position,
-            self.value.len(),
+            0,
+            self.position..self.value.len(),
             &mut self.issues,
         );
         let year = rest
