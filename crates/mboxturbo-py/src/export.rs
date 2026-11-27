@@ -409,6 +409,22 @@ fn report_progress(
     });
 }
 
+/// The catalogue column names in order: the defaults when `opt_in` is false, the opt-in columns
+/// when it is true, and every named column when it is `None`.
+#[pyfunction]
+#[pyo3(signature = (opt_in=None))]
+pub(crate) fn column_names(opt_in: Option<bool>) -> Vec<String> {
+    let columns = match opt_in {
+        Some(false) => Column::defaults(),
+        _ => Column::names().filter_map(Column::from_name).collect(),
+    };
+    columns
+        .iter()
+        .filter(|column| opt_in != Some(true) || column.is_opt_in())
+        .map(|column| column.name().into_owned())
+        .collect()
+}
+
 /// A selection over the rows `filters` keep in `mailbox`, with the interpreter released while
 /// they are found; `ValueError` for a zero `batch_size` or an unknown column, with every column
 /// in `Column::defaults` when `requested` is `None`.

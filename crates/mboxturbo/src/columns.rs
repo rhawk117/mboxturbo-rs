@@ -3,48 +3,150 @@
 use std::borrow::Cow;
 
 use arrow_schema::{DataType, Field, TimeUnit};
+use mail_parser::{HeaderForm, HeaderName};
 
 use crate::structured;
+
+/// Needs the full MIME parse.
+const BODY: u8 = 2;
 
 /// Prefix that selects an arbitrary header column; the rest of the name is the header name.
 const HEADER_PREFIX: &str = "header:";
 
-/// Public name and variant of every named column; the order is what [`Column::names`] yields.
-const NAMED: [(&str, Column); 33] = [
-    ("position", Column::Position),
-    ("offset", Column::Offset),
-    ("size", Column::Size),
-    ("raw", Column::Raw),
-    ("from", Column::From),
-    ("to", Column::To),
-    ("cc", Column::Cc),
-    ("reply_to", Column::ReplyTo),
-    ("subject", Column::Subject),
-    ("date", Column::Date),
-    ("date_offset_minutes", Column::DateOffsetMinutes),
-    ("message_id", Column::MessageId),
-    ("received", Column::Received),
-    ("authentication_results", Column::AuthenticationResults),
-    ("received_spf", Column::ReceivedSpf),
-    ("dkim_signature", Column::DkimSignature),
-    ("return_path", Column::ReturnPath),
-    ("text", Column::Text),
-    ("html", Column::Html),
-    ("attachment_names", Column::AttachmentNames),
-    ("attachment_types", Column::AttachmentTypes),
-    ("attachment_sizes", Column::AttachmentSizes),
-    ("attachment_sha256", Column::AttachmentSha256),
-    ("auth_results", Column::AuthResults),
-    ("arc_sets", Column::ArcSets),
-    ("dkim_signatures", Column::DkimSignatures),
-    ("received_hops", Column::ReceivedHops),
-    ("received_spf_parsed", Column::ReceivedSpfParsed),
-    ("microsoft_antispam", Column::MicrosoftAntispam),
-    ("verdict_dmarc", Column::VerdictDmarc),
-    ("verdict_spf", Column::VerdictSpf),
-    ("verdict_dkim", Column::VerdictDkim),
-    ("verdict_compauth", Column::VerdictCompauth),
+/// Left out of [`Column::defaults`].
+const OPT_IN: u8 = 1;
+
+/// Comes from the index or the raw bytes alone.
+const UNPARSED: u8 = 4;
+
+/// The row shared by every `header:<Name>` column, which the catalogue does not list.
+static HEADER_SPEC: ColumnSpec = ColumnSpec::new("", Column::Header(String::new()), text_list, 0);
+
+/// The catalogue row of every named column; the order is what [`Column::names`] yields.
+static NAMED: [ColumnSpec; 33] = [
+    ColumnSpec::new("position", Column::Position, uint64, UNPARSED),
+    ColumnSpec::new("offset", Column::Offset, uint64, UNPARSED),
+    ColumnSpec::new("size", Column::Size, uint64, UNPARSED),
+    ColumnSpec::new("raw", Column::Raw, binary, OPT_IN | UNPARSED),
+    ColumnSpec::decoded(
+        "from",
+        Column::From,
+        text_list,
+        (HeaderName::From, HeaderForm::Addresses),
+    ),
+    ColumnSpec::decoded(
+        "to",
+        Column::To,
+        text_list,
+        (HeaderName::To, HeaderForm::Addresses),
+    ),
+    ColumnSpec::decoded(
+        "cc",
+        Column::Cc,
+        text_list,
+        (HeaderName::Cc, HeaderForm::Addresses),
+    ),
+    ColumnSpec::decoded(
+        "reply_to",
+        Column::ReplyTo,
+        text_list,
+        (HeaderName::ReplyTo, HeaderForm::Addresses),
+    ),
+    ColumnSpec::decoded(
+        "subject",
+        Column::Subject,
+        utf8,
+        (HeaderName::Subject, HeaderForm::Text),
+    ),
+    ColumnSpec::new("date", Column::Date, utc_micros, UNPARSED),
+    ColumnSpec::new(
+        "date_offset_minutes",
+        Column::DateOffsetMinutes,
+        int32,
+        UNPARSED,
+    ),
+    ColumnSpec::decoded(
+        "message_id",
+        Column::MessageId,
+        utf8,
+        (HeaderName::MessageId, HeaderForm::MessageIds),
+    ),
+    ColumnSpec::new("received", Column::Received, text_list, 0),
+    ColumnSpec::new(
+        "authentication_results",
+        Column::AuthenticationResults,
+        text_list,
+        0,
+    ),
+    ColumnSpec::new("received_spf", Column::ReceivedSpf, text_list, 0),
+    ColumnSpec::new("dkim_signature", Column::DkimSignature, text_list, 0),
+    ColumnSpec::new("return_path", Column::ReturnPath, utf8, 0),
+    ColumnSpec::new("text", Column::Text, utf8, BODY),
+    ColumnSpec::new("html", Column::Html, utf8, BODY),
+    ColumnSpec::new("attachment_names", Column::AttachmentNames, text_list, BODY),
+    ColumnSpec::new("attachment_types", Column::AttachmentTypes, text_list, BODY),
+    ColumnSpec::new("attachment_sizes", Column::AttachmentSizes, size_list, BODY),
+    ColumnSpec::new(
+        "attachment_sha256",
+        Column::AttachmentSha256,
+        text_list,
+        BODY,
+    ),
+    ColumnSpec::new(
+        "auth_results",
+        Column::AuthResults,
+        structured::auth_results_type,
+        OPT_IN,
+    ),
+    ColumnSpec::new(
+        "arc_sets",
+        Column::ArcSets,
+        structured::arc_sets_type,
+        OPT_IN,
+    ),
+    ColumnSpec::new(
+        "dkim_signatures",
+        Column::DkimSignatures,
+        structured::dkim_signatures_type,
+        OPT_IN,
+    ),
+    ColumnSpec::new(
+        "received_hops",
+        Column::ReceivedHops,
+        structured::received_hops_type,
+        OPT_IN,
+    ),
+    ColumnSpec::new(
+        "received_spf_parsed",
+        Column::ReceivedSpfParsed,
+        structured::received_spf_parsed_type,
+        OPT_IN,
+    ),
+    ColumnSpec::new(
+        "microsoft_antispam",
+        Column::MicrosoftAntispam,
+        structured::microsoft_antispam_type,
+        OPT_IN,
+    ),
+    ColumnSpec::new("verdict_dmarc", Column::VerdictDmarc, utf8, OPT_IN),
+    ColumnSpec::new("verdict_spf", Column::VerdictSpf, utf8, OPT_IN),
+    ColumnSpec::new("verdict_dkim", Column::VerdictDkim, utf8, OPT_IN),
+    ColumnSpec::new("verdict_compauth", Column::VerdictCompauth, utf8, OPT_IN),
 ];
+
+/// One catalogue row: everything the pipeline knows about a column besides how it builds its slot.
+struct ColumnSpec {
+    /// The variant this row describes.
+    column: Column,
+    /// Builds the Arrow type of the column's values.
+    data_type: fn() -> DataType,
+    /// The `OPT_IN`, `BODY` and `UNPARSED` traits of the column.
+    flags: u8,
+    /// The header the column reads and how to decode it, when it reads one decoded.
+    header_form: Option<(HeaderName<'static>, HeaderForm)>,
+    /// The public name, as accepted by [`Column::from_name`].
+    name: &'static str,
+}
 
 /// One per-message column the pipeline can extract.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -194,48 +296,59 @@ pub enum Column {
     VerdictSpf,
 }
 
+impl ColumnSpec {
+    /// A column that reads `header` decoded as its form.
+    const fn decoded(
+        name: &'static str,
+        column: Column,
+        data_type: fn() -> DataType,
+        header: (HeaderName<'static>, HeaderForm),
+    ) -> Self {
+        Self {
+            column,
+            data_type,
+            flags: 0,
+            header_form: Some(header),
+            name,
+        }
+    }
+
+    /// Whether the column needs the full MIME parse.
+    const fn needs_body(&self) -> bool {
+        self.flags & BODY != 0
+    }
+
+    /// A column with the traits in `flags` and no decoded header.
+    const fn new(
+        name: &'static str,
+        column: Column,
+        data_type: fn() -> DataType,
+        flags: u8,
+    ) -> Self {
+        Self {
+            column,
+            data_type,
+            flags,
+            header_form: None,
+            name,
+        }
+    }
+
+    /// Whether the column is left out of the defaults.
+    const fn opt_in(&self) -> bool {
+        self.flags & OPT_IN != 0
+    }
+
+    /// Whether the column needs the message parsed at all.
+    const fn parsed(&self) -> bool {
+        self.flags & UNPARSED == 0
+    }
+}
+
 impl Column {
     /// The Arrow type of the values this column extracts; list-typed for multi-valued headers.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
-    )]
     fn data_type(&self) -> DataType {
-        let text_list = DataType::new_list(DataType::Utf8, true);
-        match self {
-            Self::Position | Self::Offset | Self::Size => DataType::UInt64,
-            Self::Subject
-            | Self::MessageId
-            | Self::ReturnPath
-            | Self::Text
-            | Self::Html
-            | Self::VerdictDmarc
-            | Self::VerdictSpf
-            | Self::VerdictDkim
-            | Self::VerdictCompauth => DataType::Utf8,
-            Self::Date => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            Self::DateOffsetMinutes => DataType::Int32,
-            Self::Raw => DataType::LargeBinary,
-            Self::AttachmentSizes => DataType::new_list(DataType::UInt64, true),
-            Self::AuthResults => structured::auth_results_type(),
-            Self::ArcSets => structured::arc_sets_type(),
-            Self::DkimSignatures => structured::dkim_signatures_type(),
-            Self::ReceivedHops => structured::received_hops_type(),
-            Self::ReceivedSpfParsed => structured::received_spf_parsed_type(),
-            Self::MicrosoftAntispam => structured::microsoft_antispam_type(),
-            Self::From
-            | Self::To
-            | Self::Cc
-            | Self::ReplyTo
-            | Self::Received
-            | Self::AuthenticationResults
-            | Self::ReceivedSpf
-            | Self::DkimSignature
-            | Self::AttachmentNames
-            | Self::AttachmentTypes
-            | Self::AttachmentSha256
-            | Self::Header(_) => text_list,
-        }
+        (self.spec().data_type)()
     }
 
     /// The columns selected when none are named: everything that needs only the header block,
@@ -246,8 +359,8 @@ impl Column {
     pub fn defaults() -> Vec<Self> {
         NAMED
             .iter()
-            .map(|(_, column)| column.clone())
-            .filter(|column| !column.needs_body() && !column.is_opt_in())
+            .filter(|spec| !spec.needs_body() && !spec.opt_in())
+            .map(|spec| spec.column.clone())
             .collect()
     }
 
@@ -264,27 +377,21 @@ impl Column {
         }
         NAMED
             .iter()
-            .find(|(known, _)| *known == name)
-            .map(|(_, column)| column.clone())
+            .find(|spec| spec.name == name)
+            .map(|spec| spec.column.clone())
+    }
+
+    /// The header this column reads and how to decode it, or `None` when it needs no header
+    /// decoded: it reads the raw bytes, offsets, the body, or a header kept as raw text.
+    pub(crate) fn header_form(&self) -> Option<(HeaderName<'static>, HeaderForm)> {
+        self.spec().header_form.clone()
     }
 
     /// Whether this column is left out of [`Column::defaults`]: raw bytes and the structured
     /// header columns.
-    const fn is_opt_in(&self) -> bool {
-        matches!(
-            self,
-            Self::Raw
-                | Self::AuthResults
-                | Self::ArcSets
-                | Self::DkimSignatures
-                | Self::ReceivedHops
-                | Self::ReceivedSpfParsed
-                | Self::MicrosoftAntispam
-                | Self::VerdictDmarc
-                | Self::VerdictSpf
-                | Self::VerdictDkim
-                | Self::VerdictCompauth
-        )
+    #[must_use]
+    pub fn is_opt_in(&self) -> bool {
+        self.spec().opt_in()
     }
 
     /// This column's name, as accepted by [`Column::from_name`].
@@ -293,44 +400,68 @@ impl Column {
         if let Self::Header(header) = self {
             return Cow::Owned(format!("{HEADER_PREFIX}{header}"));
         }
-        NAMED
-            .iter()
-            .find(|(_, column)| column == self)
-            .map_or(Cow::Borrowed(""), |(name, _)| Cow::Borrowed(*name))
+        Cow::Borrowed(self.spec().name)
     }
 
     /// Every named column, in catalogue order.
     pub fn names() -> impl Iterator<Item = &'static str> {
-        NAMED.iter().map(|(name, _)| *name)
+        NAMED.iter().map(|spec| spec.name)
     }
 
     /// Whether extracting this column needs the full MIME parse rather than the header block.
     #[must_use]
-    pub const fn needs_body(&self) -> bool {
-        matches!(
-            self,
-            Self::Text
-                | Self::Html
-                | Self::AttachmentNames
-                | Self::AttachmentTypes
-                | Self::AttachmentSizes
-                | Self::AttachmentSha256
-        )
+    pub fn needs_body(&self) -> bool {
+        self.spec().needs_body()
     }
 
     /// Whether extracting this column requires parsing the message at all; position, offset,
     /// size, raw bytes and the date columns come from the index or the raw bytes alone.
-    pub(crate) const fn needs_parsing(&self) -> bool {
-        !matches!(
-            self,
-            Self::Position
-                | Self::Offset
-                | Self::Size
-                | Self::Raw
-                | Self::Date
-                | Self::DateOffsetMinutes
-        )
+    pub(crate) fn needs_parsing(&self) -> bool {
+        self.spec().parsed()
     }
+
+    /// This column's catalogue row; every header column shares one row.
+    fn spec(&self) -> &'static ColumnSpec {
+        NAMED
+            .iter()
+            .find(|spec| spec.column == *self)
+            .unwrap_or(&HEADER_SPEC)
+    }
+}
+
+/// Raw bytes.
+const fn binary() -> DataType {
+    DataType::LargeBinary
+}
+
+/// A signed 32-bit integer.
+const fn int32() -> DataType {
+    DataType::Int32
+}
+
+/// A list of byte counts.
+fn size_list() -> DataType {
+    DataType::new_list(DataType::UInt64, true)
+}
+
+/// A list of text values.
+fn text_list() -> DataType {
+    DataType::new_list(DataType::Utf8, true)
+}
+
+/// An unsigned 64-bit integer.
+const fn uint64() -> DataType {
+    DataType::UInt64
+}
+
+/// A UTC timestamp, microsecond precision so Parquet keeps the type.
+fn utc_micros() -> DataType {
+    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+}
+
+/// A text value.
+const fn utf8() -> DataType {
+    DataType::Utf8
 }
 
 #[cfg(test)]

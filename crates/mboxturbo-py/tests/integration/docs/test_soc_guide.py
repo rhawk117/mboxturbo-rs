@@ -13,11 +13,7 @@ pytestmark = pytest.mark.integration
 
 REPOSITORY = Path(__file__).resolve().parents[5]
 GUIDE = REPOSITORY / 'docs' / 'soc-guide.md'
-CATALOGUE = REPOSITORY / 'crates' / 'mboxturbo' / 'src' / 'columns.rs'
 PYTHON_BLOCK = re.compile(r'^```python\n(.*?)^```$', re.MULTILINE | re.DOTALL)
-NAMED_ENTRY = re.compile(r'\("(\w+)", Column::(\w+)\)')
-OPT_IN_FUNCTION = re.compile(r'const fn is_opt_in.*?\n    }\n', re.DOTALL)
-VARIANT = re.compile(r'Self::(\w+)')
 GUIDE_COLUMNS = (
     'auth_results',
     'arc_sets',
@@ -33,13 +29,7 @@ GUIDE_COLUMNS = (
 
 
 def opt_in_names() -> set[str]:
-    source = CATALOGUE.read_text()
-    function = OPT_IN_FUNCTION.search(source)
-    assert function, 'columns.rs no longer has is_opt_in'
-    variants = set(VARIANT.findall(function.group()))
-    names = {name for name, variant in NAMED_ENTRY.findall(source) if variant in variants}
-    assert len(names) == len(variants)
-    return names
+    return set(mboxturbo.column_names(opt_in=True))
 
 
 class TestGuide:

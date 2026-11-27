@@ -18,6 +18,7 @@ from mboxturbo._core import (
     StaleIndexError,
     Trust,
     VerdictBuilder,
+    column_names,
     header,
     verdict,
 )
@@ -63,32 +64,8 @@ class Exporter[Out: (ByteSink, Path)](Protocol):
 
 
 SOC_COLUMNS: tuple[str, ...] = (
-    'position',
-    'offset',
-    'size',
-    'from',
-    'to',
-    'cc',
-    'reply_to',
-    'subject',
-    'date',
-    'date_offset_minutes',
-    'message_id',
-    'received',
-    'authentication_results',
-    'received_spf',
-    'dkim_signature',
-    'return_path',
-    'auth_results',
-    'arc_sets',
-    'dkim_signatures',
-    'received_hops',
-    'received_spf_parsed',
-    'microsoft_antispam',
-    'verdict_dmarc',
-    'verdict_spf',
-    'verdict_dkim',
-    'verdict_compauth',
+    *column_names(opt_in=False),
+    *(name for name in column_names(opt_in=True) if name != 'raw'),
 )
 """The default columns plus every structured and verdict column."""
 

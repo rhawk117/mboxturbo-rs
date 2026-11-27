@@ -612,47 +612,8 @@ fn depth_for(columns: &[Column]) -> Depth {
 
 /// The header `column` reads and how to decode it, or `None` when the column needs no header
 /// decoded: it reads the raw bytes, offsets, the body, or a header kept as raw text.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
-)]
-const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm)> {
-    match column {
-        Column::From => Some((HeaderName::From, HeaderForm::Addresses)),
-        Column::To => Some((HeaderName::To, HeaderForm::Addresses)),
-        Column::Cc => Some((HeaderName::Cc, HeaderForm::Addresses)),
-        Column::ReplyTo => Some((HeaderName::ReplyTo, HeaderForm::Addresses)),
-        Column::Subject => Some((HeaderName::Subject, HeaderForm::Text)),
-        Column::MessageId => Some((HeaderName::MessageId, HeaderForm::MessageIds)),
-        Column::Position
-        | Column::Offset
-        | Column::Size
-        | Column::Raw
-        | Column::Date
-        | Column::DateOffsetMinutes
-        | Column::Received
-        | Column::AuthenticationResults
-        | Column::ReceivedSpf
-        | Column::DkimSignature
-        | Column::ReturnPath
-        | Column::Text
-        | Column::Html
-        | Column::AttachmentNames
-        | Column::AttachmentTypes
-        | Column::AttachmentSizes
-        | Column::AttachmentSha256
-        | Column::AuthResults
-        | Column::ArcSets
-        | Column::DkimSignatures
-        | Column::ReceivedHops
-        | Column::ReceivedSpfParsed
-        | Column::MicrosoftAntispam
-        | Column::VerdictDmarc
-        | Column::VerdictSpf
-        | Column::VerdictDkim
-        | Column::VerdictCompauth
-        | Column::Header(_) => None,
-    }
+fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm)> {
+    column.header_form()
 }
 
 /// Empty UTC timestamp builder with room for `rows` entries.

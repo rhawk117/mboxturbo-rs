@@ -20,7 +20,7 @@ mod _core {
     #[pymodule_export]
     use super::errors::{Cancelled, CorruptIndexError, MboxTurboError, StaleIndexError};
     #[pymodule_export]
-    use super::export::{CancelToken, Selection};
+    use super::export::{CancelToken, Selection, column_names};
     #[pymodule_export]
     use super::mailbox::Mailbox;
     #[pymodule_export]
