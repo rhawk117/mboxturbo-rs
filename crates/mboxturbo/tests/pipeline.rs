@@ -90,6 +90,41 @@ Subject: none of these headers\n\
 \n\
 body\n";
 
+    /// Three messages: a forged `Authentication-Results` above a real one, an Exchange-style
+    /// id-less header above the first external hop, and the same header below it.
+    const VERDICTS: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Authentication-Results: evil.example; dmarc=pass header.from=example.org\n\
+Authentication-Results: mx.example.org; dmarc=fail header.from=example.org;\n\
+\tspf=pass smtp.mailfrom=example.org; dkim=softfail header.d=example.org\n\
+Subject: forged above real\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Received: from sender.example.net (sender.example.net [203.0.113.5])\n\
+\tby mx.example.org with ESMTPS id 1; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Subject: id-less above the first external hop\n\
+\n\
+body\n\
+\n\
+From c@example.com Wed Jan  3 00:00:00 2024\n\
+Received: from sender.example.net (sender.example.net [203.0.113.5])\n\
+\tby mx.example.org with ESMTPS id 2; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Subject: id-less below the first external hop\n\
+\n\
+body\n";
+
+    const VERDICT_COLUMNS: [Column; 4] = [
+        Column::VerdictDmarc,
+        Column::VerdictSpf,
+        Column::VerdictDkim,
+        Column::VerdictCompauth,
+    ];
+
     /// Header blocks of messages with varied real-world `Received` forms, newest hop first.
     const RECEIVED_CORPUS: [&str; 13] = [
         "Received: from mail.example.org (mail.example.org [203.0.113.7])\n\
@@ -796,6 +831,121 @@ body\n";
             trusted_flags(&elements(&batch, 0, 0)),
             vec![None, None],
             "nothing can be said without a trust set"
+        );
+    }
+
+    fn trust_mx_relay() -> TrustSet {
+        TrustSet::new()
+            .add_authserv_id("mx.example.org")
+            .add_host("mx.example.org")
+            .clone()
+    }
+
+    fn trust_mx_relay_idless() -> TrustSet {
+        trust_mx_relay().trust_idless_inside(true).clone()
+    }
+
+    /// The `auth_results` and four verdict columns of the three `VERDICTS` messages.
+    fn verdicts_batch(trust: Option<TrustSet>) -> RecordBatch {
+        let fixture = Fixture::with(VERDICTS);
+        let mut columns = vec![Column::AuthResults];
+        columns.extend(VERDICT_COLUMNS);
+        let base = Pipeline::new(columns, 8);
+        let pipeline = Arc::new(match trust {
+            Some(set) => base.with_trust(set),
+            None => base,
+        });
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("three messages fit one batch of eight")
+            .expect("the verdict batch is assembled")
+    }
+
+    /// The dmarc, spf, dkim and compauth verdicts of message `row`.
+    fn verdicts_of(batch: &RecordBatch, row: usize) -> Vec<Option<String>> {
+        (1..=4)
+            .map(|column| {
+                let values = batch.column(column).as_string::<i32>();
+                values.is_valid(row).then(|| values.value(row).to_owned())
+            })
+            .collect()
+    }
+
+    fn some_words(words: [&str; 4]) -> Vec<Option<String>> {
+        words.iter().map(|word| Some((*word).to_owned())).collect()
+    }
+
+    #[test]
+    fn verdicts_ignore_a_forged_topmost_authentication_results() {
+        let batch = verdicts_batch(Some(trust_mx_relay()));
+        assert_eq!(
+            batch.column(1).as_string::<i32>().value(0),
+            "fail",
+            "the trusted dmarc=fail wins over the forged dmarc=pass above it"
+        );
+        assert_eq!(
+            verdicts_of(&batch, 0)[1..3],
+            [Some("pass".to_owned()), Some("softfail".to_owned())],
+            "spf and dkim come from the trusted header too"
+        );
+        assert_eq!(
+            verdicts_of(&batch, 0)[3],
+            None,
+            "a method no trusted header names is null"
+        );
+    }
+
+    #[test]
+    fn verdicts_are_null_without_a_trust_set() {
+        let batch = verdicts_batch(None);
+        for row in 0..3 {
+            assert_eq!(
+                verdicts_of(&batch, row),
+                vec![None; 4],
+                "message {row}: nothing can be said without a trust set"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idless_header_above_the_first_external_hop_gives_verdicts_only_with_the_switch_on() {
+        let on = verdicts_batch(Some(trust_mx_relay_idless()));
+        assert_eq!(
+            verdicts_of(&on, 1),
+            some_words(["pass", "pass", "pass", "pass"]),
+            "the Exchange-style header inside the trusted relays sets all four verdicts"
+        );
+        assert_eq!(
+            trusted_flags(&elements(&on, 0, 1)),
+            vec![Some(true)],
+            "auth_results agrees with the verdicts"
+        );
+        let off = verdicts_batch(Some(trust_mx_relay()));
+        assert_eq!(
+            verdicts_of(&off, 1),
+            vec![None; 4],
+            "the switch is off by default, so an id-less header sets nothing"
+        );
+        assert_eq!(
+            trusted_flags(&elements(&off, 0, 1)),
+            vec![Some(false)],
+            "an id-less header is untrusted with the switch off"
+        );
+    }
+
+    #[test]
+    fn an_idless_header_below_the_first_external_hop_stays_untrusted_with_the_switch_on() {
+        let batch = verdicts_batch(Some(trust_mx_relay_idless()));
+        assert_eq!(
+            trusted_flags(&elements(&batch, 0, 2)),
+            vec![Some(false)],
+            "a header the sender could have added is untrusted"
+        );
+        assert_eq!(
+            verdicts_of(&batch, 2),
+            vec![None; 4],
+            "so it sets no verdict"
         );
     }
 

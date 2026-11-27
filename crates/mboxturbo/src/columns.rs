@@ -10,7 +10,7 @@ use crate::structured;
 const HEADER_PREFIX: &str = "header:";
 
 /// Public name and variant of every named column; the order is what [`Column::names`] yields.
-const NAMED: [(&str, Column); 29] = [
+const NAMED: [(&str, Column); 33] = [
     ("position", Column::Position),
     ("offset", Column::Offset),
     ("size", Column::Size),
@@ -40,6 +40,10 @@ const NAMED: [(&str, Column); 29] = [
     ("received_hops", Column::ReceivedHops),
     ("received_spf_parsed", Column::ReceivedSpfParsed),
     ("microsoft_antispam", Column::MicrosoftAntispam),
+    ("verdict_dmarc", Column::VerdictDmarc),
+    ("verdict_spf", Column::VerdictSpf),
+    ("verdict_dkim", Column::VerdictDkim),
+    ("verdict_compauth", Column::VerdictCompauth),
 ];
 
 /// One per-message column the pipeline can extract.
@@ -170,17 +174,45 @@ pub enum Column {
     Text,
     /// Addresses in `To:`.
     To,
+    /// The `compauth` result word of the newest trusted `Authentication-Results`; opt-in, never a
+    /// default. See [`Column::VerdictDmarc`].
+    VerdictCompauth,
+    /// The `dkim` result word of the newest trusted `Authentication-Results`; opt-in, never a
+    /// default. See [`Column::VerdictDmarc`].
+    VerdictDkim,
+    /// The `dmarc` result word (`pass`, `fail`, `none`, ...) of the first `dmarc` entry in the
+    /// topmost trusted `Authentication-Results` that has one; opt-in, never a default.
+    ///
+    /// Utf8, null when no trust set was given to
+    /// [`Pipeline::with_trust`](crate::Pipeline::with_trust) or no trusted header has such an
+    /// entry, so a forged header outside the trust set never sets a verdict. Trust is decided as
+    /// for the `trusted` flag of [`Column::AuthResults`], including the positional rule of
+    /// [`TrustSet::trust_idless_inside`](crate::TrustSet::trust_idless_inside).
+    VerdictDmarc,
+    /// The `spf` result word of the newest trusted `Authentication-Results`; opt-in, never a
+    /// default. See [`Column::VerdictDmarc`].
+    VerdictSpf,
 }
 
 impl Column {
     /// The Arrow type of the values this column extracts; list-typed for multi-valued headers.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
+    )]
     fn data_type(&self) -> DataType {
         let text_list = DataType::new_list(DataType::Utf8, true);
         match self {
             Self::Position | Self::Offset | Self::Size => DataType::UInt64,
-            Self::Subject | Self::MessageId | Self::ReturnPath | Self::Text | Self::Html => {
-                DataType::Utf8
-            },
+            Self::Subject
+            | Self::MessageId
+            | Self::ReturnPath
+            | Self::Text
+            | Self::Html
+            | Self::VerdictDmarc
+            | Self::VerdictSpf
+            | Self::VerdictDkim
+            | Self::VerdictCompauth => DataType::Utf8,
             Self::Date => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             Self::DateOffsetMinutes => DataType::Int32,
             Self::Raw => DataType::LargeBinary,
@@ -248,6 +280,10 @@ impl Column {
                 | Self::ReceivedHops
                 | Self::ReceivedSpfParsed
                 | Self::MicrosoftAntispam
+                | Self::VerdictDmarc
+                | Self::VerdictSpf
+                | Self::VerdictDkim
+                | Self::VerdictCompauth
         )
     }
 
@@ -349,6 +385,10 @@ mod tests {
             "received_hops",
             "received_spf_parsed",
             "microsoft_antispam",
+            "verdict_dmarc",
+            "verdict_spf",
+            "verdict_dkim",
+            "verdict_compauth",
         ] {
             let column = Column::from_name(name).expect("a structured column name parses");
             assert!(!column.needs_body(), "{name} reads headers only");

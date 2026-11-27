@@ -16,7 +16,7 @@ use arrow_array::builder::{
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
-use mboxturbo_headers::TrustSet;
+use mboxturbo_headers::{AuthMethod, TrustSet};
 use sha2::{Digest as _, Sha256};
 
 use crate::columns::Column;
@@ -30,7 +30,7 @@ use crate::selection::{Plan, Selection};
 use crate::stream::Ordered;
 use crate::structured::{
     ArcSetsColumn, AuthResultsColumn, DkimSignaturesColumn, MicrosoftAntispamColumn,
-    ReceivedHopsColumn, ReceivedSpfColumn,
+    ReceivedHopsColumn, ReceivedSpfColumn, VerdictColumn,
 };
 use crate::width::widen;
 
@@ -260,7 +260,7 @@ impl Pipeline {
     }
 
     /// Sets the trust set that decides the `trusted` flag of the `auth_results` and `arc_sets`
-    /// columns. Without one every flag is null.
+    /// columns and the `verdict_*` columns. Without one every flag and verdict is null.
     #[must_use]
     pub fn with_trust(mut self, trust: TrustSet) -> Self {
         self.trust = Some(Arc::new(trust));
@@ -361,6 +361,8 @@ enum Slot {
     Subject(StringBuilder),
     /// Plain-text bodies joined by newlines, null when the message is unparsed.
     Text(StringBuilder),
+    /// The result word of one method from the newest trusted `Authentication-Results`.
+    Verdict(VerdictColumn),
 }
 
 /// Builder for one per-attachment list column; each message contributes one list, which is
@@ -480,6 +482,7 @@ impl Slot {
             Self::ReceivedHops(column) => column.append(mail, record.trust),
             Self::ReceivedSpfParsed(column) => column.append(mail),
             Self::MicrosoftAntispam(column) => column.append(mail),
+            Self::Verdict(column) => column.append(mail, record.trust),
         }
     }
 
@@ -511,6 +514,7 @@ impl Slot {
             Self::ReceivedHops(column) => column.finish()?,
             Self::ReceivedSpfParsed(column) => column.finish()?,
             Self::MicrosoftAntispam(column) => column.finish()?,
+            Self::Verdict(column) => column.finish(),
         };
         Ok(array)
     }
@@ -568,6 +572,10 @@ impl Slot {
             Column::MicrosoftAntispam => {
                 Self::MicrosoftAntispam(Box::new(MicrosoftAntispamColumn::new()))
             },
+            Column::VerdictDmarc => Self::Verdict(VerdictColumn::new(AuthMethod::Dmarc)),
+            Column::VerdictSpf => Self::Verdict(VerdictColumn::new(AuthMethod::Spf)),
+            Column::VerdictDkim => Self::Verdict(VerdictColumn::new(AuthMethod::Dkim)),
+            Column::VerdictCompauth => Self::Verdict(VerdictColumn::new(AuthMethod::CompAuth)),
         }
     }
 }
@@ -639,6 +647,10 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         | Column::ReceivedHops
         | Column::ReceivedSpfParsed
         | Column::MicrosoftAntispam
+        | Column::VerdictDmarc
+        | Column::VerdictSpf
+        | Column::VerdictDkim
+        | Column::VerdictCompauth
         | Column::Header(_) => None,
     }
 }

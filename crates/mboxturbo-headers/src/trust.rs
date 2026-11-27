@@ -43,6 +43,9 @@ pub struct TrustSet {
     authserv_ids: Vec<Box<str>>,
     /// Trusted domains, lowercased, without a trailing dot and never empty.
     hosts: Vec<Box<str>>,
+    /// Whether an `Authentication-Results` with no authserv-id counts as trusted when it sits
+    /// inside the trusted relays; off by default.
+    idless_inside: bool,
     /// Trusted IPv4 networks as `(masked network, mask)`.
     v4_ranges: Vec<(u32, u32)>,
     /// Trusted IPv6 networks as `(masked network, mask)`.
@@ -130,6 +133,24 @@ impl TrustSet {
         self.v6_ranges.push((u128::from(addr) & mask, mask));
     }
 
+    /// Opts in (or out) of trusting an `Authentication-Results` that has no authserv-id, as
+    /// Exchange Online writes it, by position instead of by id. Off by default.
+    ///
+    /// With the switch on, such a header is trusted only when it appears above (before, in
+    /// header order) the `Received` header of the first external hop: the newest hop whose
+    /// `by` host is trusted and whose `from` host and address are not. A header below that
+    /// hop, or in a message with no such hop, was added outside the trusted relays and stays
+    /// untrusted. [`TrustSet::add_authserv_id`] still ignores an empty id; the switch is the
+    /// only way an id-less header becomes trusted.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "a setter for one switch; a two-variant enum would only wrap the flag"
+    )]
+    pub const fn trust_idless_inside(&mut self, enabled: bool) -> &mut Self {
+        self.idless_inside = enabled;
+        self
+    }
+
     /// Whether `id` is a trusted authserv-id, matched exactly and ASCII case-insensitively.
     #[must_use]
     pub fn trusts_authserv_id(&self, id: &[u8]) -> bool {
@@ -146,6 +167,12 @@ impl TrustSet {
         self.hosts
             .iter()
             .any(|entry| is_same_or_subdomain(trimmed, entry.as_bytes()))
+    }
+
+    /// Whether the opt-in of [`TrustSet::trust_idless_inside`] is on.
+    #[must_use]
+    pub const fn trusts_idless_inside(&self) -> bool {
+        self.idless_inside
     }
 
     /// Whether `ip` lies inside a trusted range. An IPv4-mapped IPv6 address is also checked
@@ -352,6 +379,31 @@ mod tests {
             !blanks.trusts_authserv_id(b""),
             "an empty id entry is ignored"
         );
+    }
+
+    #[test]
+    fn the_idless_switch_is_off_by_default_and_leaves_authserv_ids_alone() {
+        let mut set = TrustSet::new();
+        assert!(!set.trusts_idless_inside(), "off by default");
+        assert!(
+            !TrustSet::default().trusts_idless_inside(),
+            "off in the default value too"
+        );
+        set.trust_idless_inside(true).add_authserv_id("");
+        assert!(set.trusts_idless_inside(), "switched on");
+        assert!(
+            !set.trusts_authserv_id(b""),
+            "the switch does not make an empty id a trusted entry"
+        );
+        set.trust_idless_inside(false);
+        assert!(!set.trusts_idless_inside(), "switched off again");
+    }
+
+    #[test]
+    fn the_idless_switch_survives_a_clone() {
+        let mut set = TrustSet::new();
+        set.trust_idless_inside(true);
+        assert!(set.clone().trusts_idless_inside(), "the clone keeps it");
     }
 
     #[test]
