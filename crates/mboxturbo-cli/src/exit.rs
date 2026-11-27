@@ -35,6 +35,7 @@ pub(crate) enum Stage {
 /// | Failure | Code |
 /// |---------|------|
 /// | other failure (Arrow, Parquet, unsupported destination, any future variant) | 1 |
+/// | `InvalidPredicate` (the CLI builds no predicate, so it never arises) | 1 |
 /// | `PositionOutOfRange` (usage) | 64 |
 /// | `CorruptIndex`, `StaleIndex` | 65 |
 /// | `Io` whose source is `NotFound` for the mailbox path itself (mailbox missing) | 66 |
@@ -50,6 +51,7 @@ pub(crate) enum Stage {
 pub(crate) fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
     match error {
         MboxTurboError::Arrow { .. }
+        | MboxTurboError::InvalidPredicate { .. }
         | MboxTurboError::Parquet { .. }
         | MboxTurboError::UnsupportedDestination { .. } => OTHER,
         MboxTurboError::Cancelled { .. } => INTERRUPTED,
