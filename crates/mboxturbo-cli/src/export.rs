@@ -49,7 +49,7 @@ pub(crate) enum Failure {
 
 impl Failure {
     /// A library failure after the mailbox is open.
-    const fn after_open(error: Box<MboxTurboError>) -> Self {
+    pub(crate) const fn after_open(error: Box<MboxTurboError>) -> Self {
         Self::Core {
             error,
             stage: Stage::AfterOpen,
@@ -418,7 +418,7 @@ fn write_chain(formatter: &mut fmt::Formatter<'_>, error: &MboxTurboError) -> fm
 }
 
 /// An event that could not be written to standard output, as an I/O failure.
-fn stdout_failure(source: io::Error) -> Failure {
+pub(crate) fn stdout_failure(source: io::Error) -> Failure {
     Failure::after_open(Box::new(MboxTurboError::Io {
         path: PathBuf::from("standard output"),
         source,
@@ -434,7 +434,7 @@ fn signal_failure(source: io::Error) -> Failure {
 }
 
 /// A line that could not be written to standard error, as an I/O failure.
-fn stderr_failure(source: io::Error) -> Failure {
+pub(crate) fn stderr_failure(source: io::Error) -> Failure {
     Failure::after_open(Box::new(MboxTurboError::Io {
         path: PathBuf::from("standard error"),
         source,
@@ -494,7 +494,7 @@ fn destination(format: Format, output: &Path) -> Result<Destination, Failure> {
 }
 
 /// Opens the mailbox, with the index at `index` when one is named.
-fn open(path: &Path, index: Option<&Path>) -> Result<Mailbox, Failure> {
+pub(crate) fn open(path: &Path, index: Option<&Path>) -> Result<Mailbox, Failure> {
     let policy = index.map_or(IndexPolicy::Sidecar, |index_path| {
         IndexPolicy::Path(index_path.to_path_buf())
     });

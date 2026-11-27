@@ -481,6 +481,38 @@ mod json {
     }
 
     #[test]
+    fn info_writes_one_info_event_valid_against_the_schema() {
+        let fixture = Fixture::new();
+        let mbox = fixture.mbox.to_str().expect("the fixture path is UTF-8");
+        let output = run(&["info", mbox, "--json"]);
+        assert_eq!(code(&output), 0_i32, "info succeeds: {}", stderr(&output));
+        let events = events(&output);
+        assert_eq!(names(&events), ["info"], "one info event and nothing else");
+        assert_eq!(
+            (&events[0]["count"], &events[0]["undated"]),
+            (&Value::from(4_u64), &Value::from(4_u64)),
+            "the fixture has four undated messages"
+        );
+        assert_eq!(
+            (&events[0]["earliest"], &events[0]["latest"]),
+            (&Value::Null, &Value::Null),
+            "no dates, no span"
+        );
+        assert!(output.stderr.is_empty(), "--json is silent on stderr");
+    }
+
+    #[test]
+    fn show_with_json_ends_in_an_error_event_and_writes_no_message() {
+        let fixture = Fixture::new();
+        let mbox = fixture.mbox.to_str().expect("the fixture path is UTF-8");
+        let output = run(&["show", mbox, "0", "--json"]);
+        assert_eq!(code(&output), 64_i32, "show cannot be combined with --json");
+        let events = events(&output);
+        assert_eq!(names(&events), ["error"], "one error event and no bytes");
+        assert_eq!(events[0]["code"], 64_i32, "the event carries the exit code");
+    }
+
+    #[test]
     #[should_panic(expected = "does not know the keyword")]
     fn the_validator_fails_on_a_keyword_it_does_not_know() {
         let schema: Value = serde_json::from_str(r#"{"minimum":1}"#).expect("the sample is JSON");

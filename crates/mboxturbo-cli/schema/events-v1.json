@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "mboxturbo --json events, version 1",
-  "description": "One JSON object per line on standard output. A run that fails before the mailbox is open writes only an error event; otherwise the order is start, index, progress (one or more), file, summary, and a failure after start ends the stream with an error event.",
+  "description": "One JSON object per line on standard output. A run that fails before the mailbox is open writes only an error event; an info run writes one info event; otherwise the order is start, index, progress (one or more), file, summary, and a failure after start ends the stream with an error event.",
   "oneOf": [
     {
       "title": "start",
@@ -73,6 +73,21 @@
         "bytes": { "type": "integer" },
         "path": { "type": "string" },
         "elapsed_ms": { "type": "integer" }
+      }
+    },
+    {
+      "title": "info",
+      "description": "The shape of a mailbox, from its index: the message count, the earliest and latest dates as RFC 3339 UTC strings (null when no message has a date) and the number of undated messages.",
+      "type": "object",
+      "required": ["v", "event", "count", "earliest", "latest", "undated"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "info" },
+        "count": { "type": "integer" },
+        "earliest": { "oneOf": [{ "type": "string" }, { "const": null }] },
+        "latest": { "oneOf": [{ "type": "string" }, { "const": null }] },
+        "undated": { "type": "integer" }
       }
     },
     {

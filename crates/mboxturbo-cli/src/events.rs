@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use mboxturbo::{IndexOrigin, Progress};
 use serde_json::{Value, json};
 
+use crate::info::rfc3339;
+
 /// The version carried by every event; a change to an event's shape bumps it.
 const VERSION: u8 = 1;
 
@@ -45,6 +47,19 @@ impl From<Progress> for Counts {
             total: progress.total,
         }
     }
+}
+
+/// What an `info` event reports: the shape of one mailbox.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Info {
+    /// How many messages the mailbox holds.
+    pub count: usize,
+    /// Unix seconds of the earliest dated message; `None` when no message has a date.
+    pub earliest: Option<i64>,
+    /// Unix seconds of the latest dated message; `None` when no message has a date.
+    pub latest: Option<i64>,
+    /// How many messages have no date.
+    pub undated: usize,
 }
 
 /// What a `start` event reports.
@@ -151,6 +166,22 @@ pub(crate) fn file(file: &File<'_>) -> io::Result<()> {
 pub(crate) fn index(origin: IndexOrigin) -> io::Result<()> {
     let name = format!("{origin:?}").to_lowercase();
     emit(&json!({ "v": VERSION, "event": "index", "origin": name }))
+}
+
+/// Writes an `info` event.
+///
+/// # Errors
+///
+/// The I/O error of writing to standard output.
+pub(crate) fn info(info: &Info) -> io::Result<()> {
+    emit(&json!({
+        "v": VERSION,
+        "event": "info",
+        "count": info.count,
+        "earliest": info.earliest.map(rfc3339),
+        "latest": info.latest.map(rfc3339),
+        "undated": info.undated,
+    }))
 }
 
 /// Writes a `progress` event.

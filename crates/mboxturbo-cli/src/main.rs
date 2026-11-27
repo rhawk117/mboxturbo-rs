@@ -27,8 +27,10 @@
 mod events;
 mod exit;
 mod export;
+mod info;
 mod progress;
 mod select;
+mod show;
 mod signals;
 
 use std::env;
@@ -39,7 +41,9 @@ use clap::{ColorChoice, CommandFactory as _, FromArgMatches as _, Parser, Subcom
 
 use crate::events::Report;
 use crate::export::{ExportArgs, Failure};
+use crate::info::InfoArgs;
 use crate::progress::{Environment, Feedback};
+use crate::show::ShowArgs;
 
 /// Exports large mbox files to analysis-friendly formats.
 #[derive(Debug, Parser)]
@@ -66,6 +70,10 @@ struct Cli {
 enum Command {
     /// Write the selected messages of a mailbox as parquet, eml, mbox, jsonl, csv or arrow.
     Export(ExportArgs),
+    /// Print a mailbox's message count, date span and number of undated messages.
+    Info(InfoArgs),
+    /// Write one message's stored bytes to standard output.
+    Show(ShowArgs),
 }
 
 fn main() -> ExitCode {
@@ -89,8 +97,12 @@ fn main() -> ExitCode {
     } else {
         Report::Text
     };
-    let Command::Export(args) = cli.command;
-    match export::run(&args, report, feedback) {
+    let outcome = match &cli.command {
+        Command::Export(args) => export::run(args, report, feedback),
+        Command::Info(args) => info::run(args, report, feedback),
+        Command::Show(args) => show::run(args, report, feedback),
+    };
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => describe(&failure, report),
     }
