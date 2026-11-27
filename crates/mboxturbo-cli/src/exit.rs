@@ -35,7 +35,7 @@ pub(crate) enum Stage {
 /// | Failure | Code |
 /// |---------|------|
 /// | other failure (Arrow, Parquet, unsupported destination, any future variant) | 1 |
-/// | `InvalidPredicate` (the CLI builds no predicate, so it never arises) | 1 |
+/// | `InvalidPredicate` (`--where` or `--where-file` is not valid JSON or fails validation) | 64 |
 /// | `PositionOutOfRange` (usage) | 64 |
 /// | `CorruptIndex`, `StaleIndex` | 65 |
 /// | `Io` whose source is `NotFound` for the mailbox path itself (mailbox missing) | 66 |
@@ -51,13 +51,14 @@ pub(crate) enum Stage {
 pub(crate) fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
     match error {
         MboxTurboError::Arrow { .. }
-        | MboxTurboError::InvalidPredicate { .. }
         | MboxTurboError::Parquet { .. }
         | MboxTurboError::UnsupportedDestination { .. } => OTHER,
         MboxTurboError::Cancelled { .. } => INTERRUPTED,
         MboxTurboError::CorruptIndex { .. } | MboxTurboError::StaleIndex { .. } => CORRUPT,
         MboxTurboError::Io { source, .. } => io_code(stage, source),
-        MboxTurboError::PositionOutOfRange { .. } => USAGE,
+        MboxTurboError::InvalidPredicate { .. } | MboxTurboError::PositionOutOfRange { .. } => {
+            USAGE
+        },
         MboxTurboError::TargetExists { .. } => TARGET_EXISTS,
         // `MboxTurboError` is `#[non_exhaustive]`: a variant added later is "other" until named
         // above.
@@ -79,7 +80,7 @@ fn io_code(stage: Stage, source: &io::Error) -> u8 {
 mod tests {
     use std::path::PathBuf;
 
-    use mboxturbo::{Corruption, DestinationKind, Mailbox};
+    use mboxturbo::{Corruption, DestinationKind, Mailbox, Predicate};
 
     use super::*;
 
@@ -171,6 +172,13 @@ mod tests {
             64,
             "an out-of-range position is a usage error"
         );
+    }
+
+    #[test]
+    fn an_invalid_predicate_exits_64() {
+        let error = Predicate::from_json("{\"op\":\"and\",\"args\":[]}")
+            .expect_err("an empty `and` is invalid");
+        assert_eq!(code(&error), 64, "an invalid predicate is a usage error");
     }
 
     #[test]

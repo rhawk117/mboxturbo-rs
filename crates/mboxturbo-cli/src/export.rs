@@ -10,9 +10,9 @@ use std::{fmt, fs, io};
 use clap::{Args, ValueEnum};
 use mboxturbo::{
     CancelToken, Column, Compression, CsvExporter, Destination, EmlExporter, Export, ExportSummary,
-    Exporter, FormulaEscaping, IndexOrigin, IndexPolicy, IpcExporter, JsonlExporter, Mailbox,
-    MailboxBuilder, MboxExporter, MboxTurboError, Overwrite, ParquetExporter, Pipeline, Progress,
-    Selection,
+    Exporter, Filter, FormulaEscaping, IndexOrigin, IndexPolicy, IpcExporter, JsonlExporter,
+    Mailbox, MailboxBuilder, MboxExporter, MboxTurboError, Overwrite, ParquetExporter, Pipeline,
+    Predicate, Progress, Selection,
 };
 
 use crate::dates::{Bounds, DateError};
@@ -109,6 +109,9 @@ pub(crate) struct ExportArgs {
     /// Keep the message index in this file instead of beside the mailbox.
     #[arg(long, value_name = "PATH")]
     index: Option<PathBuf>,
+    /// The filters that narrow the export.
+    #[command(flatten)]
+    limits: Box<Limits>,
     /// The mbox file to export.
     mailbox: PathBuf,
     /// Where to write: a file, a directory for eml, or `-` for standard output.
@@ -124,6 +127,11 @@ pub(crate) struct ExportArgs {
     /// A file of selections, one SPEC per line; blank lines are ignored.
     #[arg(long, value_name = "FILE")]
     select_file: Option<PathBuf>,
+}
+
+/// The filters of `export` that decide by what a message holds rather than where it is.
+#[derive(Debug, Args)]
+struct Limits {
     /// Keep only messages dated at or after this moment: an RFC 3339 timestamp with an offset or
     /// a date `YYYY-MM-DD` (midnight UTC). Messages with no date are excluded.
     #[arg(long, value_name = "WHEN")]
@@ -132,6 +140,13 @@ pub(crate) struct ExportArgs {
     /// with no date are excluded.
     #[arg(long, value_name = "WHEN")]
     until: Option<Box<str>>,
+    /// A file holding the predicate in its JSON form, as for `--where`.
+    #[arg(long, value_name = "PATH")]
+    where_file: Option<PathBuf>,
+    /// Keep only messages matching this predicate, given in its JSON form such as
+    /// `{"op":"contains","header":"subject","value":"invoice"}`.
+    #[arg(long = "where", value_name = "JSON", conflicts_with = "where_file")]
+    where_json: Option<String>,
 }
 
 impl ExportArgs {
@@ -191,6 +206,16 @@ impl Format {
     const fn streams(self) -> bool {
         !matches!(self, Self::Eml | Self::Parquet)
     }
+}
+
+/// What narrows an export beyond the whole mailbox, parsed before the mailbox is opened.
+struct Narrowing {
+    /// The `--since` and `--until` bounds.
+    bounds: Bounds,
+    /// The `--where` or `--where-file` filter.
+    filter: Option<Filter>,
+    /// The `--select` ranges.
+    ranges: Vec<Range<usize>>,
 }
 
 /// The messages an export writes and how many there are.
@@ -293,20 +318,30 @@ impl Observer {
 ///
 /// A [`Failure::Usage`] for an unknown column, a malformed or out-of-range selection, standard
 /// output with a format that cannot stream, or `--json` with standard output, all found before
-/// anything is written; a [`Failure::Core`] for everything the library refuses, and for an event
-/// that cannot be written to standard output.
+/// anything is written; a [`Failure::Core`] for everything the library refuses, including a
+/// predicate that is not valid, and for an event that cannot be written to standard output.
+///
+/// The predicate scan and the date scan run before the signal handlers are installed, so a
+/// signal that arrives during them ends the process by its default action, with nothing
+/// written yet.
 pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Result<(), Failure> {
     refuse_events_on_stdout(args, report)?;
     let columns = columns(args.format, args.columns.as_deref())?;
     let destination = destination(args.format, &args.output)?;
     let ranges = select::parse_all(&args.select)?;
-    let bounds = Bounds::parse(args.since.as_deref(), args.until.as_deref())?;
-    let mailbox = open(&args.mailbox, args.index.as_deref())?;
-    let selected = selection(args, ranges, bounds, &mailbox)?;
+    let bounds = Bounds::parse(args.limits.since.as_deref(), args.limits.until.as_deref())?;
+    let filter = filter(args)?;
+    let mailbox = Arc::new(open(&args.mailbox, args.index.as_deref())?);
+    let narrowing = Narrowing {
+        bounds,
+        filter,
+        ranges,
+    };
+    let selected = selection(args, narrowing, &mailbox)?;
     let pipeline = Arc::new(Pipeline::new(columns, BATCH_SIZE));
     let exporter = args.format.exporter(mailbox.len());
     let origin = mailbox.index_origin();
-    let export = Export::new(pipeline, Arc::new(mailbox), destination)
+    let export = Export::new(pipeline, mailbox, destination)
         .selection(selected.selection)
         .overwrite(args.overwrite_policy());
     let reported = Reported {
@@ -548,47 +583,82 @@ fn is_missing(error: &MboxTurboError, mailbox: &Path) -> bool {
 }
 
 /// The messages to export: those `args` select by position, or every message, that also fall
-/// inside `bounds`.
+/// inside the bounds and satisfy the filter of `narrowing`.
 ///
 /// Positions come out ascending and without repeats whatever order `--select` lists them in, so
 /// the export keeps mailbox order.
 fn selection(
     args: &ExportArgs,
-    ranges: Vec<Range<usize>>,
-    bounds: Bounds,
-    mailbox: &Mailbox,
+    narrowing: Narrowing,
+    mailbox: &Arc<Mailbox>,
 ) -> Result<Selected, Failure> {
-    let chosen = chosen_positions(args, ranges, mailbox)?;
-    if bounds.is_open() {
-        return Ok(unbounded(chosen, mailbox.len()));
+    let mut kept = chosen_positions(args, narrowing.ranges, mailbox)?;
+    let mut undated = None;
+    if !narrowing.bounds.is_open() {
+        let dated = mailbox.date_range(narrowing.bounds.since, narrowing.bounds.until);
+        undated = Some(dated.undated);
+        kept = Some(narrow(kept, dated.positions));
     }
-    let dated = mailbox.date_range(bounds.since, bounds.until);
-    let undated = dated.undated;
-    let mut positions = dated.positions;
-    if let Some(picked) = chosen {
-        positions.retain(|position| picked.binary_search(position).is_ok());
+    if let Some(found) = narrowing.filter {
+        let matching = found
+            .positions(mailbox)
+            .map_err(|error| Failure::after_open(Box::new(error)))?;
+        kept = Some(narrow_to(kept, &matching, mailbox.len()));
     }
-    Ok(Selected {
-        count: positions.len(),
-        selection: Selection::Positions(positions),
-        undated: Some(undated),
-    })
-}
-
-/// What an export with no date bound writes: the `chosen` positions, or all `len` messages.
-fn unbounded(chosen: Option<Vec<usize>>, len: usize) -> Selected {
-    chosen.map_or_else(
+    Ok(kept.map_or_else(
         || Selected {
-            count: len,
+            count: mailbox.len(),
             selection: Selection::All,
-            undated: None,
+            undated,
         },
         |positions| Selected {
             count: positions.len(),
             selection: Selection::Positions(positions),
-            undated: None,
+            undated,
         },
-    )
+    ))
+}
+
+/// `positions` limited to those in `kept`; `positions` itself when `kept` is `None`.
+fn narrow(kept: Option<Vec<usize>>, mut positions: Vec<usize>) -> Vec<usize> {
+    if let Some(picked) = kept {
+        positions.retain(|position| picked.binary_search(position).is_ok());
+    }
+    positions
+}
+
+/// The ascending `matching` positions limited to those in `kept`; every message position that
+/// matches when `kept` is `None`.
+fn narrow_to(kept: Option<Vec<usize>>, matching: &[u64], len: usize) -> Vec<usize> {
+    let wide = |position: &usize| {
+        u64::try_from(*position).is_ok_and(|value| matching.binary_search(&value).is_ok())
+    };
+    kept.unwrap_or_else(|| (0..len).collect())
+        .into_iter()
+        .filter(wide)
+        .collect()
+}
+
+/// The filter that `--where` or `--where-file` asks for; `None` when the command line has
+/// neither flag.
+///
+/// The predicate is checked here, before the mailbox is opened, so a bad one costs no scan.
+fn filter(args: &ExportArgs) -> Result<Option<Filter>, Failure> {
+    let text = match (&args.limits.where_json, &args.limits.where_file) {
+        (Some(json), _) => json.clone(),
+        (None, Some(path)) => fs::read_to_string(path).map_err(|source| {
+            Failure::after_open(Box::new(MboxTurboError::Io {
+                path: path.clone(),
+                source,
+            }))
+        })?,
+        (None, None) => return Ok(None),
+    };
+    let predicate =
+        Predicate::from_json(&text).map_err(|error| Failure::after_open(Box::new(error)))?;
+    Filter::new(&predicate)
+        .map(Some)
+        .map_err(|error| Failure::after_open(Box::new(error)))
 }
 
 /// The ascending positions named by `ranges` (from `--select`) united with the `--select-file`
