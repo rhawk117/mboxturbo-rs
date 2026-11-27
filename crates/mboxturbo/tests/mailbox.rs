@@ -9,9 +9,11 @@ mod mailbox {
     use std::time::Duration;
     use std::{fs, thread};
 
+    use arrow_array::cast::AsArray as _;
+    use arrow_array::types::UInt64Type;
     #[cfg(unix)]
     use mboxturbo::IndexSource;
-    use mboxturbo::{Corruption, Mailbox, MboxTurboError, Message};
+    use mboxturbo::{Column, Corruption, Mailbox, MboxTurboError, Message, Pipeline, Selection};
     use rayon::prelude::*;
     use tempfile::TempDir;
 
@@ -56,6 +58,9 @@ X-Bad: bad\xe9\n\nbody\n";
 
     /// Offset of a byte in the first payload block of a freshly built sidecar.
     const FIRST_PAYLOAD_BYTE: usize = 72;
+
+    /// 2024-01-01T00:00:00Z in unix seconds.
+    const MIDNIGHT: i64 = 1_704_067_200;
 
     struct Fixture {
         _directory: TempDir,
@@ -117,6 +122,33 @@ X-Bad: bad\xe9\n\nbody\n";
             fs::set_permissions(self.0, fs::Permissions::from_mode(0o755))
                 .expect("directory permissions are restored");
         }
+    }
+
+    fn dated_mailbox(dates: &[Option<&str>]) -> (TempDir, Arc<Mailbox>) {
+        let mut contents = String::new();
+        for (number, date) in dates.iter().enumerate() {
+            contents.push_str("From a@example.com Mon Jan  1 00:00:00 24\n");
+            if let Some(value) = date {
+                writeln!(contents, "Date: {value}").expect("writing to a string cannot fail");
+            }
+            writeln!(contents, "Subject: {number}\n\nb\n")
+                .expect("writing to a string cannot fail");
+        }
+        let directory = tempfile::tempdir().expect("temporary directory is created");
+        let mbox = directory.path().join("ranged.mbox");
+        fs::write(&mbox, contents).expect("fixture mbox is written");
+        let mailbox = Mailbox::open(&mbox).expect("fixture mbox opens");
+        (directory, Arc::new(mailbox))
+    }
+
+    fn mixed() -> (TempDir, Arc<Mailbox>) {
+        dated_mailbox(&[
+            Some("Sun, 31 Dec 2023 23:59:59 +0000"),
+            Some("Mon, 01 Jan 2024 00:00:00 +0000"),
+            Some("Mon, 01 Jan 2024 00:00:01 +0000"),
+            None,
+            Some("not a date at all"),
+        ])
     }
 
     #[test]
@@ -279,6 +311,112 @@ body\n\n";
             mailbox.date(1),
             None,
             "a message with no Date header has no date"
+        );
+    }
+
+    #[test]
+    fn a_date_range_includes_since_and_excludes_until_at_the_exact_second() {
+        let (_directory, mailbox) = mixed();
+        let range = mailbox.date_range(Some(MIDNIGHT), Some(MIDNIGHT + 1));
+        assert_eq!(
+            range.positions,
+            vec![1],
+            "only the message dated exactly since"
+        );
+        assert_eq!(
+            range.undated, 2,
+            "a missing and an unparsable Date are undated"
+        );
+        let wider = mailbox.date_range(Some(MIDNIGHT - 1), Some(MIDNIGHT + 2));
+        assert_eq!(
+            wider.positions,
+            vec![0, 1, 2],
+            "one second wider on both sides"
+        );
+        let next = mailbox.date_range(Some(MIDNIGHT + 1), Some(MIDNIGHT + 2));
+        assert_eq!(
+            next.positions,
+            vec![2],
+            "until is exclusive of the next second"
+        );
+    }
+
+    #[test]
+    fn an_open_bound_leaves_that_side_unlimited() {
+        let (_directory, mailbox) = mixed();
+        assert_eq!(
+            mailbox.date_range(Some(MIDNIGHT), None).positions,
+            vec![1, 2],
+            "since alone"
+        );
+        assert_eq!(
+            mailbox.date_range(None, Some(MIDNIGHT)).positions,
+            vec![0],
+            "until alone"
+        );
+        let unbounded = mailbox.date_range(None, None);
+        assert_eq!(
+            unbounded.positions,
+            vec![0, 1, 2, 3, 4],
+            "no bound keeps every message, undated included"
+        );
+        assert_eq!(unbounded.undated, 2, "undated is still reported");
+    }
+
+    #[test]
+    fn since_at_or_past_until_selects_nothing() {
+        let (_directory, mailbox) = mixed();
+        for until in [MIDNIGHT, MIDNIGHT - 1] {
+            let range = mailbox.date_range(Some(MIDNIGHT), Some(until));
+            assert!(range.positions.is_empty(), "since {MIDNIGHT} until {until}");
+            assert_eq!(range.undated, 2, "undated is reported for an empty range");
+        }
+    }
+
+    #[test]
+    fn an_all_undated_mailbox_is_excluded_by_any_bound() {
+        let (_directory, mailbox) = dated_mailbox(&[None, Some("nonsense"), None]);
+        for (since, until) in [
+            (Some(0), None),
+            (None, Some(MIDNIGHT)),
+            (Some(0), Some(MIDNIGHT)),
+        ] {
+            let range = mailbox.date_range(since, until);
+            assert!(range.positions.is_empty(), "bounds {since:?}..{until:?}");
+            assert_eq!(range.undated, 3, "bounds {since:?}..{until:?}");
+        }
+        let unbounded = mailbox.date_range(None, None);
+        assert_eq!(unbounded.positions, vec![0, 1, 2], "no bound returns all");
+        assert_eq!(unbounded.undated, 3, "all three are undated");
+    }
+
+    #[test]
+    fn a_date_range_selects_exactly_its_messages_through_the_pipeline() {
+        let (_directory, mailbox) = mixed();
+        let range = mailbox.date_range(Some(MIDNIGHT - 1), Some(MIDNIGHT + 1));
+        assert_eq!(range.positions, vec![0, 1], "the range under test");
+        let pipeline = Arc::new(Pipeline::new(vec![Column::Position, Column::Subject], 10));
+        let batch = pipeline
+            .select(&mailbox, Selection::from(range))
+            .expect("the positions are inside the mailbox")
+            .next()
+            .expect("one batch covers the selection")
+            .expect("the batch is assembled");
+        let positions = batch
+            .column(0)
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        assert_eq!(
+            positions,
+            vec![0, 1],
+            "the reader visits the ranged positions"
+        );
+        let subjects = batch.column(1).as_string::<i32>();
+        assert_eq!(
+            (subjects.value(0), subjects.value(1)),
+            ("0", "1"),
+            "the rows are the ranged messages"
         );
     }
 

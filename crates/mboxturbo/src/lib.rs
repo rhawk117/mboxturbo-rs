@@ -46,7 +46,7 @@ pub use export::{CancelToken, Export, Exporter, Progress};
 pub use filter::Filter;
 pub use fingerprint::Fingerprint;
 pub use index::{BlockSize, Index, IndexBytes};
-pub use mailbox::{Mailbox, ParsedBatch};
+pub use mailbox::{DateRange, Mailbox, ParsedBatch};
 pub use mboxturbo_headers::TrustSet;
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use parquet::ParquetExporter;

@@ -15,6 +15,7 @@ use crate::hint;
 use crate::index::{BlockSize, Cursor, Index};
 use crate::mapping::map_read_only;
 use crate::message::Message;
+use crate::selection::Selection;
 
 /// An mbox file mapped read-only, with the byte offset of every message.
 ///
@@ -41,6 +42,24 @@ pub struct ParsedBatch {
     /// whose parser panicked, which is contained and reported the same way as a message with no
     /// MIME part.
     pub unparsed: Vec<usize>,
+}
+
+/// The result of [`Mailbox::date_range`]: the selected positions and the undated count.
+///
+/// Converts into [`Selection::Positions`](crate::Selection::Positions) with `Selection::from`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DateRange {
+    /// Positions, ascending, of the messages inside the requested range.
+    pub positions: Vec<usize>,
+    /// Messages with no index date. They are excluded from `positions` whenever a bound was given.
+    pub undated: usize,
+}
+
+impl From<DateRange> for Selection {
+    fn from(range: DateRange) -> Self {
+        Self::Positions(range.positions)
+    }
 }
 
 /// A mapped file with its fingerprint, before an index is attached.
@@ -133,6 +152,32 @@ impl Mailbox {
     #[must_use]
     pub fn date(&self, position: usize) -> Option<i64> {
         self.index.date(position)
+    }
+
+    /// The positions of the messages whose index date `d` satisfies `since <= d < until`, in
+    /// ascending order, and the number of messages with no index date.
+    ///
+    /// Bounds are unix seconds, inclusive for `since` and exclusive for `until`; `None` leaves
+    /// that side open. Both bounds with `since >= until` select nothing. A message without an
+    /// index date (no Date header, or one that did not parse) matches no bound, so it is
+    /// excluded whenever either bound is given; with neither, every position is returned.
+    /// [`DateRange::undated`] counts those messages in every case. Only the index is read,
+    /// never the message bytes.
+    #[must_use]
+    pub fn date_range(&self, since: Option<i64>, until: Option<i64>) -> DateRange {
+        let unbounded = since.is_none() && until.is_none();
+        let positions = (0..self.len())
+            .filter(|&position| {
+                self.date(position).map_or(unbounded, |date| {
+                    since.is_none_or(|bound| bound <= date)
+                        && until.is_none_or(|bound| date < bound)
+                })
+            })
+            .collect();
+        let undated = (0..self.len())
+            .filter(|&position| self.date(position).is_none())
+            .count();
+        DateRange { positions, undated }
     }
 
     /// The message index.
