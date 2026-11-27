@@ -115,6 +115,9 @@ jobs:
       - name: Run Workspace Tests
         run: cargo test --workspace --locked
 
+      - name: Package mboxturbo-headers (dry run)
+        run: cargo publish --dry-run -p mboxturbo-headers --locked
+
   python-checks:
     name: 🐍 Python Checks (${{ matrix.python }})
     runs-on: ubuntu-24.04
