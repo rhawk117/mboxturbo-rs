@@ -128,6 +128,9 @@ synchronize_cargo_version() {
 synchronize_cli_extra_pin() {
   log::step "Synchronize CLI Extra Pin"
 
+  uv lock --check --project "${PYTHON_PROJECT}" ||
+    panic "uv.lock is stale before the version bump; run uv lock and commit it."
+
   local pin="mboxturbo-cli==${release_version}"
   sed -E "s/^(cli = \\[\")mboxturbo-cli==[^\"]*(\"\\])$/\\1${pin}\\2/" \
     "${PYTHON_MANIFEST}" >"${PYTHON_MANIFEST}.tmp"
