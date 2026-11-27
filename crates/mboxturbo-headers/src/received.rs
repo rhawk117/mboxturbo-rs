@@ -136,8 +136,7 @@ impl Hop<'_> {
         self.from_comment.as_deref()
     }
 
-    /// The host after `from`, as the sender introduced itself; a domain literal keeps its
-    /// brackets.
+    /// The `from` host as the sender introduced itself; a domain literal keeps its brackets.
     #[must_use]
     #[expect(
         clippy::wrong_self_convention,
