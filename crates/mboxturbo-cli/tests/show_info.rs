@@ -3,9 +3,13 @@
 
 #[cfg(test)]
 mod show_info {
-    use std::fs::{self, OpenOptions};
+    use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::fs::OpenOptions;
     use std::path::PathBuf;
-    use std::process::{Command, Output, Stdio};
+    #[cfg(target_os = "linux")]
+    use std::process::Stdio;
+    use std::process::{Command, Output};
 
     use tempfile::TempDir;
 
