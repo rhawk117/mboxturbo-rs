@@ -99,6 +99,8 @@ class Trust:
 class Selection:
     @property
     def columns(self) -> list[str]: ...
+    @property
+    def excluded_undated(self) -> int: ...
     def __arrow_c_stream__(
         self, requested_schema: object | None = None
     ) -> CapsuleType: ...
@@ -124,8 +126,18 @@ class Mailbox:
     def __iter__(self) -> Iterator[Message]: ...
     def batches(self, size: int) -> Iterator[list[Message]]: ...
     # Column "raw" (each message's bytes) is opt-in: never part of the defaults.
+    # `since <= date < until` on the index date; both must be timezone-aware. A position
+    # past the end raises MboxTurboError.
     def select(
-        self, columns: Sequence[str] | None = None, *, batch_size: int = 8192
+        self,
+        columns: Sequence[str] | None = None,
+        *,
+        batch_size: int = 8192,
+        positions: Sequence[int] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        where: Predicate | None = None,
+        trust: Trust | None = None,
     ) -> Selection: ...
     def save_index(self, path: StrPath) -> None: ...
     def close(self) -> None: ...

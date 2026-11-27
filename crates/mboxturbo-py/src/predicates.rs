@@ -81,10 +81,6 @@ impl Predicate {
     }
 
     /// The core predicate, for the selection that filters with it.
-    #[expect(
-        dead_code,
-        reason = "select(where=) takes the core predicate in the next task"
-    )]
     pub(crate) const fn predicate(&self) -> &mboxturbo::Predicate {
         &self.inner
     }
@@ -220,10 +216,6 @@ pub(crate) struct Trust {
 
 impl Trust {
     /// The core trust set, for the selection that filters with it.
-    #[expect(
-        dead_code,
-        reason = "select(trust=) takes the core trust set in the next task"
-    )]
     pub(crate) const fn trust_set(&self) -> &mboxturbo::TrustSet {
         &self.inner
     }

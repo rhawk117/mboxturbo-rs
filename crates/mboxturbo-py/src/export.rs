@@ -11,12 +11,42 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use mboxturbo::{Column, Compression, Destination, Export, Overwrite, ParquetExporter, Pipeline};
-use pyo3::exceptions::PyValueError;
+use mboxturbo::{
+    Column, Compression, Destination, Export, Filter, MboxTurboError, Overwrite, ParquetExporter,
+    Pipeline,
+};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyCapsule;
+use pyo3::types::{PyCapsule, PyDateTime, PyDelta, PyDeltaAccess as _, PyTzInfo};
 
 use crate::errors::into_py_err;
+use crate::predicates::{Predicate, Trust};
+
+/// The narrowing a ``select`` call asks for, converted from its Python arguments.
+#[derive(Debug)]
+pub(crate) struct Filters {
+    /// The only positions that may be kept.
+    positions: Option<Vec<usize>>,
+    /// The predicate rows must satisfy.
+    predicate: Option<mboxturbo::Predicate>,
+    /// The inclusive lower bound of the index date, in unix seconds.
+    since: Option<i64>,
+    /// The trust set that decides verdicts and trusted flags.
+    trust: Option<mboxturbo::TrustSet>,
+    /// The exclusive upper bound of the index date, in unix seconds.
+    until: Option<i64>,
+}
+
+/// The rows the filters keep, and the undated messages the date range dropped.
+#[derive(Debug)]
+struct Rows {
+    /// The undated messages the date range dropped.
+    excluded_undated: usize,
+    /// How many rows `selection` visits.
+    messages: usize,
+    /// The rows to visit.
+    selection: mboxturbo::Selection,
+}
 
 /// Chosen columns over a mailbox. Any Arrow consumer reads it directly (``pyarrow.table``,
 /// ``polars.DataFrame``, ``DuckDB``), and ``to_parquet`` writes it to a file. Each read extracts
@@ -26,12 +56,98 @@ use crate::errors::into_py_err;
 pub(crate) struct Selection {
     /// Rows per batch; a Parquet row group holds sixteen batches.
     batch_size: usize,
+    /// The undated messages the date range dropped.
+    excluded_undated: usize,
     /// The mapping the columns are extracted from.
     mailbox: Arc<mboxturbo::Mailbox>,
+    /// The number of rows every read yields.
+    messages: usize,
     /// The column names, in selection order.
     names: Vec<String>,
     /// The extraction plan shared by every read.
     pipeline: Arc<Pipeline>,
+    /// The rows every read visits.
+    rows: mboxturbo::Selection,
+}
+
+impl Filters {
+    /// Converts the Python arguments: `TypeError` for a naive `since` or `until`.
+    pub(crate) fn from_python(
+        py: Python<'_>,
+        positions: Option<Vec<usize>>,
+        since: Option<&Bound<'_, PyDateTime>>,
+        until: Option<&Bound<'_, PyDateTime>>,
+        predicate: Option<&Predicate>,
+        trust: Option<&Trust>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            positions,
+            predicate: predicate.map(|wrapped| wrapped.predicate().clone()),
+            since: since
+                .map(|moment| unix_seconds(py, moment, "since"))
+                .transpose()?,
+            trust: trust.map(|wrapped| wrapped.trust_set().clone()),
+            until: until
+                .map(|moment| unix_seconds(py, moment, "until"))
+                .transpose()?,
+        })
+    }
+
+    /// The positions whose messages satisfy `predicate`, decided with this trust set.
+    fn matching(
+        &self,
+        predicate: &mboxturbo::Predicate,
+        mailbox: &Arc<mboxturbo::Mailbox>,
+    ) -> Result<Vec<usize>, Box<MboxTurboError>> {
+        let filter = self
+            .trust
+            .clone()
+            .into_iter()
+            .fold(Filter::new(predicate)?, Filter::with_trust);
+        filter
+            .positions(mailbox)?
+            .into_iter()
+            .map(|position| {
+                usize::try_from(position).map_err(|_overflow| {
+                    Box::new(MboxTurboError::PositionOutOfRange {
+                        position: usize::MAX,
+                        len: mailbox.len(),
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// The rows kept by every filter given, ascending and without repeats, or every row when
+    /// none is given.
+    fn rows(&self, mailbox: &Arc<mboxturbo::Mailbox>) -> Result<Rows, Box<MboxTurboError>> {
+        let mut kept = self
+            .positions
+            .as_deref()
+            .map(|positions| checked_positions(positions, mailbox.len()))
+            .transpose()?;
+        let mut excluded_undated = 0;
+        if self.since.is_some() || self.until.is_some() {
+            let range = mailbox.date_range(self.since, self.until);
+            excluded_undated = range.undated;
+            kept = Some(narrow(kept, range.positions));
+        }
+        if let Some(predicate) = &self.predicate {
+            kept = Some(narrow(kept, self.matching(predicate, mailbox)?));
+        }
+        let (selection, messages) = kept.map_or_else(
+            || (mboxturbo::Selection::All, mailbox.len()),
+            |positions| {
+                let messages = positions.len();
+                (mboxturbo::Selection::Positions(positions), messages)
+            },
+        );
+        Ok(Rows {
+            excluded_undated,
+            messages,
+            selection,
+        })
+    }
 }
 
 #[pymethods]
@@ -44,17 +160,20 @@ impl Selection {
         requested_schema: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
         drop(requested_schema);
-        let reader = self.pipeline.reader(&self.mailbox);
+        let reader = self
+            .pipeline
+            .select(&self.mailbox, self.rows.clone())
+            .map_err(|error| into_py_err(py, error))?;
         let stream = FFI_ArrowArrayStream::new(Box::new(reader));
         PyCapsule::new_with_value(py, stream, c"arrow_array_stream")
     }
 
-    /// ``Selection(columns=N, messages=M)``.
+    /// ``Selection(columns=N, messages=M)``, counting the rows the selection keeps.
     fn __repr__(&self) -> String {
         format!(
             "Selection(columns={}, messages={})",
             self.names.len(),
-            self.mailbox.len()
+            self.messages
         )
     }
 
@@ -62,6 +181,12 @@ impl Selection {
     #[getter]
     fn columns(&self) -> Vec<String> {
         self.names.clone()
+    }
+
+    /// The undated messages the date range dropped; 0 without ``since`` or ``until``.
+    #[getter]
+    const fn excluded_undated(&self) -> usize {
+        self.excluded_undated
     }
 
     /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
@@ -91,19 +216,23 @@ impl Selection {
             Arc::clone(&self.mailbox),
             Destination::File(path),
         )
-        .overwrite(policy);
+        .overwrite(policy)
+        .selection(self.rows.clone());
         py.detach(move || export.run(Box::new(sink)).map_err(Box::new))
             .map(|summary| summary.messages)
             .map_err(|error| into_py_err(py, *error))
     }
 }
 
-/// A selection over `mailbox`; `ValueError` for a zero `batch_size` or an unknown column, with
-/// every column in `Column::defaults` when `requested` is `None`.
+/// A selection over the rows `filters` keep in `mailbox`, with the interpreter released while
+/// they are found; `ValueError` for a zero `batch_size` or an unknown column, with every column
+/// in `Column::defaults` when `requested` is `None`.
 pub(crate) fn select_columns(
+    py: Python<'_>,
     mailbox: Arc<mboxturbo::Mailbox>,
     requested: Option<Vec<String>>,
     batch_size: usize,
+    filters: &Filters,
 ) -> PyResult<Selection> {
     if batch_size == 0 {
         return Err(PyValueError::new_err("batch size must be positive"));
@@ -114,13 +243,48 @@ pub(crate) fn select_columns(
         .iter()
         .map(|column| column.name().into_owned())
         .collect();
-    let pipeline = Arc::new(Pipeline::new(columns, batch_size));
+    let rows = py
+        .detach(|| filters.rows(&mailbox))
+        .map_err(|error| into_py_err(py, *error))?;
+    let extraction = filters
+        .trust
+        .clone()
+        .into_iter()
+        .fold(Pipeline::new(columns, batch_size), Pipeline::with_trust);
     Ok(Selection {
         batch_size,
+        excluded_undated: rows.excluded_undated,
         mailbox,
+        messages: rows.messages,
         names,
-        pipeline,
+        pipeline: Arc::new(extraction),
+        rows: rows.selection,
     })
+}
+
+/// `positions` sorted without repeats, or the core's out-of-range error for the first position
+/// at or past `len`.
+fn checked_positions(positions: &[usize], len: usize) -> Result<Vec<usize>, Box<MboxTurboError>> {
+    if let Some(&position) = positions.iter().find(|&&position| position >= len) {
+        return Err(Box::new(MboxTurboError::PositionOutOfRange {
+            position,
+            len,
+        }));
+    }
+    let mut sorted = positions.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    Ok(sorted)
+}
+
+/// The ascending positions that both `kept` and `next` hold; `next` alone when nothing was
+/// kept yet.
+fn narrow(kept: Option<Vec<usize>>, next: Vec<usize>) -> Vec<usize> {
+    let Some(mut positions) = kept else {
+        return next;
+    };
+    positions.retain(|position| next.binary_search(position).is_ok());
+    positions
 }
 
 /// The columns `names` name, or `ValueError` listing the known names for the first unknown one.
@@ -148,4 +312,20 @@ fn parse_compression(name: &str) -> PyResult<Compression> {
             "unknown compression '{name}'; expected 'zstd', 'snappy' or 'none'"
         ))),
     }
+}
+
+/// Unix seconds of an aware `moment`, rounded up when it has a fraction so that the whole
+/// seconds at or after it are exactly those the instant admits; `TypeError` when it is naive.
+fn unix_seconds(py: Python<'_>, moment: &Bound<'_, PyDateTime>, name: &str) -> PyResult<i64> {
+    if moment.call_method0("utcoffset")?.is_none() {
+        return Err(PyTypeError::new_err(format!(
+            "{name} must be timezone-aware: give the datetime a tzinfo"
+        )));
+    }
+    let epoch = PyDateTime::from_timestamp(py, 0.0, Some(&PyTzInfo::utc(py)?.to_owned()))?;
+    let elapsed = moment.sub(epoch)?.cast_into::<PyDelta>()?;
+    let whole = i64::from(elapsed.get_days())
+        .saturating_mul(86_400)
+        .saturating_add(i64::from(elapsed.get_seconds()));
+    Ok(whole.saturating_add(i64::from(elapsed.get_microseconds() > 0)))
 }
