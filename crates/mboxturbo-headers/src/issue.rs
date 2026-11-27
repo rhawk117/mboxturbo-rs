@@ -78,6 +78,9 @@ pub enum IssueKind {
         /// The name of the absent tag.
         tag: RequiredTag,
     },
+    /// A hop's date is earlier than the previous hop's, so its delay is negative; the offset
+    /// points at the `;` before the hop's date and the delay is still given.
+    NegativeDelay,
     /// A date field was outside its range: a leap second (60) was clamped to 59 and any other
     /// out-of-range field made the date unparsable.
     OutOfRange,

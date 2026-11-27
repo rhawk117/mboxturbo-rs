@@ -369,14 +369,12 @@ mod tests {
     use crate::caps::{Cap, MAX_ENTRIES};
     use crate::issue::{IssueKind, Parsed};
 
-    // Split so the spell checker does not flag the SMTP greeting key as a typo.
-    const GREETING_KEY: &str = concat!("he", "lo");
+    const GREETING_KEY: &str = "helo";
 
     const RFC_7208: &str = concat!(
         "pass (mybox.example.org: domain of myname@example.com designates 192.0.2.1 as ",
         "permitted sender) receiver=mybox.example.org; client-ip=192.0.2.1;\r\n",
-        " envelope-from=\"myname@example.com\"; he",
-        "lo=foo.example.com;"
+        " envelope-from=\"myname@example.com\"; helo=foo.example.com;"
     );
 
     const GOOGLE: &str = concat!(
@@ -387,13 +385,11 @@ mod tests {
     const MICROSOFT: &str = concat!(
         "Pass (protection.outlook.com: domain of example.com designates 203.0.113.9 as ",
         "permitted sender) receiver=protection.outlook.com; client-ip=203.0.113.9; ",
-        "he",
-        "lo=mail.example.com;"
+        "helo=mail.example.com;"
     );
 
     const POSTFIX: &str = concat!(
-        "Softfail (mailfrom) identity=mailfrom; client-ip=2001:db8::25; he",
-        "lo=mx.example.net; ",
+        "Softfail (mailfrom) identity=mailfrom; client-ip=2001:db8::25; helo=mx.example.net; ",
         "envelope-from=bounce@example.net; receiver=<UNKNOWN>; mechanism=-all; ",
         "problem=\"no match\""
     );

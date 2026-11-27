@@ -7,9 +7,9 @@ mod properties {
 
     use mboxturbo_headers::{
         ArcHeader, Cap, Issue, IssueKind, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES,
-        MAX_HEADER_BYTES, TrustSet, decode_encoded_words, parse_arc_sets,
-        parse_authentication_results, parse_date, parse_dkim_signature, parse_received_spf,
-        parse_tag_list, tokenize,
+        MAX_HEADER_BYTES, MAX_RECEIVED_HOPS, TrustSet, decode_encoded_words, parse_arc_sets,
+        parse_authentication_results, parse_date, parse_dkim_signature, parse_received_hops,
+        parse_received_spf, parse_tag_list, tokenize,
     };
     use proptest::prelude::*;
 
@@ -23,6 +23,10 @@ mod properties {
 
     fn from_alphabet(alphabet: &'static [u8]) -> impl Strategy<Value = Vec<u8>> {
         prop::collection::vec(prop::sample::select(alphabet), 0..4096)
+    }
+
+    fn from_alphabet_up_to(alphabet: &'static [u8], max: usize) -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(prop::sample::select(alphabet), 0..max)
     }
 
     fn tokenize_adversarial() -> impl Strategy<Value = Vec<u8>> {
@@ -64,6 +68,13 @@ mod properties {
 
     fn received_spf_adversarial() -> impl Strategy<Value = Vec<u8>> {
         from_alphabet(b";;==  \r\n\"()passfilnetrk-ip.:1a0")
+    }
+
+    fn received_adversarial() -> impl Strategy<Value = Vec<Vec<u8>>> {
+        prop::collection::vec(
+            from_alphabet_up_to(b";;()[]<>:. \r\nfrombyidwthaelo0123456789:@-", 96),
+            0..24,
+        )
     }
 
     fn arc_adversarial() -> impl Strategy<Value = Vec<(u8, Vec<u8>)>> {
@@ -222,6 +233,30 @@ mod properties {
         }
 
         #[test]
+        fn parse_received_hops_survives_arbitrary_headers(
+            raw in prop::collection::vec(arbitrary_bytes(), 0..8),
+            trusted in any::<bool>(),
+        ) {
+            let set = trusting("mx.example.com");
+            let headers: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
+            let parsed = parse_received_hops(&headers, trusted.then_some(&set));
+            let longest = raw.iter().map(Vec::len).max().unwrap_or(0);
+            assert_offsets_within(parsed.issues(), longest)?;
+        }
+
+        #[test]
+        fn parse_received_hops_survives_adversarial_separators(
+            raw in received_adversarial(),
+            trusted in any::<bool>(),
+        ) {
+            let set = trusting("mx.example.com");
+            let headers: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
+            let parsed = parse_received_hops(&headers, trusted.then_some(&set));
+            let longest = raw.iter().map(Vec::len).max().unwrap_or(0);
+            assert_offsets_within(parsed.issues(), longest)?;
+        }
+
+        #[test]
         fn tag_list_and_dkim_survive_arbitrary_bytes(input in arbitrary_bytes()) {
             assert_offsets_within(parse_tag_list(&input).issues(), input.len())?;
             assert_offsets_within(parse_dkim_signature(&input).issues(), input.len())?;
@@ -311,6 +346,16 @@ mod properties {
             let issues = parse_received_spf(&input).issues().to_vec();
             prop_assert_eq!(cap_issues(&issues, Cap::Entries), 1, "one Entries issue");
             assert_offsets_within(&issues, input.len())?;
+        }
+
+        #[test]
+        fn more_received_headers_than_the_hop_cap_are_reported_once(extra in 1_usize..64) {
+            let header: &[u8] = b"by mx.example.com; 3 Nov 2026 10:00:00 +0000";
+            let headers = vec![header; MAX_RECEIVED_HOPS.saturating_add(extra)];
+            let parsed = parse_received_hops(&headers, None);
+            let capped = cap_issues(parsed.issues(), Cap::ReceivedHops);
+            prop_assert_eq!(capped, 1, "one ReceivedHops issue");
+            prop_assert_eq!(parsed.value().hops().len(), MAX_RECEIVED_HOPS, "the rest is dropped");
         }
 
         #[test]
