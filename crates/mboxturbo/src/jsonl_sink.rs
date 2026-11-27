@@ -1,13 +1,15 @@
 //! The JSON Lines sink of the export driver.
 
 use arrow_array::cast::AsArray as _;
-use arrow_array::types::{Int32Type, TimestampMicrosecondType, UInt64Type};
+use arrow_array::types::{
+    Int8Type, Int32Type, Int64Type, TimestampMicrosecondType, UInt8Type, UInt32Type, UInt64Type,
+};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mail_parser::DateTime;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::error::MboxTurboError;
 use crate::export::Exporter;
@@ -20,9 +22,10 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 /// Writes one JSON object per selected message, one per line, to a file or stream.
 ///
 /// Each object is keyed by column name in selection column order. Text columns are strings,
-/// integer columns numbers, list columns arrays of the same, [`Column::Raw`](crate::Column::Raw)
-/// a standard base64 string, and the date column an RFC 3339 UTC string with fractional seconds
-/// only when non-zero. A missing value is `null`.
+/// integer columns numbers, boolean columns `true` or `false`, list columns arrays of the same,
+/// struct columns objects keyed by field name, [`Column::Raw`](crate::Column::Raw) a standard
+/// base64 string, and the date column an RFC 3339 UTC string with fractional seconds only when
+/// non-zero. A missing value is `null`.
 ///
 /// [`Exporter::begin`] refuses a schema holding a column type the sink cannot encode with an
 /// [`MboxTurboError::Arrow`] schema error naming the column.
@@ -75,7 +78,8 @@ impl Exporter for JsonlExporter {
     }
 }
 
-/// The JSON value of `array` at `row`: `null` for a missing value, an array for a list.
+/// The JSON value of `array` at `row`: `null` for a missing value, an array for a list, an
+/// object keyed by field name for a struct.
 ///
 /// # Errors
 ///
@@ -90,9 +94,26 @@ pub(crate) fn cell_value(array: &dyn Array, row: usize) -> Result<Value, MboxTur
     }
     match array.data_type() {
         DataType::List(_) => list_value(array, row),
+        DataType::Struct(_) => struct_value(array, row),
+        _ => scalar_value(array, row),
+    }
+}
+
+/// The JSON value of the non-nested `array` at `row`, which is not null.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Arrow has dozens of types and only the ones the columns produce are encoded"
+)]
+fn scalar_value(array: &dyn Array, row: usize) -> Result<Value, MboxTurboError> {
+    match array.data_type() {
         DataType::Utf8 => Ok(Value::from(array.as_string::<i32>().value(row))),
+        DataType::Boolean => Ok(Value::from(array.as_boolean().value(row))),
+        DataType::UInt8 => Ok(Value::from(array.as_primitive::<UInt8Type>().value(row))),
+        DataType::UInt32 => Ok(Value::from(array.as_primitive::<UInt32Type>().value(row))),
         DataType::UInt64 => Ok(Value::from(array.as_primitive::<UInt64Type>().value(row))),
+        DataType::Int8 => Ok(Value::from(array.as_primitive::<Int8Type>().value(row))),
         DataType::Int32 => Ok(Value::from(array.as_primitive::<Int32Type>().value(row))),
+        DataType::Int64 => Ok(Value::from(array.as_primitive::<Int64Type>().value(row))),
         DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Value::from(rfc3339_micros(
             array.as_primitive::<TimestampMicrosecondType>().value(row),
         ))),
@@ -104,6 +125,17 @@ pub(crate) fn cell_value(array: &dyn Array, row: usize) -> Result<Value, MboxTur
             source: ArrowError::SchemaError(format!("the {other} type cannot be encoded")),
         }),
     }
+}
+
+/// The JSON object of the struct at `row`, keyed by field name.
+fn struct_value(array: &dyn Array, row: usize) -> Result<Value, MboxTurboError> {
+    let fields = array.as_struct();
+    let mut object = Map::new();
+    for (name, column) in fields.column_names().into_iter().zip(fields.columns()) {
+        let value = cell_value(column.as_ref(), row)?;
+        drop(object.insert(name.to_owned(), value));
+    }
+    Ok(Value::Object(object))
 }
 
 /// `micros` since the epoch as an RFC 3339 UTC string, with fractional seconds only when
@@ -149,7 +181,7 @@ fn encode_row(buffer: &mut Vec<u8>, batch: &RecordBatch, row: usize) -> Result<(
     Ok(())
 }
 
-/// Whether `data_type` is one of the types the columns produce, or a list of one.
+/// Whether `data_type` is one of the types the columns produce, or a list or struct of them.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "Arrow has dozens of types and only the ones the columns produce are encoded"
@@ -157,8 +189,17 @@ fn encode_row(buffer: &mut Vec<u8>, batch: &RecordBatch, row: usize) -> Result<(
 fn is_encodable(data_type: &DataType) -> bool {
     match data_type {
         DataType::List(field) => is_encodable(field.data_type()),
+        DataType::Struct(fields) => fields.iter().all(|field| is_encodable(field.data_type())),
         DataType::Timestamp(unit, _) => *unit == TimeUnit::Microsecond,
-        DataType::Utf8 | DataType::UInt64 | DataType::Int32 | DataType::LargeBinary => true,
+        DataType::Utf8
+        | DataType::Boolean
+        | DataType::UInt8
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Int8
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::LargeBinary => true,
         _ => false,
     }
 }
@@ -181,8 +222,117 @@ fn write_json(buffer: &mut Vec<u8>, value: &Value, row: usize) -> Result<(), Mbo
 }
 
 #[cfg(test)]
-mod tests {
-    use super::rfc3339_micros;
+pub(crate) mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::builder::{
+        ArrayBuilder, BooleanBuilder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder,
+    };
+    use arrow_array::{ArrayRef, RecordBatch};
+    use arrow_schema::{DataType, Field, Fields, Schema};
+
+    use super::{encode_batch, is_encodable, rfc3339_micros};
+
+    /// One struct of the `sets` column.
+    struct Set {
+        count: Option<u32>,
+        flag: bool,
+        name: &'static str,
+        tags: &'static [&'static str],
+    }
+
+    /// Appends `set` to `item`.
+    fn append_set(item: &mut StructBuilder, set: &Set) {
+        let Set {
+            count,
+            flag,
+            name,
+            tags,
+        } = *set;
+        item.field_builder::<StringBuilder>(0)
+            .expect("field 0 is a string builder")
+            .append_value(name);
+        item.field_builder::<UInt32Builder>(1)
+            .expect("field 1 is an integer builder")
+            .append_option(count);
+        item.field_builder::<BooleanBuilder>(2)
+            .expect("field 2 is a boolean builder")
+            .append_value(flag);
+        let list = item
+            .field_builder::<ListBuilder<StringBuilder>>(3)
+            .expect("field 3 is a list builder");
+        for tag in tags {
+            list.values().append_value(tag);
+        }
+        list.append(true);
+        item.append(true);
+    }
+
+    /// An empty builder of the `sets` structs.
+    fn set_builder() -> StructBuilder {
+        let tags_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let fields = Fields::from(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("count", DataType::UInt32, true),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("tags", tags_type, true),
+        ]);
+        let builders: Vec<Box<dyn ArrayBuilder>> = vec![
+            Box::new(StringBuilder::new()),
+            Box::new(UInt32Builder::new()),
+            Box::new(BooleanBuilder::new()),
+            Box::new(ListBuilder::new(StringBuilder::new())),
+        ];
+        StructBuilder::new(fields, builders)
+    }
+
+    /// A `List<Struct>` array of one row holding two structs, the second with a null `count`
+    /// and an empty nested `tags` list.
+    pub(crate) fn sets_column() -> ArrayRef {
+        let mut sets = ListBuilder::new(set_builder());
+        append_set(
+            sets.values(),
+            &Set {
+                name: "spf",
+                count: Some(1),
+                flag: true,
+                tags: &["a", "b"],
+            },
+        );
+        append_set(
+            sets.values(),
+            &Set {
+                name: "dkim",
+                count: None,
+                flag: false,
+                tags: &[],
+            },
+        );
+        sets.append(true);
+        Arc::new(sets.finish())
+    }
+
+    #[test]
+    fn a_list_of_structs_is_an_array_of_objects_with_null_fields_and_nested_lists() {
+        let column = sets_column();
+        let schema = Schema::new(vec![Field::new("sets", column.data_type().clone(), true)]);
+        assert!(
+            is_encodable(column.data_type()),
+            "a list of structs of encodable fields is accepted"
+        );
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![column])
+            .expect("the batch matches its schema");
+        let encoded = encode_batch(&batch).expect("the batch encodes");
+        assert_eq!(
+            String::from_utf8(encoded).expect("the line is UTF-8"),
+            concat!(
+                r#"{"sets":[{"count":1,"flag":true,"name":"spf","tags":["a","b"]},"#,
+                r#"{"count":null,"flag":false,"name":"dkim","tags":[]}]}"#,
+                "\n"
+            ),
+            "each struct is an object keyed by field name"
+        );
+    }
 
     #[test]
     fn fractional_seconds_appear_only_when_non_zero_without_trailing_zeros() {

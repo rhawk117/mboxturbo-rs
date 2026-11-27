@@ -2,7 +2,7 @@
 
 `mboxturbo` exports large mbox files to analysis-friendly formats from the command line. It has three subcommands: `export`, `info` and `show`.
 
-All example output on this page comes from the built binary or from a test named in the comment beside it. The examples use a four-message mailbox called `mail.mbox` with no `Date:` headers.
+All example output on this page comes from the built binary or from a test named in the comment beside it. The examples use a four-message mailbox called `mail.mbox`. Unless an example says otherwise, none of its messages has a `Date:` header.
 
 ## Install
 
@@ -19,6 +19,8 @@ To build the binary from a checkout instead:
 ```sh
 cargo install --path crates/mboxturbo-cli
 ```
+
+<!-- Source: crates/mboxturbo-cli/Cargo.toml (the mboxturbo bin target), installed from a checkout by cargo install --path. -->
 
 To find the binary from Python, call `mboxturbo.find_mboxturbo_bin()`. It searches the interpreter's scripts directory, the user scripts directory and the scripts directory beside the package. It does not read `PATH`. When nothing is found it raises `mboxturbo.MboxTurboBinNotFoundError`, a `FileNotFoundError` that also derives from `MboxTurboError`.
 
@@ -79,6 +81,10 @@ mboxturbo export [OPTIONS] --format <FORMAT> --output <OUT> <MAILBOX>
 | `--columns <NAME,...>` | Columns to write, comma-separated. `header:<Name>` selects any header. Default: every column that needs no body parsing. |
 | `--select <SPEC>` | Messages to export. Repeatable. Default: every message. |
 | `--select-file <FILE>` | A file of selections, one spec per line. Blank lines are ignored. |
+| `--since <WHEN>` | Keep only messages dated at or after `WHEN`. See [Date bounds](#date-bounds). |
+| `--until <WHEN>` | Keep only messages dated before `WHEN`. See [Date bounds](#date-bounds). |
+| `--where <JSON>` | Keep only messages matching a predicate in its JSON form. See [Predicates](#predicates). |
+| `--where-file <PATH>` | A file holding the predicate, as for `--where`. Conflicts with `--where`. |
 | `--index <PATH>` | Keep the message index in this file instead of beside the mailbox. |
 | `--overwrite` | Replace the output if it already exists. Without it an existing output is refused with exit 73 and left unchanged. |
 
@@ -182,14 +188,53 @@ exported 2 messages, 63 bytes to - in 0.0s
 
 <!-- Source: ran the built binary; crates/mboxturbo-cli/tests/export.rs (select_ranges_and_positions_are_united_without_duplicates, select_file_lines_are_specs_and_blank_lines_are_ignored, select_and_select_file_are_united). -->
 
+## Date bounds
+
+`--since` keeps messages dated at or after a moment and `--until` keeps messages dated before it, so `--since` is inclusive and `--until` is exclusive. Either may be given alone. Each takes a date `YYYY-MM-DD`, which is midnight UTC, or an RFC 3339 timestamp such as `2024-01-04T12:00:00+02:00`. An offset is compared as the instant it names. A fraction of a second rounds the bound up to the next whole second. A value that is neither exits 64 and names the flag and value.
+
+The bounds read the date in the index, so they do not parse the messages. A message with no `Date:` header, or one that does not parse, has no date and is excluded whenever a bound is given. The bounds intersect with `--select` and `--where`.
+
+The summary line on standard error ends with the count of excluded undated messages, and the `summary` event carries it as `excluded_undated`. Neither appears when no bound is given.
+
+```console
+$ mboxturbo export mail.mbox --format jsonl --since 2024-01-01 --columns position -o -
+exported 0 messages, 0 bytes to - in 0.0s (4 undated excluded)
+```
+
+<!-- Source: ran the built binary on an undated mailbox; crates/mboxturbo-cli/tests/dates.rs (since_is_inclusive_to_the_second_and_until_exclusive, a_plain_date_is_midnight_utc, the_summary_line_says_how_many_undated_messages_were_excluded, the_summary_event_counts_the_undated_messages_a_bound_excluded). -->
+
+A signal that arrives during the `--since`, `--until` or `--where` scan, before the export starts, ends the process by the signal's default action. No `--json` `error` event is written and nothing is written to the target. The [Signals](#signals) handling starts only once the export does.
+
+<!-- Source: crates/mboxturbo-cli/src/signals.rs and the T21 finding FC-2 on the scan that runs before the export starts. -->
+
+## Predicates
+
+`--where` takes a predicate in its JSON form: an object with an `op`, such as `contains` or `equals` on a `header`, and the combinators `and` and `or`, whose `args` must not be empty. `--where-file` reads the same JSON from a file, and the two flags conflict. A predicate that is not JSON or is not valid exits 64 and names the operator at fault. A `--where-file` that cannot be read exits 74 and names the file.
+
+```console
+$ mboxturbo export mail.mbox --format jsonl --columns position,subject \
+    --where '{"op":"contains","header":"subject","value":"o"}' -o -
+```
+
+This keeps the messages whose subject contains an `o`. A predicate intersects with `--select`, `--since` and `--until`. It matches the same messages as the Python package's `header('subject').contains('o')`.
+
+```console
+$ mboxturbo export mail.mbox --format jsonl --where '{"op":"and","args":[]}' -o -
+mboxturbo: invalid predicate at `and`: an `and` or `or` needs at least one argument
+$ echo $?
+64
+```
+
+<!-- Source: crates/mboxturbo-cli/tests/predicates.rs (a_header_predicate_keeps_the_matching_messages_as_the_python_select_does, a_predicate_intersects_with_select_and_since_as_the_python_select_does, an_invalid_predicate_exits_64_with_an_error_event, an_unreadable_where_file_exits_74_naming_it); the invalid predicate output is from the built binary. -->
+
 ## Formats and columns
 
 | Format | Encoding | Columns | Standard output |
 |--------|----------|---------|-----------------|
 | `arrow` | Arrow IPC stream: a schema message, one record batch per exported batch, an end marker. | `--columns` or the defaults | yes |
-| `csv` | RFC 4180, header row, CRLF line ends. List columns are one JSON-encoded cell. Dates are RFC 3339 UTC. A missing value is an empty cell. Text cells that look like formulas get a leading apostrophe. | `--columns` or the defaults | yes |
+| `csv` | RFC 4180, header row, CRLF line ends. List and struct columns are one compact JSON-encoded cell. Dates are RFC 3339 UTC. A missing value is an empty cell. Text cells that look like formulas get a leading apostrophe. | `--columns` or the defaults | yes |
 | `eml` | One `.eml` file per message in a directory, named by zero-padded position, plus `manifest.jsonl`. The file holds the stored bytes without the `From ` line, with mboxrd quoting removed. | fixed | no |
-| `jsonl` | One JSON object per line, keyed by column name. Raw bytes are base64. Dates are RFC 3339 UTC. A missing value is `null`. | `--columns` or the defaults | yes |
+| `jsonl` | One JSON object per line, keyed by column name. Structs are JSON objects. Raw bytes are base64. Dates are RFC 3339 UTC. A missing value is `null`. | `--columns` or the defaults | yes |
 | `mbox` | The selected messages' stored bytes, `From ` line included, so the output is a mailbox. | fixed | yes |
 | `parquet` | One Parquet file with the Arrow schema embedded. | `--columns` or the defaults | no |
 
@@ -208,11 +253,36 @@ mboxturbo: --columns cannot be used with Eml, which writes whole messages
 
 ### Column names
 
-`position`, `offset`, `size`, `raw`, `from`, `to`, `cc`, `reply_to`, `subject`, `date`, `date_offset_minutes`, `message_id`, `received`, `authentication_results`, `received_spf`, `dkim_signature`, `return_path`, `text`, `html`, `attachment_names`, `attachment_types`, `attachment_sizes`, `attachment_sha256`, and `header:<Name>` for any header.
+`position`, `offset`, `size`, `raw`, `from`, `to`, `cc`, `reply_to`, `subject`, `date`, `date_offset_minutes`, `message_id`, `received`, `authentication_results`, `received_spf`, `dkim_signature`, `return_path`, `text`, `html`, `attachment_names`, `attachment_types`, `attachment_sizes`, `attachment_sha256`, the structured columns below, and `header:<Name>` for any header.
 
 The defaults are every column that needs no body parsing, except `raw`, which is opt-in. `raw` can be written as `arrow`, `jsonl` and `parquet`, but the `csv` sink refuses it. An unknown column name exits 64 and names the column.
 
 <!-- Source: crates/mboxturbo/src/columns.rs (NAMED, defaults) and crates/mboxturbo/src/csv_sink.rs (is_encodable); crates/mboxturbo-cli/tests/export.rs (an_unknown_column_exits_64_naming_it). -->
+
+### Structured columns
+
+`auth_results`, `arc_sets`, `dkim_signatures`, `received_hops`, `received_spf_parsed` and `microsoft_antispam` parse a header family into structs. They are opt-in. `verdict_dmarc`, `verdict_spf`, `verdict_dkim` and `verdict_compauth` are opt-in text columns.
+
+In JSONL a struct is a JSON object keyed by field name, in alphabetical order, and a list of structs is an array of objects. A missing field is `null`, a boolean is `true` or `false`, and integers are numbers. A message without the header has an empty array, or for `received_hops` and `arc_sets` an object with an empty `hops` or `sets` array. In CSV the same value is one compact JSON text cell, quoted as CSV requires. A message with no value in a column has an empty cell.
+
+```console
+$ mboxturbo export mail.mbox --format jsonl --columns position,auth_results -o -
+{"position":0,"auth_results":[{"authserv_id":"mx.example.org","entries":[{"method":"dmarc","properties":[{"property":"from","ptype":"header","value":"example.org"}],"reason":null,"result":"pass"}],"issues":[],"trusted":null,"version":null}]}
+$ mboxturbo export mail.mbox --format csv --columns position,auth_results -o -
+position,auth_results
+0,"[{""authserv_id"":""mx.example.org"",""entries"":[{""method"":""dmarc"",""properties"":[{""property"":""from"",""ptype"":""header"",""value"":""example.org""}],""reason"":null,""result"":""pass""}],""issues"":[],""trusted"":null,""version"":null}]"
+```
+
+<!-- Source: ran the built binary on a message with one Authentication-Results header; crates/mboxturbo-cli/tests/structured.rs (jsonl_writes_the_structured_columns_as_objects, csv_writes_each_structured_column_as_one_json_cell) and the unit tests in crates/mboxturbo/src/jsonl_sink.rs and csv_sink.rs. -->
+
+The CLI takes no trust set in this version. `trusted` inside `auth_results` and `arc_sets`, `first_external` inside `received_hops`, and every `verdict_*` column are therefore null. To get verdicts, use the Python package and its `Trust`.
+
+```console
+$ mboxturbo export mail.mbox --format jsonl --columns position,verdict_dmarc -o -
+{"position":0,"verdict_dmarc":null}
+```
+
+<!-- Source: ran the built binary; crates/mboxturbo-cli/tests/structured.rs (verdict_columns_are_null_without_a_trust_set). -->
 
 ## Exit codes
 
@@ -220,7 +290,7 @@ The defaults are every column that needs no body parsing, except `raw`, which is
 |------|---------|
 | 0 | Success, including `--help` and `--version`. |
 | 1 | Any other failure. |
-| 64 | Usage error: bad arguments, or a message position past the last message. |
+| 64 | Usage error: bad arguments, a message position past the last message, or a `--where` or `--where-file` predicate that is not valid. |
 | 65 | Corrupt or stale index. |
 | 66 | The mailbox does not exist. |
 | 73 | The export target exists and `--overwrite` was not given. |

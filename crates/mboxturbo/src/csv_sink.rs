@@ -26,8 +26,8 @@ pub enum FormulaEscaping {
 ///
 /// The header holds the selected column names in selection order and every row ends in CRLF. A
 /// field holding a comma, double quote, CR or LF is quoted with its double quotes doubled. List
-/// columns are one JSON-encoded cell, the date column an RFC 3339 UTC string as in the JSONL
-/// sink, and a missing value an empty cell.
+/// and struct columns are one compact JSON-encoded cell as in the JSONL sink, the date column an
+/// RFC 3339 UTC string, and a missing value an empty cell.
 ///
 /// [`Exporter::begin`] refuses a schema holding a column type the sink cannot encode, such as
 /// [`Column::Raw`](crate::Column::Raw), with an [`MboxTurboError::Arrow`] schema error naming the
@@ -116,7 +116,7 @@ fn escape_formula(text: String, escaping: FormulaEscaping) -> String {
     }
 }
 
-/// Whether `data_type` is one of the types the sink writes, or a list of one.
+/// Whether `data_type` is one of the types the sink writes, or a list or struct of them.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "Arrow has dozens of types and only the ones the columns produce are encoded"
@@ -124,8 +124,16 @@ fn escape_formula(text: String, escaping: FormulaEscaping) -> String {
 fn is_encodable(data_type: &DataType) -> bool {
     match data_type {
         DataType::List(field) => is_encodable(field.data_type()),
+        DataType::Struct(fields) => fields.iter().all(|field| is_encodable(field.data_type())),
         DataType::Timestamp(unit, _) => *unit == TimeUnit::Microsecond,
-        DataType::Utf8 | DataType::UInt64 | DataType::Int32 => true,
+        DataType::Boolean
+        | DataType::UInt8
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Int8
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Utf8 => true,
         _ => false,
     }
 }
@@ -154,4 +162,27 @@ fn write_bytes(staged: &mut Staged, bytes: &[u8]) -> Result<u64, MboxTurboError>
     let written = destination.write_all(bytes);
     written.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
     Ok(widen(bytes.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FormulaEscaping, cell_text, is_encodable};
+    use crate::jsonl_sink::tests::sets_column;
+
+    #[test]
+    fn a_list_of_structs_is_one_compact_json_cell() {
+        let column = sets_column();
+        assert!(
+            is_encodable(column.data_type()),
+            "a list of structs of encodable fields is accepted"
+        );
+        assert_eq!(
+            cell_text(column.as_ref(), 0, FormulaEscaping::Prefix).expect("the cell encodes"),
+            concat!(
+                r#"[{"count":1,"flag":true,"name":"spf","tags":["a","b"]},"#,
+                r#"{"count":null,"flag":false,"name":"dkim","tags":[]}]"#
+            ),
+            "the cell is the JSONL value as compact text"
+        );
+    }
 }
