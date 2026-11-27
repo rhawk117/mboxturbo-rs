@@ -17,9 +17,9 @@ use pyo3::prelude::*;
 #[pymodule]
 mod _core {
     #[pymodule_export]
-    use super::errors::{CorruptIndexError, MboxTurboError, StaleIndexError};
+    use super::errors::{Cancelled, CorruptIndexError, MboxTurboError, StaleIndexError};
     #[pymodule_export]
-    use super::export::Selection;
+    use super::export::{CancelToken, Selection};
     #[pymodule_export]
     use super::mailbox::Mailbox;
     #[pymodule_export]

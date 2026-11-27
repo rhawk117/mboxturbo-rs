@@ -3,6 +3,8 @@
 from mboxturbo._core import (
     Address,
     Attachment,
+    Cancelled,
+    CancelToken,
     CorruptIndexError,
     HeaderBuilder,
     Mailbox,
@@ -20,6 +22,8 @@ from mboxturbo._core import (
 __all__ = [
     'Address',
     'Attachment',
+    'CancelToken',
+    'Cancelled',
     'CorruptIndexError',
     'HeaderBuilder',
     'Mailbox',

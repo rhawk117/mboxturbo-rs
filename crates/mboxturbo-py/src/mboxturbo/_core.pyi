@@ -1,4 +1,4 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from email.message import EmailMessage
 from os import PathLike
@@ -11,6 +11,14 @@ type Compression = Literal['zstd', 'snappy', 'none']
 class MboxTurboError(Exception): ...
 class CorruptIndexError(MboxTurboError): ...
 class StaleIndexError(MboxTurboError): ...
+class Cancelled(MboxTurboError): ...  # noqa: N818
+
+@final
+class CancelToken:
+    def __init__(self) -> None: ...
+    def cancel(self) -> None: ...
+    @property
+    def is_cancelled(self) -> bool: ...
 
 @final
 class Address:
@@ -110,6 +118,8 @@ class Selection:
         *,
         compression: Compression = 'zstd',
         overwrite: bool = False,
+        progress: Callable[[int, int], object] | None = None,
+        cancel: CancelToken | None = None,
     ) -> int: ...
 
 @final

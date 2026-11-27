@@ -7,13 +7,18 @@
               signature in this module has that many"
 )]
 
+use std::panic::resume_unwind;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+use std::time::Duration;
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use mboxturbo::{
-    Column, Compression, Destination, Export, Filter, MboxTurboError, Overwrite, ParquetExporter,
-    Pipeline,
+    Column, Compression, Destination, Export, ExportSummary, Exporter, Filter, MboxTurboError,
+    Overwrite, ParquetExporter, Pipeline, Progress,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -21,6 +26,40 @@ use pyo3::types::{PyCapsule, PyDateTime, PyDelta, PyDeltaAccess as _, PyTzInfo};
 
 use crate::errors::into_py_err;
 use crate::predicates::{Predicate, Trust};
+
+/// The longest the calling thread waits for an export before it checks for signals.
+const SIGNAL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How an export on the worker thread ended.
+type Stopped = Result<ExportSummary, Box<MboxTurboError>>;
+
+/// Stops a running export from another thread; share one between exports to stop them together.
+#[pyclass(frozen, module = "mboxturbo", name = "CancelToken")]
+#[derive(Debug, Default)]
+pub(crate) struct CancelToken {
+    /// The core token every export given this one watches.
+    inner: mboxturbo::CancelToken,
+}
+
+#[pymethods]
+impl CancelToken {
+    /// Stops every export given this token after its current batch.
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    /// Whether ``cancel`` has been called.
+    #[getter]
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    /// A token that has not been cancelled.
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// The narrowing a ``select`` call asks for, converted from its Python arguments.
 #[derive(Debug)]
@@ -191,8 +230,12 @@ impl Selection {
 
     /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
     /// An existing file raises ``FileExistsError`` and is left untouched unless ``overwrite`` is
-    /// true. The GIL is released while exporting.
-    #[pyo3(signature = (path, *, compression = "zstd", overwrite = false))]
+    /// true. The GIL is released while exporting. ``progress(done, total)`` runs after each
+    /// written batch. Ctrl-C, ``cancel``, or a ``progress`` that raises stops the export, leaves
+    /// no file and raises ``Cancelled`` caused by the interrupt or the callback's exception.
+    #[pyo3(signature = (
+        path, *, compression = "zstd", overwrite = false, progress = None, cancel = None
+    ))]
     #[expect(
         clippy::fn_params_excessive_bools,
         reason = "Python's `overwrite=` keyword is a bool by the requested interface"
@@ -203,6 +246,8 @@ impl Selection {
         path: PathBuf,
         compression: &str,
         overwrite: bool,
+        progress: Option<Py<PyAny>>,
+        cancel: Option<&CancelToken>,
     ) -> PyResult<u64> {
         let policy = if overwrite {
             Overwrite::Replace
@@ -218,10 +263,100 @@ impl Selection {
         )
         .overwrite(policy)
         .selection(self.rows.clone());
-        py.detach(move || export.run(Box::new(sink)).map_err(Box::new))
-            .map(|summary| summary.messages)
-            .map_err(|error| into_py_err(py, *error))
+        run_export(py, export, Box::new(sink), progress, cancel).map(|summary| summary.messages)
     }
+}
+
+/// Runs `export` through `sink` on a worker thread with the interpreter released, while this
+/// thread checks for signals. `progress(done, total)` runs after each batch. An interrupt, a
+/// raising callback or a cancelled `cancel` stops the export through the core token, and the
+/// stopped export raises `Cancelled` caused by the interrupt or the callback's exception.
+pub(crate) fn run_export(
+    py: Python<'_>,
+    export: Export,
+    sink: Box<dyn Exporter>,
+    progress: Option<Py<PyAny>>,
+    cancel: Option<&CancelToken>,
+) -> PyResult<ExportSummary> {
+    let token = cancel.map_or_else(mboxturbo::CancelToken::new, |wrapped| wrapped.inner.clone());
+    let (raised_sender, raised) = mpsc::channel::<PyErr>();
+    let watched = export.cancel_token(token.clone());
+    let armed = match progress {
+        Some(callback) => {
+            let stop = token.clone();
+            watched.on_progress(move |report| {
+                report_progress(&callback, &stop, &raised_sender, report);
+            })
+        },
+        None => watched,
+    };
+    let (result, interrupt) = run_on_worker(py, armed, sink, &token);
+    match (result, raised.try_iter().next().or(interrupt)) {
+        (Ok(summary), None) => Ok(summary),
+        (Ok(_finished_first), Some(cause)) => Err(cause),
+        (Err(error), cause) => {
+            let stopped = into_py_err(py, *error);
+            stopped.set_cause(py, cause);
+            Err(stopped)
+        },
+    }
+}
+
+/// Runs `export` on a worker thread while the calling thread, with the interpreter released,
+/// checks for signals every `SIGNAL_INTERVAL`; a signal that raises cancels `token` and is
+/// returned beside the export's result once the worker has stopped.
+fn run_on_worker(
+    py: Python<'_>,
+    export: Export,
+    sink: Box<dyn Exporter>,
+    token: &mboxturbo::CancelToken,
+) -> (Stopped, Option<PyErr>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let caller = thread::current();
+    let worker = thread::spawn({
+        let flag = Arc::clone(&done);
+        move || {
+            let result = export.run(sink).map_err(Box::new);
+            flag.store(true, Ordering::Release);
+            caller.unpark();
+            result
+        }
+    });
+    let mut interrupt = None;
+    while !done.load(Ordering::Acquire) {
+        py.detach(|| thread::park_timeout(SIGNAL_INTERVAL));
+        if interrupt.is_none()
+            && let Err(signal) = py.check_signals()
+        {
+            token.cancel();
+            interrupt = Some(signal);
+        }
+    }
+    let result = py
+        .detach(move || worker.join())
+        .unwrap_or_else(|payload| resume_unwind(payload));
+    (result, interrupt)
+}
+
+/// Calls `callback(done, total)` with the GIL held; an exception cancels the export through
+/// `token` and is passed to `raised` to become the cause of `Cancelled`.
+fn report_progress(
+    callback: &Py<PyAny>,
+    token: &mboxturbo::CancelToken,
+    raised: &Sender<PyErr>,
+    report: Progress,
+) {
+    if token.is_cancelled() {
+        return;
+    }
+    Python::attach(|py| {
+        if let Err(error) = callback.call1(py, (report.messages, report.total)) {
+            token.cancel();
+            if let Err(lost) = raised.send(error) {
+                lost.0.write_unraisable(py, None);
+            }
+        }
+    });
 }
 
 /// A selection over the rows `filters` keep in `mailbox`, with the interpreter released while
