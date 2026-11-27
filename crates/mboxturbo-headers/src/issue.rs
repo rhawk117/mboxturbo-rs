@@ -106,6 +106,33 @@ pub enum IssueKind {
     WidenedYear,
 }
 
+impl IssueKind {
+    /// A stable `snake_case` name for the kind, which is what exported data carries.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ArcInstance { .. } => "arc_instance",
+            Self::AssumedZone => "assumed_zone",
+            Self::CapExceeded { .. } => "cap_exceeded",
+            Self::InvalidEncoding => "invalid_encoding",
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::MalformedBytes => "malformed_bytes",
+            Self::MalformedEntry => "malformed_entry",
+            Self::MissingTag { .. } => "missing_tag",
+            Self::NegativeDelay => "negative_delay",
+            Self::OutOfRange => "out_of_range",
+            Self::RepeatedTag => "repeated_tag",
+            Self::TrailingText => "trailing_text",
+            Self::UnknownCharset => "unknown_charset",
+            Self::UnparsableDate => "unparsable_date",
+            Self::UnterminatedComment => "unterminated_comment",
+            Self::UnterminatedQuote => "unterminated_quote",
+            Self::WeekdayMismatch => "weekday_mismatch",
+            Self::WidenedYear => "widened_year",
+        }
+    }
+}
+
 /// One problem found while parsing, located by byte offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Issue {
@@ -175,8 +202,9 @@ impl<T> Parsed<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Issue, IssueKind, Parsed};
+    use super::{ArcPart, ArcProblem, Issue, IssueKind, Parsed};
     use crate::caps::Cap;
+    use crate::dkim::RequiredTag;
 
     #[test]
     fn a_parsed_value_reads_back_its_value_and_each_issue_kind_and_offset() {
@@ -199,5 +227,49 @@ mod tests {
             ],
             "kinds and offsets come back in order",
         );
+    }
+
+    /// One value of every kind, so a new kind needs adding here to be covered.
+    fn every_kind() -> [IssueKind; 18] {
+        [
+            IssueKind::ArcInstance {
+                instance: 1,
+                problem: ArcProblem::DuplicatePart {
+                    part: ArcPart::Seal,
+                },
+            },
+            IssueKind::AssumedZone,
+            IssueKind::CapExceeded { cap: Cap::Entries },
+            IssueKind::InvalidEncoding,
+            IssueKind::InvalidUtf8,
+            IssueKind::MalformedBytes,
+            IssueKind::MalformedEntry,
+            IssueKind::MissingTag {
+                tag: RequiredTag::Domain,
+            },
+            IssueKind::NegativeDelay,
+            IssueKind::OutOfRange,
+            IssueKind::RepeatedTag,
+            IssueKind::TrailingText,
+            IssueKind::UnknownCharset,
+            IssueKind::UnparsableDate,
+            IssueKind::UnterminatedComment,
+            IssueKind::UnterminatedQuote,
+            IssueKind::WeekdayMismatch,
+            IssueKind::WidenedYear,
+        ]
+    }
+
+    #[test]
+    fn every_issue_kind_has_a_distinct_name_other_than_unknown() {
+        let kinds = every_kind();
+        let mut names: Vec<_> = kinds.into_iter().map(IssueKind::name).collect();
+        assert!(
+            !names.contains(&"unknown"),
+            "no kind is named unknown: {names:?}"
+        );
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), kinds.len(), "every kind has its own name");
     }
 }

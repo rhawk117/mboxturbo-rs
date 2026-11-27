@@ -100,6 +100,24 @@ impl<'src> AuthMethod<'src> {
             .find(|(known, _)| known.eq_ignore_ascii_case(&name))
             .map_or(Self::Other(name), |(_, method)| method.clone())
     }
+
+    /// The method name as written in the header: lowercase for a method with a variant of its
+    /// own, verbatim for any other.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Arc => "arc",
+            Self::Auth => "auth",
+            Self::CompAuth => "compauth",
+            Self::Dkim => "dkim",
+            Self::Dmarc => "dmarc",
+            Self::DomainKeys => "domainkeys",
+            Self::Iprev => "iprev",
+            Self::Other(name) => name,
+            Self::SenderId => "sender-id",
+            Self::Spf => "spf",
+        }
+    }
 }
 
 impl<'src> AuthResult<'src> {
@@ -109,6 +127,24 @@ impl<'src> AuthResult<'src> {
             .iter()
             .find(|(known, _)| known.eq_ignore_ascii_case(&name))
             .map_or(Self::Other(name), |(_, result)| result.clone())
+    }
+
+    /// The result word as written in the header: lowercase for a result with a variant of its
+    /// own (`hardfail` reads `fail`), verbatim for any other.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Fail => "fail",
+            Self::Neutral => "neutral",
+            Self::NoResult => "none",
+            Self::Other(name) => name,
+            Self::Pass => "pass",
+            Self::PermError => "permerror",
+            Self::Policy => "policy",
+            Self::SoftFail => "softfail",
+            Self::TempError => "temperror",
+            Self::Unknown => "unknown",
+        }
     }
 }
 
@@ -549,7 +585,7 @@ mod tests {
     use std::iter::repeat_n;
 
     use super::{
-        AuthMethod, AuthResult, AuthenticationResults, ResInfo, TrustStatus,
+        AuthMethod, AuthResult, AuthenticationResults, METHODS, RESULTS, ResInfo, TrustStatus,
         parse_authentication_results,
     };
     use crate::caps::{Cap, MAX_ENTRIES};
@@ -838,6 +874,31 @@ mod tests {
         assert!(
             !parsed.issues().is_empty(),
             "the missing results are reported"
+        );
+    }
+
+    #[test]
+    fn every_method_and_result_with_a_variant_names_itself_as_the_table_spells_it() {
+        for (word, method) in &METHODS {
+            assert_eq!(method.name(), *word, "method {word} names itself");
+        }
+        for (word, result) in RESULTS.iter().filter(|(word, _)| *word != "hardfail") {
+            assert_eq!(result.name(), *word, "result {word} names itself");
+        }
+        assert_eq!(AuthResult::Fail.name(), "fail", "hardfail reads fail");
+    }
+
+    #[test]
+    fn a_method_or_result_without_a_variant_names_itself_as_written() {
+        assert_eq!(
+            AuthMethod::Other(Cow::Borrowed("x-custom")).name(),
+            "x-custom",
+            "method kept verbatim"
+        );
+        assert_eq!(
+            AuthResult::Other(Cow::Borrowed("bestguesspass")).name(),
+            "bestguesspass",
+            "result kept verbatim"
         );
     }
 }

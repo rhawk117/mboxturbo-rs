@@ -37,6 +37,7 @@ mod selection;
 mod staging;
 mod stream;
 mod structured;
+mod verdict;
 mod width;
 
 pub use builder::{IndexPolicy, IndexSource, MailboxBuilder};

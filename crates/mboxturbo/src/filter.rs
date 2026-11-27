@@ -12,17 +12,11 @@ use crate::error::{MboxTurboError, PredicateFault};
 use crate::fields::{raw_headers, unfold};
 use crate::mailbox::Mailbox;
 use crate::predicates::Predicate;
-use crate::structured::verdict_is;
+use crate::verdict::{AUTHENTICATION_RESULTS, RECEIVED, verdict_is};
 use crate::width::widen;
 
 /// The compiled-program size a pattern may reach, in bytes.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
-
-/// The header whose results a verdict reads.
-const AUTHENTICATION_RESULTS: &str = "authentication-results";
-
-/// The header that places an id-less `Authentication-Results` relative to the first external hop.
-const RECEIVED: &str = "received";
 
 /// A header name and its raw value, as [`raw_headers`] yields them.
 type Header<'bytes> = (&'bytes [u8], &'bytes [u8]);

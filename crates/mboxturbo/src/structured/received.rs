@@ -10,7 +10,7 @@ use arrow_array::builder::{
 use arrow_array::{Array as _, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, DataType, Fields, TimeUnit};
 use mboxturbo_headers::{
-    Hop, MsAntispam, ReceivedSpf, SpfResult, Tls, TrustSet, parse_ms_antispam, parse_received_hops,
+    Hop, MsAntispam, ReceivedSpf, Tls, TrustSet, parse_ms_antispam, parse_received_hops,
     parse_received_spf,
 };
 
@@ -370,7 +370,7 @@ impl ReceivedSpfColumn {
 
     /// Appends the row for `spf`, without its issues.
     fn push_header(&mut self, spf: &ReceivedSpf<'_>) {
-        self.result.append_value(spf_result_name(&spf.result()));
+        self.result.append_value(spf.result().name());
         self.client_ip
             .append_option(spf.client_ip().map(|ip| ip.to_string()));
         self.comment.append_option(spf.comment());
@@ -579,21 +579,6 @@ fn received_spf_fields() -> Fields {
 /// The Arrow type of the `received_spf_parsed` column.
 pub(crate) fn received_spf_parsed_type() -> DataType {
     list_of_structs(received_spf_fields())
-}
-
-/// The verdict word as written in the header, lowercase for the known results.
-fn spf_result_name<'result>(result: &'result SpfResult<'_>) -> &'result str {
-    match result {
-        SpfResult::Fail => "fail",
-        SpfResult::Neutral => "neutral",
-        SpfResult::None => "none",
-        SpfResult::Other(name) => name,
-        SpfResult::Pass => "pass",
-        SpfResult::PermError => "permerror",
-        SpfResult::SoftFail => "softfail",
-        SpfResult::TempError => "temperror",
-        _ => "unknown",
-    }
 }
 
 /// The `{version, cipher}` struct of a hop's TLS details.

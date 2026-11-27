@@ -12,9 +12,9 @@ use arrow_array::builder::{
 use arrow_array::{Array as _, ArrayRef, ListArray, StructArray};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields};
 use mboxturbo_headers::{
-    ArcHeader, ArcSet, AuthMethod, AuthResult, AuthenticationResults, ChainValidation,
-    DkimSignature, Issue, IssueKind, ResInfo, Tag, TagList, TrustSet, TrustStatus, parse_arc_sets,
-    parse_authentication_results, parse_dkim_signature, parse_received_hops,
+    ArcHeader, ArcSet, AuthMethod, AuthenticationResults, ChainValidation, DkimSignature, Issue,
+    RequiredTag, ResInfo, Tag, TagList, TrustSet, TrustStatus, parse_arc_sets,
+    parse_dkim_signature,
 };
 pub(crate) use received::{
     MicrosoftAntispamColumn, ReceivedHopsColumn, ReceivedSpfColumn, microsoft_antispam_type,
@@ -22,6 +22,7 @@ pub(crate) use received::{
 };
 
 use crate::fields::Mail;
+use crate::verdict::{decide_results, trusted_entry};
 use crate::width::widen;
 
 /// The `ARC-Authentication-Results` header name, lowercase.
@@ -33,14 +34,16 @@ const ARC_MESSAGE_SIGNATURE: &str = "arc-message-signature";
 /// The `ARC-Seal` header name, lowercase.
 const ARC_SEAL: &str = "arc-seal";
 
-/// The `Authentication-Results` header name, lowercase.
-const AUTHENTICATION_RESULTS: &str = "authentication-results";
-
-/// The `Received` header name, lowercase.
-const RECEIVED: &str = "received";
-
 /// The tags of a DKIM signature that have a column of their own, so `tags` leaves them out.
-const DKIM_NAMED_TAGS: [&str; 7] = ["v", "a", "bh", "d", "h", "s", "b"];
+const DKIM_NAMED_TAGS: [RequiredTag; 7] = [
+    RequiredTag::Version,
+    RequiredTag::Algorithm,
+    RequiredTag::BodyHash,
+    RequiredTag::Domain,
+    RequiredTag::Headers,
+    RequiredTag::Selector,
+    RequiredTag::Signature,
+];
 
 /// The `DKIM-Signature` header name, lowercase.
 const DKIM_SIGNATURE: &str = "dkim-signature";
@@ -118,7 +121,7 @@ impl IssueLists {
     fn push<'issue>(&mut self, issues: impl Iterator<Item = &'issue Issue>) {
         let mut len = 0_usize;
         for issue in issues {
-            self.kind.append_value(issue_kind_name(issue.kind()));
+            self.kind.append_value(issue.kind().name());
             self.offset.append_value(widen(issue.offset()));
             len = len.saturating_add(1);
         }
@@ -293,8 +296,8 @@ impl EntryLists {
     /// Appends one list holding `entries`.
     fn push(&mut self, entries: &[ResInfo<'_>]) {
         for entry in entries {
-            self.method.append_value(method_name(entry.method()));
-            self.result.append_value(result_name(entry.result()));
+            self.method.append_value(entry.method().name());
+            self.result.append_value(entry.result().name());
             self.reason.append_option(entry.reason());
             self.properties.push(entry);
         }
@@ -396,8 +399,8 @@ impl AuthResultsColumn {
             decide_results(mail_headers(parsed), trust)
         });
         for header in &decided {
-            self.results.push(&header.results, header.status);
-            self.issues.push(header.issues.iter());
+            self.results.push(header.results(), header.status());
+            self.issues.push(header.issues().iter());
         }
         self.shape.push_list(decided.len());
     }
@@ -604,23 +607,13 @@ impl DkimSignaturesColumn {
             .values()
             .extend(signature.signed_headers().map(Some));
         self.signed_headers.append(true);
-        let others = signature
-            .tags()
-            .tags()
-            .iter()
-            .filter(|tag| !DKIM_NAMED_TAGS.contains(&tag.name()));
+        let others = signature.tags().tags().iter().filter(|tag| {
+            DKIM_NAMED_TAGS
+                .iter()
+                .all(|named| named.name() != tag.name())
+        });
         self.tags.push(others);
     }
-}
-
-/// One `Authentication-Results` header with the trust its authserv-id and position earn.
-struct DecidedResults<'mail> {
-    /// The issues the parse reported.
-    issues: Vec<Issue>,
-    /// The parsed header.
-    results: AuthenticationResults<'mail>,
-    /// Whether the header is trusted, from [`decide_status`].
-    status: TrustStatus,
 }
 
 /// Builder of one `verdict_*` column.
@@ -642,7 +635,7 @@ impl VerdictColumn {
         });
         let verdict = trusted_entry(&decided, &self.method);
         self.builder
-            .append_option(verdict.map(|entry| result_name(entry.result())));
+            .append_option(verdict.map(|entry| entry.result().name()));
     }
 
     /// The column built so far, resetting the builder.
@@ -727,94 +720,6 @@ fn chain_validation_name<'status>(status: &'status ChainValidation<'_>) -> &'sta
     }
 }
 
-/// Every `Authentication-Results` header of `mail` in header order, each with its trust.
-///
-/// The one place that decides trust for the `auth_results` flag and the verdict columns.
-fn decide_results<'bytes>(
-    headers: impl IntoIterator<Item = (&'bytes [u8], &'bytes [u8])>,
-    trust: Option<&TrustSet>,
-) -> Vec<DecidedResults<'bytes>> {
-    let mut received = Vec::new();
-    let mut parsed = Vec::new();
-    for (position, (name, value)) in headers.into_iter().enumerate() {
-        if name.eq_ignore_ascii_case(AUTHENTICATION_RESULTS.as_bytes()) {
-            let (results, issues) = parse_authentication_results(value, trust).into_parts();
-            parsed.push((position, results, issues));
-            continue;
-        }
-        if name.eq_ignore_ascii_case(RECEIVED.as_bytes()) {
-            received.push((position, value));
-        }
-    }
-    let any_idless = parsed
-        .iter()
-        .any(|(_, results, _)| results.authserv_id().is_empty());
-    let boundary = trust
-        .filter(|set| any_idless && set.trusts_idless_inside())
-        .and_then(|set| first_external_position(&received, set));
-    parsed
-        .into_iter()
-        .map(|(position, results, issues)| DecidedResults {
-            status: decide_status(&results, position, trust, boundary),
-            issues,
-            results,
-        })
-        .collect()
-}
-
-/// The first `method` entry of the topmost trusted header in `decided` that has one.
-fn trusted_entry<'decided, 'mail>(
-    decided: &'decided [DecidedResults<'mail>],
-    method: &AuthMethod<'_>,
-) -> Option<&'decided ResInfo<'mail>> {
-    decided
-        .iter()
-        .filter(|header| header.status == TrustStatus::Trusted)
-        .find_map(|header| {
-            header
-                .results
-                .entries()
-                .iter()
-                .find(|entry| entry.method() == method)
-        })
-}
-
-/// Whether the topmost trusted `Authentication-Results` entry for `method` among `headers`
-/// (name and raw value pairs, in order) reads `word`, as [`VerdictColumn`] would write it.
-///
-/// Only `Authentication-Results` and `Received` headers are read; other pairs are ignored.
-/// Without a trust set nothing is trusted, so the answer is `false`.
-pub(crate) fn verdict_is<'bytes>(
-    headers: impl IntoIterator<Item = (&'bytes [u8], &'bytes [u8])>,
-    method: &AuthMethod<'_>,
-    trust: Option<&TrustSet>,
-    word: &str,
-) -> bool {
-    let decided = decide_results(headers, trust);
-    trusted_entry(&decided, method).is_some_and(|entry| result_name(entry.result()) == word)
-}
-
-/// The trust of `results`, which sits at header `position`: by authserv-id as the parser says,
-/// except that an id-less header is trusted when the set opts in, a first external hop exists
-/// at header position `boundary` and the header sits above it.
-fn decide_status(
-    results: &AuthenticationResults<'_>,
-    position: usize,
-    trust: Option<&TrustSet>,
-    boundary: Option<usize>,
-) -> TrustStatus {
-    match trust {
-        Some(set) if results.authserv_id().is_empty() && set.trusts_idless_inside() => {
-            if boundary.is_some_and(|external| position < external) {
-                TrustStatus::Trusted
-            } else {
-                TrustStatus::Untrusted
-            }
-        },
-        _ => results.trust(),
-    }
-}
-
 /// The struct of one `dkim_signatures` element.
 fn dkim_fields() -> Fields {
     with_issues(&Fields::from(vec![
@@ -844,17 +749,6 @@ fn field(name: &str, data_type: DataType) -> Field {
     Field::new(name, data_type, true)
 }
 
-/// The header position of the `Received` header of the first external hop, when there is one.
-/// `received` holds the position and raw value of every `Received` header in header order.
-fn first_external_position(received: &[(usize, &[u8])], trust: &TrustSet) -> Option<usize> {
-    let values: Vec<&[u8]> = received.iter().map(|&(_, value)| value).collect();
-    let (chain, _issues) = parse_received_hops(&values, Some(trust)).into_parts();
-    let hop = chain.hops().get(chain.first_external()?)?;
-    received
-        .get(hop.header_index())
-        .map(|&(position, _)| position)
-}
-
 /// The `{kind, offset}` struct of one issue.
 fn issue_fields() -> Fields {
     Fields::from(vec![
@@ -863,54 +757,9 @@ fn issue_fields() -> Fields {
     ])
 }
 
-/// A stable `snake_case` name for each kind of issue.
-///
-/// A kind added to the headers crate after this was written reads `unknown` until someone gives
-/// it a name in this function.
-const fn issue_kind_name(kind: IssueKind) -> &'static str {
-    match kind {
-        IssueKind::ArcInstance { .. } => "arc_instance",
-        IssueKind::AssumedZone => "assumed_zone",
-        IssueKind::CapExceeded { .. } => "cap_exceeded",
-        IssueKind::InvalidEncoding => "invalid_encoding",
-        IssueKind::InvalidUtf8 => "invalid_utf8",
-        IssueKind::MalformedBytes => "malformed_bytes",
-        IssueKind::MalformedEntry => "malformed_entry",
-        IssueKind::MissingTag { .. } => "missing_tag",
-        IssueKind::NegativeDelay => "negative_delay",
-        IssueKind::OutOfRange => "out_of_range",
-        IssueKind::RepeatedTag => "repeated_tag",
-        IssueKind::TrailingText => "trailing_text",
-        IssueKind::UnknownCharset => "unknown_charset",
-        IssueKind::UnparsableDate => "unparsable_date",
-        IssueKind::UnterminatedComment => "unterminated_comment",
-        IssueKind::UnterminatedQuote => "unterminated_quote",
-        IssueKind::WeekdayMismatch => "weekday_mismatch",
-        IssueKind::WidenedYear => "widened_year",
-        _ => "unknown",
-    }
-}
-
 /// A list whose items are structs of `fields`.
 fn list_of_structs(fields: Fields) -> DataType {
     DataType::List(struct_item(fields))
-}
-
-/// The method name as written in the header, lowercase for the known methods.
-fn method_name<'method>(method: &'method AuthMethod<'_>) -> &'method str {
-    match method {
-        AuthMethod::Arc => "arc",
-        AuthMethod::Auth => "auth",
-        AuthMethod::CompAuth => "compauth",
-        AuthMethod::Dkim => "dkim",
-        AuthMethod::Dmarc => "dmarc",
-        AuthMethod::DomainKeys => "domainkeys",
-        AuthMethod::Iprev => "iprev",
-        AuthMethod::Other(name) => name,
-        AuthMethod::SenderId => "sender-id",
-        AuthMethod::Spf => "spf",
-        _ => "unknown",
-    }
 }
 
 /// The `{ptype, property, value}` struct of one result property.
@@ -963,22 +812,6 @@ fn results_fields() -> Fields {
         struct_list_field("entries", entry_fields()),
         field("trusted", DataType::Boolean),
     ])
-}
-
-/// The result name as written in the header, lowercase for the known results.
-fn result_name<'result>(result: &'result AuthResult<'_>) -> &'result str {
-    match result {
-        AuthResult::Fail => "fail",
-        AuthResult::Neutral => "neutral",
-        AuthResult::NoResult => "none",
-        AuthResult::Other(name) => name,
-        AuthResult::Pass => "pass",
-        AuthResult::PermError => "permerror",
-        AuthResult::Policy => "policy",
-        AuthResult::SoftFail => "softfail",
-        AuthResult::TempError => "temperror",
-        AuthResult::Unknown | _ => "unknown",
-    }
 }
 
 /// `raw` without its one final line break.

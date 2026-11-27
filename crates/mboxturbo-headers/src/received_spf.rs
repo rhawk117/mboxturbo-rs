@@ -55,6 +55,22 @@ impl<'src> SpfResult<'src> {
             .find(|(known, _)| known.eq_ignore_ascii_case(&name))
             .map_or(Self::Other(name), |(_, result)| result.clone())
     }
+
+    /// The verdict word as written in the header: lowercase for a result with a variant of its
+    /// own, verbatim for any other.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Fail => "fail",
+            Self::Neutral => "neutral",
+            Self::None => "none",
+            Self::Other(name) => name,
+            Self::Pass => "pass",
+            Self::PermError => "permerror",
+            Self::SoftFail => "softfail",
+            Self::TempError => "temperror",
+        }
+    }
 }
 
 /// One `key=value` pair after the result, such as `client-ip=192.0.2.1`.
@@ -654,6 +670,18 @@ mod tests {
             kinds(&parsed),
             vec![(IssueKind::UnterminatedComment, 5)],
             "tokenizer issue is included"
+        );
+    }
+
+    #[test]
+    fn every_result_with_a_variant_names_itself_as_the_table_spells_it() {
+        for (word, result) in &super::RESULTS {
+            assert_eq!(result.name(), *word, "result {word} names itself");
+        }
+        assert_eq!(
+            SpfResult::Other(Cow::Borrowed("x-odd")).name(),
+            "x-odd",
+            "an unlisted word is kept verbatim"
         );
     }
 }
