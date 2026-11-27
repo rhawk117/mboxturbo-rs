@@ -3,6 +3,7 @@
 //! [`ParquetExporter`](crate::ParquetExporter) for files.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 #[cfg(test)]
 use std::fmt::Debug;
 use std::ops::Range;
@@ -23,6 +24,7 @@ use crate::fields::{
     self, Mail, builtin_table_with_raw_received, contain_parser_panic, strip_separator,
 };
 use crate::mailbox::Mailbox;
+use crate::message::Timestamp;
 use crate::selection::{Plan, Selection};
 use crate::stream::Ordered;
 use crate::width::widen;
@@ -77,6 +79,8 @@ trait Probe: Debug + Send + Sync {
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
 struct Record<'mail> {
+    /// The `Date` header, read from `raw` on first use so two date columns share one read.
+    date: OnceCell<Option<Timestamp>>,
     /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
     /// on it.
     mail: Option<&'mail Mail<'mail>>,
@@ -86,6 +90,13 @@ struct Record<'mail> {
     raw: &'mail [u8],
     /// Byte range of the message in the mailbox file.
     span: Range<usize>,
+}
+
+impl Record<'_> {
+    /// The message's `Date` header, read from the raw bytes at most once.
+    fn date(&self) -> Option<Timestamp> {
+        *self.date.get_or_init(|| fields::date(self.raw))
+    }
 }
 
 /// Batches over a selection of a mailbox, extracted on all rayon threads and handed over in
@@ -139,6 +150,7 @@ impl Pipeline {
         for (position, span, raw) in runs.iter().flat_map(|run| mailbox.rows(run.clone())) {
             let parsed = self.parse(raw);
             let record = Record {
+                date: OnceCell::new(),
                 position,
                 raw,
                 span,
@@ -412,8 +424,12 @@ impl Slot {
             Self::Raw(builder) => builder.append_value(record.raw),
             Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
             Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
-            Self::Date(builder) => builder.append_option(date_micros(record.raw)),
-            Self::DateOffset(builder) => builder.append_option(date_offset_minutes(record.raw)),
+            Self::Date(builder) => {
+                builder.append_option(record.date().map(|found| micros(found.unix_seconds)));
+            },
+            Self::DateOffset(builder) => {
+                builder.append_option(record.date().map(|found| found.offset_minutes));
+            },
             Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
             Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
             Self::FirstHeaderValue(name, builder) => {
@@ -529,12 +545,13 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         Column::Cc => Some((HeaderName::Cc, HeaderForm::Addresses)),
         Column::ReplyTo => Some((HeaderName::ReplyTo, HeaderForm::Addresses)),
         Column::Subject => Some((HeaderName::Subject, HeaderForm::Text)),
-        Column::Date | Column::DateOffsetMinutes => Some((HeaderName::Date, HeaderForm::Date)),
         Column::MessageId => Some((HeaderName::MessageId, HeaderForm::MessageIds)),
         Column::Position
         | Column::Offset
         | Column::Size
         | Column::Raw
+        | Column::Date
+        | Column::DateOffsetMinutes
         | Column::Received
         | Column::AuthenticationResults
         | Column::ReceivedSpf
@@ -593,18 +610,6 @@ fn first_header_value<'mail>(
     fields::header_values(parsed, name).next()
 }
 
-/// The Date header of the stored message `raw` as UTC microseconds; `None` when the message has
-/// no valid one.
-fn date_micros(raw: &[u8]) -> Option<i64> {
-    fields::date(raw).map(|date| micros(date.unix_seconds))
-}
-
-/// Minutes east of UTC in the Date header of the stored message `raw`; `None` when the message
-/// has no valid one.
-fn date_offset_minutes(raw: &[u8]) -> Option<i32> {
-    fields::date(raw).map(|date| date.offset_minutes)
-}
-
 /// The plain-text bodies of `mail` joined by newlines.
 fn text_body(mail: &Mail<'_>) -> String {
     joined(fields::text_bodies(mail))
@@ -656,12 +661,13 @@ mod tests {
 
     use super::{
         AddressHeader, AttachmentSlot, Depth, Pipeline, Probe, Slot, append_addresses,
-        append_header_values, date_micros, date_offset_minutes, depth_for, first_header_value,
-        header_form, html_body, joined, text_body, utc_timestamps,
+        append_header_values, depth_for, first_header_value, header_form, html_body, joined,
+        micros, text_body, utc_timestamps,
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
     use crate::export::{Export, Exporter};
+    use crate::fields;
     use crate::fields::Mail;
     use crate::mailbox::Mailbox;
     use crate::selection::Selection;
@@ -766,12 +772,6 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
             (Column::Cc, HeaderName::Cc, HeaderForm::Addresses),
             (Column::ReplyTo, HeaderName::ReplyTo, HeaderForm::Addresses),
             (Column::Subject, HeaderName::Subject, HeaderForm::Text),
-            (Column::Date, HeaderName::Date, HeaderForm::Date),
-            (
-                Column::DateOffsetMinutes,
-                HeaderName::Date,
-                HeaderForm::Date,
-            ),
             (
                 Column::MessageId,
                 HeaderName::MessageId,
@@ -794,6 +794,12 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
             header_form(&Column::Received).is_none(),
             "received stays raw"
         );
+        for column in [Column::Date, Column::DateOffsetMinutes] {
+            assert!(
+                header_form(&column).is_none(),
+                "{column:?} reads the raw bytes, so no Date decode"
+            );
+        }
     }
 
     #[test]
@@ -903,12 +909,12 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
     #[test]
     fn the_date_header_gives_utc_microseconds_and_a_minute_offset() {
         assert_eq!(
-            date_micros(MULTIPART),
+            fields::date(MULTIPART).map(|found| micros(found.unix_seconds)),
             Some(-5_390_000_000),
             "00:00:10 at +01:30 is 5390 seconds before the epoch"
         );
         assert_eq!(
-            date_offset_minutes(MULTIPART),
+            fields::date(MULTIPART).map(|found| found.offset_minutes),
             Some(90_i32),
             "+0130 is 90 minutes east"
         );
@@ -916,9 +922,13 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
 
     #[test]
     fn an_empty_message_has_no_date() {
-        assert_eq!(date_micros(b""), None, "no micros without a message");
         assert_eq!(
-            date_offset_minutes(b""),
+            fields::date(b"").map(|found| micros(found.unix_seconds)),
+            None,
+            "no micros without a message"
+        );
+        assert_eq!(
+            fields::date(b"").map(|found| found.offset_minutes),
             None,
             "no offset without a message"
         );

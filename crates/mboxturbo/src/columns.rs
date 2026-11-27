@@ -176,9 +176,17 @@ impl Column {
     }
 
     /// Whether extracting this column requires parsing the message at all; position, offset,
-    /// size and raw bytes come from the index alone.
+    /// size, raw bytes and the date columns come from the index or the raw bytes alone.
     pub(crate) const fn needs_parsing(&self) -> bool {
-        !matches!(self, Self::Position | Self::Offset | Self::Size | Self::Raw)
+        !matches!(
+            self,
+            Self::Position
+                | Self::Offset
+                | Self::Size
+                | Self::Raw
+                | Self::Date
+                | Self::DateOffsetMinutes
+        )
     }
 }
 
@@ -230,5 +238,11 @@ mod tests {
         assert_eq!(Column::from_name("raw"), Some(Column::Raw), "raw parses");
         assert!(!Column::Raw.needs_body(), "raw needs no body parse");
         assert!(!Column::Raw.needs_parsing(), "raw needs no parse at all");
+        for column in [Column::Date, Column::DateOffsetMinutes] {
+            assert!(
+                !column.needs_parsing(),
+                "{column:?} reads the raw bytes only"
+            );
+        }
     }
 }
