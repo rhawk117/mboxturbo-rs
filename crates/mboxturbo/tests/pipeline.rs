@@ -8,9 +8,9 @@ mod pipeline {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use arrow_array::RecordBatch;
     use arrow_array::cast::AsArray as _;
-    use arrow_array::types::UInt64Type;
+    use arrow_array::types::{Int32Type, TimestampMicrosecondType, UInt64Type};
+    use arrow_array::{Array as _, RecordBatch};
     use mboxturbo::{
         Column, Compression, Destination, Export, Mailbox, MboxTurboError, ParquetExporter,
         Pipeline, Selection,
@@ -44,6 +44,19 @@ Content-Transfer-Encoding: base64\n\
 \n\
 AAEC\n\
 --B--\n";
+
+    const DATE_MIX: [&str; 10] = [
+        "Date: Mon, 01 Jan 2024 12:00:00 +0000\n",
+        "Date: Mon Jan  1 12:00:00 2024\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 EST\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 -0500 (EST)\n",
+        "Date: Mon, 01 Jan 24 12:00:00 +1400\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 +0000\nDate: Tue, 02 Jan 2024 08:30:00 -0700\n",
+        "Date: Mon, 01 Jan 2024\n 12:00:00 +0530\n",
+        "Date: not a date\n",
+        "Subject: no date\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 +0000\nDate: not a date\n",
+    ];
 
     struct Fixture {
         directory: TempDir,
@@ -237,6 +250,71 @@ AAEC\n\
         let pipeline = Arc::new(Pipeline::new(Column::defaults(), 1));
         let rows = fixture.export_parquet(&pipeline);
         assert_eq!(rows, 2, "both fixture messages are counted");
+    }
+
+    /// A select of the whole date fixture with the Date and offset columns, one row per message.
+    fn date_batch() -> (Fixture, RecordBatch) {
+        let contents = DATE_MIX
+            .iter()
+            .map(|header| format!("From x Mon Jan  1 00:00:00 2024\n{header}\nbody\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let fixture = Fixture::with(&contents);
+        let pipeline = Arc::new(Pipeline::new(
+            vec![Column::Date, Column::DateOffsetMinutes],
+            DATE_MIX.len(),
+        ));
+        let batch = pipeline
+            .select(&fixture.mailbox, Selection::All)
+            .expect("the whole mailbox is selectable")
+            .next()
+            .expect("one batch covers the fixture")
+            .expect("the batch is assembled");
+        (fixture, batch)
+    }
+
+    fn assert_date_row_agrees(fixture: &Fixture, batch: &RecordBatch, position: usize) {
+        let dates = batch.column(0).as_primitive::<TimestampMicrosecondType>();
+        let offsets = batch.column(1).as_primitive::<Int32Type>();
+        let indexed = fixture
+            .mailbox
+            .date(position)
+            .map(|seconds| seconds.saturating_mul(1_000_000));
+        let stamp = fixture
+            .mailbox
+            .message(position)
+            .expect("the position exists")
+            .date();
+        assert_eq!(
+            dates.is_valid(position).then(|| dates.value(position)),
+            indexed,
+            "message {position}: the Date column matches the index"
+        );
+        assert_eq!(
+            stamp.map(|found| found.unix_seconds.saturating_mul(1_000_000)),
+            indexed,
+            "message {position}: Message::date matches the index"
+        );
+        assert_eq!(
+            offsets.is_valid(position).then(|| offsets.value(position)),
+            stamp.map(|found| found.offset_minutes),
+            "message {position}: the offset column matches Message::date"
+        );
+    }
+
+    #[test]
+    fn the_date_column_equals_the_index_date_for_every_message() {
+        let (fixture, batch) = date_batch();
+        for position in 0..DATE_MIX.len() {
+            assert_date_row_agrees(&fixture, &batch, position);
+        }
+        let dates = batch.column(0).as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            dates.null_count(),
+            3,
+            "unparsable, missing and bad-last are null"
+        );
+        assert!(fixture.mailbox.date(1).is_some(), "asctime is dated");
     }
 
     #[test]

@@ -412,8 +412,8 @@ impl Slot {
             Self::Raw(builder) => builder.append_value(record.raw),
             Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
             Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
-            Self::Date(builder) => builder.append_option(date_micros(mail)),
-            Self::DateOffset(builder) => builder.append_option(date_offset_minutes(mail)),
+            Self::Date(builder) => builder.append_option(date_micros(record.raw)),
+            Self::DateOffset(builder) => builder.append_option(date_offset_minutes(record.raw)),
             Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
             Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
             Self::FirstHeaderValue(name, builder) => {
@@ -593,15 +593,16 @@ fn first_header_value<'mail>(
     fields::header_values(parsed, name).next()
 }
 
-/// The Date header of `mail` as UTC microseconds, or `None` when unparsed, absent or invalid.
-fn date_micros(mail: Option<&Mail<'_>>) -> Option<i64> {
-    mail.and_then(fields::date)
-        .map(|date| micros(date.unix_seconds))
+/// The Date header of the stored message `raw` as UTC microseconds; `None` when the message has
+/// no valid one.
+fn date_micros(raw: &[u8]) -> Option<i64> {
+    fields::date(raw).map(|date| micros(date.unix_seconds))
 }
 
-/// Minutes east of UTC in the Date header of `mail`, or `None` when unparsed, absent or invalid.
-fn date_offset_minutes(mail: Option<&Mail<'_>>) -> Option<i32> {
-    mail.and_then(fields::date).map(|date| date.offset_minutes)
+/// Minutes east of UTC in the Date header of the stored message `raw`; `None` when the message
+/// has no valid one.
+fn date_offset_minutes(raw: &[u8]) -> Option<i32> {
+    fields::date(raw).map(|date| date.offset_minutes)
 }
 
 /// The plain-text bodies of `mail` joined by newlines.
@@ -614,8 +615,8 @@ fn html_body(mail: &Mail<'_>) -> String {
     joined(fields::html_bodies(mail))
 }
 
-// `fields::date` only yields years 1900..=3000 (`DateTime::is_valid`), so `unix_seconds` stays
-// below 4e10 and the product below 4e16: the saturation is unreachable.
+// `fields::date` only yields years up to 9999 (`parse_date` reads at most four digits), so
+// `unix_seconds` stays below 3e11 and the product below 3e17: the saturation is unreachable.
 /// Converts Unix seconds to microseconds, saturating at the `i64` bounds.
 const fn micros(unix_seconds: i64) -> i64 {
     unix_seconds.saturating_mul(1_000_000)
@@ -901,24 +902,23 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
 
     #[test]
     fn the_date_header_gives_utc_microseconds_and_a_minute_offset() {
-        let mail = parse(MULTIPART);
         assert_eq!(
-            date_micros(Some(&mail)),
+            date_micros(MULTIPART),
             Some(-5_390_000_000),
             "00:00:10 at +01:30 is 5390 seconds before the epoch"
         );
         assert_eq!(
-            date_offset_minutes(Some(&mail)),
+            date_offset_minutes(MULTIPART),
             Some(90_i32),
             "+0130 is 90 minutes east"
         );
     }
 
     #[test]
-    fn an_unparsed_message_has_no_date() {
-        assert_eq!(date_micros(None), None, "no micros without a message");
+    fn an_empty_message_has_no_date() {
+        assert_eq!(date_micros(b""), None, "no micros without a message");
         assert_eq!(
-            date_offset_minutes(None),
+            date_offset_minutes(b""),
             None,
             "no offset without a message"
         );
