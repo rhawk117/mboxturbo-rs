@@ -764,6 +764,7 @@ dependencies = [
  "clap",
  "mboxturbo",
  "parquet",
+ "serde_json",
  "tempfile",
 ]
 

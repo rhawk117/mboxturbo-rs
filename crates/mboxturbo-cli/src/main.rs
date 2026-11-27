@@ -22,15 +22,18 @@
               uses syn 3"
 )]
 
+mod events;
 mod exit;
 mod export;
 mod select;
 
+use std::env;
 use std::io::{self, Write as _};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use crate::events::Report;
 use crate::export::{ExportArgs, Failure};
 
 /// Exports large mbox files to analysis-friendly formats.
@@ -40,6 +43,9 @@ struct Cli {
     /// What to do.
     #[command(subcommand)]
     command: Command,
+    /// Write a versioned JSON Lines event stream on standard output instead of human text.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 /// The subcommands.
@@ -52,28 +58,47 @@ enum Command {
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(error) => {
-            let code = if error.use_stderr() { exit::USAGE } else { 0 };
-            // A clap message that cannot be written (a closed stdout or stderr) has nowhere left
-            // to be reported, so it exits 1, "any other failure", rather than the code it carried.
-            return match error.print() {
-                Ok(()) => ExitCode::from(code),
-                Err(_) => ExitCode::from(1),
-            };
-        },
+        Err(error) => return usage_error(&error),
+    };
+    let report = if cli.json {
+        Report::Events
+    } else {
+        Report::Text
     };
     let Command::Export(args) = cli.command;
-    match export::run(&args) {
+    match export::run(&args, report) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(failure) => report(&failure),
+        Err(failure) => describe(&failure, report),
     }
 }
 
-/// Prints the failure as one line on stderr and returns its exit code; a line that cannot be
-/// written has nowhere to go, so it exits 1 like an unwritable clap message.
-fn report(failure: &Failure) -> ExitCode {
-    match writeln!(io::stderr(), "mboxturbo: {failure}") {
-        Ok(()) => ExitCode::from(failure.code()),
-        Err(_) => ExitCode::from(1),
+/// Prints a clap message and returns its exit code; with `--json` among the arguments a usage
+/// error is also written as an `error` event.
+fn usage_error(error: &clap::Error) -> ExitCode {
+    let code = if error.use_stderr() { exit::USAGE } else { 0 };
+    // A clap message that cannot be written (a closed stdout or stderr) has nowhere left to be
+    // reported, so it exits 1, "any other failure", rather than the code it carried.
+    if error.print().is_err() {
+        return ExitCode::from(1);
     }
+    let json = env::args_os().any(|argument| argument == "--json");
+    if json && error.use_stderr() && events::error(code, &error.to_string()).is_err() {
+        return ExitCode::from(74);
+    }
+    ExitCode::from(code)
+}
+
+/// Prints the failure as one line on stderr and returns its exit code; a line that cannot be
+/// written has nowhere to go, so it exits 1 like an unwritable clap message. With events, the
+/// same line is also written as the last `error` event, and an event that cannot be written exits
+/// 74.
+fn describe(failure: &Failure, report: Report) -> ExitCode {
+    let line = format!("mboxturbo: {failure}");
+    if writeln!(io::stderr(), "{line}").is_err() {
+        return ExitCode::from(1);
+    }
+    if report == Report::Events && events::error(failure.code(), &line).is_err() {
+        return ExitCode::from(74);
+    }
+    ExitCode::from(failure.code())
 }

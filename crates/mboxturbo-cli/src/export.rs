@@ -3,16 +3,19 @@
 use std::error::Error as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use std::{fmt, fs, io};
 
 use clap::{Args, ValueEnum};
 use mboxturbo::{
-    Column, Compression, CsvExporter, Destination, EmlExporter, Export, Exporter, FormulaEscaping,
-    IndexPolicy, IpcExporter, JsonlExporter, Mailbox, MailboxBuilder, MboxExporter, MboxTurboError,
-    Overwrite, ParquetExporter, Pipeline, Selection,
+    CancelToken, Column, Compression, CsvExporter, Destination, EmlExporter, Export, ExportSummary,
+    Exporter, FormulaEscaping, IndexOrigin, IndexPolicy, IpcExporter, JsonlExporter, Mailbox,
+    MailboxBuilder, MboxExporter, MboxTurboError, Overwrite, ParquetExporter, Pipeline, Progress,
+    Selection,
 };
 
+use crate::events::{self, Counts, File, Report, Start, Summary, Throttle};
 use crate::exit::{self, Stage};
 use crate::select::{self, SelectError};
 
@@ -151,33 +154,164 @@ impl Format {
         }
     }
 
+    /// The name the format has on the command line and in events.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Arrow => "arrow",
+            Self::Csv => "csv",
+            Self::Eml => "eml",
+            Self::Jsonl => "jsonl",
+            Self::Mbox => "mbox",
+            Self::Parquet => "parquet",
+        }
+    }
+
     /// Whether this format can be written to standard output.
     const fn streams(self) -> bool {
         !matches!(self, Self::Eml | Self::Parquet)
     }
 }
 
-/// Runs the `export` subcommand.
+/// The messages an export writes and how many there are.
+struct Selected {
+    /// How many messages `selection` holds.
+    count: usize,
+    /// What the library is asked to write.
+    selection: Selection,
+}
+
+/// What the events of one export report besides the library's own progress and summary.
+struct Reported<'run> {
+    /// The command line.
+    args: &'run ExportArgs,
+    /// How many messages the selection holds.
+    count: usize,
+    /// How the mailbox's index was obtained.
+    origin: IndexOrigin,
+}
+
+/// Runs the `export` subcommand, reporting it as events when `report` asks for them.
 ///
 /// # Errors
 ///
-/// A [`Failure::Usage`] for an unknown column, a malformed or out-of-range selection, or
-/// standard output with a format that cannot stream, all found before anything is written; a
-/// [`Failure::Core`] for everything the library refuses.
-pub(crate) fn run(args: &ExportArgs) -> Result<(), Failure> {
+/// A [`Failure::Usage`] for an unknown column, a malformed or out-of-range selection, standard
+/// output with a format that cannot stream, or `--json` with standard output, all found before
+/// anything is written; a [`Failure::Core`] for everything the library refuses, and for an event
+/// that cannot be written to standard output.
+pub(crate) fn run(args: &ExportArgs, report: Report) -> Result<(), Failure> {
+    refuse_events_on_stdout(args, report)?;
     let columns = columns(args.format, args.columns.as_deref())?;
     let destination = destination(args.format, &args.output)?;
     let ranges = select::parse_all(&args.select)?;
     let mailbox = open(&args.mailbox, args.index.as_deref())?;
-    let selection = selection(args, ranges, &mailbox)?;
+    let selected = selection(args, ranges, &mailbox)?;
     let pipeline = Arc::new(Pipeline::new(columns, BATCH_SIZE));
     let exporter = args.format.exporter(mailbox.len());
-    Export::new(pipeline, Arc::new(mailbox), destination)
-        .selection(selection)
-        .overwrite(args.overwrite_policy())
-        .run(exporter)
-        .map(|_summary| ())
-        .map_err(|error| Failure::after_open(Box::new(error)))
+    let origin = mailbox.index_origin();
+    let export = Export::new(pipeline, Arc::new(mailbox), destination)
+        .selection(selected.selection)
+        .overwrite(args.overwrite_policy());
+    if report == Report::Text {
+        return export
+            .run(exporter)
+            .map(|_summary| ())
+            .map_err(|error| Failure::after_open(Box::new(error)));
+    }
+    let reported = Reported {
+        args,
+        count: selected.count,
+        origin,
+    };
+    run_with_events(export, exporter, &reported)
+}
+
+/// Standard output carries the events, so it cannot also carry the data.
+fn refuse_events_on_stdout(args: &ExportArgs, report: Report) -> Result<(), Failure> {
+    if report == Report::Events && args.output.as_os_str() == STDOUT {
+        return Err(Failure::Usage(
+            "--json cannot be used with `-o -`: standard output carries the events".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Runs `export` and writes its events: `start`, `index`, throttled `progress`, a last
+/// `progress`, `file` and `summary`.
+///
+/// A failed event write cancels the export and is reported as an I/O failure once it has stopped.
+fn run_with_events(
+    export: Export,
+    exporter: Box<dyn Exporter>,
+    reported: &Reported<'_>,
+) -> Result<(), Failure> {
+    events::start(&Start {
+        command: "export",
+        format: reported.args.format.name(),
+        mailbox: &reported.args.mailbox,
+        output: &reported.args.output,
+        selected: reported.count,
+    })
+    .and_then(|()| events::index(reported.origin))
+    .map_err(stdout_failure)?;
+    let failure = Arc::new(OnceLock::new());
+    let cancel = CancelToken::new();
+    let hook = progress_hook(Arc::clone(&failure), cancel.clone());
+    let result = export.cancel_token(cancel).on_progress(hook).run(exporter);
+    if let Some(source) = Arc::into_inner(failure).and_then(OnceLock::into_inner) {
+        return Err(stdout_failure(source));
+    }
+    let summary = result.map_err(|error| Failure::after_open(Box::new(error)))?;
+    finish(reported, &summary).map_err(stdout_failure)
+}
+
+/// A progress hook that writes at most one event per interval; the first write that fails is kept
+/// in `failure` and cancels the export.
+fn progress_hook(
+    failure: Arc<OnceLock<io::Error>>,
+    cancel: CancelToken,
+) -> impl FnMut(Progress) + Send + 'static {
+    let mut throttle = Throttle::new(events::PROGRESS_INTERVAL);
+    move |progress| {
+        if !throttle.admit(Instant::now()) {
+            return;
+        }
+        if let Err(error) = events::progress(Counts::from(progress))
+            && failure.set(error).is_ok()
+        {
+            cancel.cancel();
+        }
+    }
+}
+
+/// Writes the events that follow a finished export: the last `progress`, `file` and `summary`.
+fn finish(reported: &Reported<'_>, summary: &ExportSummary) -> io::Result<()> {
+    // Standard output is refused for `--json`, so the export always committed a path.
+    let path = summary.path.as_deref().unwrap_or(&reported.args.output);
+    events::progress(Counts {
+        bytes: summary.bytes,
+        messages: summary.messages,
+        total: summary.messages,
+    })?;
+    events::file(&File {
+        bytes: summary.bytes,
+        format: reported.args.format.name(),
+        messages: summary.messages,
+        path,
+    })?;
+    events::summary(&Summary {
+        bytes: summary.bytes,
+        elapsed: summary.elapsed,
+        messages: summary.messages,
+        path,
+    })
+}
+
+/// An event that could not be written to standard output, as an I/O failure.
+fn stdout_failure(source: io::Error) -> Failure {
+    Failure::after_open(Box::new(MboxTurboError::Io {
+        path: PathBuf::from("standard output"),
+        source,
+    }))
 }
 
 /// The columns to extract: a fixed set for the formats that write whole messages, otherwise the
@@ -269,9 +403,12 @@ fn selection(
     args: &ExportArgs,
     mut ranges: Vec<Range<usize>>,
     mailbox: &Mailbox,
-) -> Result<Selection, Failure> {
+) -> Result<Selected, Failure> {
     if args.select.is_empty() && args.select_file.is_none() {
-        return Ok(Selection::All);
+        return Ok(Selected {
+            count: mailbox.len(),
+            selection: Selection::All,
+        });
     }
     if let Some(path) = &args.select_file {
         ranges.extend(select_file(path)?);
@@ -282,10 +419,11 @@ fn selection(
             )));
         }
     }
-    Ok(Selection::Positions(select::positions(
-        ranges,
-        mailbox.len(),
-    )?))
+    let positions = select::positions(ranges, mailbox.len())?;
+    Ok(Selected {
+        count: positions.len(),
+        selection: Selection::Positions(positions),
+    })
 }
 
 /// The ranges named by the lines of the file at `path`; blank lines are ignored.
