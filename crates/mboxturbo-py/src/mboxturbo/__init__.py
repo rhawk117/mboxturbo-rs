@@ -52,14 +52,48 @@ class Exporter[Out: (ByteSink, Path)](Protocol):
     after the last batch; nothing reaches the target unless ``finish`` returns.
     """
 
-    def begin(self, schema: ArrowSchemaLike, out: Out, /) -> None: ...
+    def begin(self, schema: ArrowSchemaLike, out: Out, /) -> None:
+        """Called once before the first batch with the Arrow schema of every batch."""
 
-    def write_batch(self, batch: ArrowBatchLike, out: Out, /) -> None: ...
+    def write_batch(self, batch: ArrowBatchLike, out: Out, /) -> None:
+        """Called once per batch, in row order, to write it to ``out``."""
 
-    def finish(self, out: Out, /) -> None: ...
+    def finish(self, out: Out, /) -> None:
+        """Called once after the last batch; the target appears only if this returns."""
 
+
+SOC_COLUMNS: tuple[str, ...] = (
+    'position',
+    'offset',
+    'size',
+    'from',
+    'to',
+    'cc',
+    'reply_to',
+    'subject',
+    'date',
+    'date_offset_minutes',
+    'message_id',
+    'received',
+    'authentication_results',
+    'received_spf',
+    'dkim_signature',
+    'return_path',
+    'auth_results',
+    'arc_sets',
+    'dkim_signatures',
+    'received_hops',
+    'received_spf_parsed',
+    'microsoft_antispam',
+    'verdict_dmarc',
+    'verdict_spf',
+    'verdict_dkim',
+    'verdict_compauth',
+)
+"""The default columns plus every structured and verdict column."""
 
 __all__ = [
+    'SOC_COLUMNS',
     'Address',
     'ArrowBatchLike',
     'ArrowSchemaLike',
