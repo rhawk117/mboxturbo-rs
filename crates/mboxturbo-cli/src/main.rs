@@ -25,19 +25,25 @@
 mod events;
 mod exit;
 mod export;
+mod progress;
 mod select;
 
 use std::env;
 use std::io::{self, Write as _};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{ColorChoice, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 use crate::events::Report;
 use crate::export::{ExportArgs, Failure};
+use crate::progress::{Environment, Feedback};
 
 /// Exports large mbox files to analysis-friendly formats.
 #[derive(Debug, Parser)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one command-line flag"
+)]
 #[command(name = "mboxturbo", version, about)]
 struct Cli {
     /// What to do.
@@ -46,6 +52,10 @@ struct Cli {
     /// Write a versioned JSON Lines event stream on standard output instead of human text.
     #[arg(long, global = true)]
     json: bool,
+    /// Print no progress bar, summary line or index note on standard error; errors still print.
+    /// `--json` implies it.
+    #[arg(short, long, global = true)]
+    quiet: bool,
 }
 
 /// The subcommands.
@@ -56,9 +66,20 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let styled = Environment::from_process().styled();
+    let choice = if styled {
+        ColorChoice::Always
+    } else {
+        ColorChoice::Never
+    };
+    let cli = match parse(choice) {
         Ok(cli) => cli,
         Err(error) => return usage_error(&error),
+    };
+    let feedback = match (cli.quiet || cli.json, styled) {
+        (true, _) => Feedback::Silent,
+        (false, true) => Feedback::Live,
+        (false, false) => Feedback::Summary,
     };
     let report = if cli.json {
         Report::Events
@@ -66,10 +87,17 @@ fn main() -> ExitCode {
         Report::Text
     };
     let Command::Export(args) = cli.command;
-    match export::run(&args, report) {
+    match export::run(&args, report, feedback) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => describe(&failure, report),
     }
+}
+
+/// Parses the command line with clap's colours fixed to `choice`, so help and usage errors carry
+/// escape codes exactly when the progress bar is drawn.
+fn parse(choice: ColorChoice) -> Result<Cli, clap::Error> {
+    let mut matches = Cli::command().color(choice).try_get_matches()?;
+    Cli::from_arg_matches_mut(&mut matches)
 }
 
 /// Prints a clap message and returns its exit code; with `--json` among the arguments a usage

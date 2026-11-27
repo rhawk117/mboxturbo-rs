@@ -545,7 +545,7 @@ mod export {
         let fixture = Fixture::new();
         fs::write(fixture.path("out.csv"), "keep me").expect("the existing output is written");
         let target = fixture.target("out.csv");
-        let output = fixture.export(&["--format", "csv", "-o", &target]);
+        let output = fixture.export(&["--format", "csv", "-o", &target, "--quiet"]);
         assert_eq!(
             code(&output),
             73_i32,
@@ -650,7 +650,15 @@ mod export {
     #[test]
     fn csv_to_stdout_writes_only_the_export() {
         let fixture = Fixture::new();
-        let output = fixture.export(&["--format", "csv", "-o", "-", "--columns", "position"]);
+        let output = fixture.export(&[
+            "--format",
+            "csv",
+            "-o",
+            "-",
+            "--columns",
+            "position",
+            "--quiet",
+        ]);
         assert_eq!(
             code(&output),
             0_i32,

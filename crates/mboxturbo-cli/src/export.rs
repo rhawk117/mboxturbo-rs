@@ -17,6 +17,7 @@ use mboxturbo::{
 
 use crate::events::{self, Counts, File, Report, Start, Summary, Throttle};
 use crate::exit::{self, Stage};
+use crate::progress::{self, Bar, Feedback};
 use crate::select::{self, SelectError};
 
 /// Messages per batch: the unit the pipeline extracts and a sink writes at a time.
@@ -180,14 +181,86 @@ struct Selected {
     selection: Selection,
 }
 
-/// What the events of one export report besides the library's own progress and summary.
+/// What one export reports besides the library's own progress and summary, and how.
 struct Reported<'run> {
     /// The command line.
     args: &'run ExportArgs,
     /// How many messages the selection holds.
     count: usize,
+    /// How much is said on standard error.
+    feedback: Feedback,
     /// How the mailbox's index was obtained.
     origin: IndexOrigin,
+    /// Whether standard output carries events or text.
+    report: Report,
+}
+
+/// Receives the library's progress: redraws the bar and, with events, writes throttled
+/// `progress` events. The first event write that fails is kept in `failure` and the export is
+/// cancelled at once, so no later event is written.
+struct Observer {
+    /// The bar, until a write to it fails.
+    bar: Option<Bar<io::Stderr>>,
+    /// Cancels the export when an event cannot be written.
+    cancel: CancelToken,
+    /// The first event write that failed.
+    failure: Arc<OnceLock<io::Error>>,
+    /// Admits at most one event per interval; `None` without events.
+    throttle: Option<Throttle>,
+}
+
+impl Observer {
+    /// Draws the bar for `counts`; a bar that cannot be written to is dropped, since standard
+    /// error has nowhere left to report that.
+    fn draw(&mut self, counts: Counts, now: Instant) {
+        if let Some(bar) = &mut self.bar
+            && bar.update(counts, now).is_err()
+        {
+            self.bar = None;
+        }
+    }
+
+    /// Writes a `progress` event for `counts` when the throttle admits one.
+    fn emit(&mut self, counts: Counts, now: Instant) {
+        let Some(throttle) = &mut self.throttle else {
+            return;
+        };
+        if !throttle.admit(now) {
+            return;
+        }
+        if let Err(error) = events::progress(counts)
+            && self.failure.set(error).is_ok()
+        {
+            self.cancel.cancel();
+        }
+    }
+
+    /// An observer for the run described by `reported`.
+    fn new(
+        reported: &Reported<'_>,
+        failure: Arc<OnceLock<io::Error>>,
+        cancel: CancelToken,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            bar: reported
+                .feedback
+                .draws()
+                .then(|| Bar::new(io::stderr(), now)),
+            cancel,
+            failure,
+            throttle: (reported.report == Report::Events)
+                .then(|| Throttle::new(events::PROGRESS_INTERVAL)),
+        }
+    }
+
+    /// Handles one library progress report.
+    fn observe(&mut self, progress: Progress) {
+        let now = Instant::now();
+        let counts = Counts::from(progress);
+        self.draw(counts, now);
+        self.emit(counts, now);
+    }
 }
 
 /// Runs the `export` subcommand, reporting it as events when `report` asks for them.
@@ -198,7 +271,7 @@ struct Reported<'run> {
 /// output with a format that cannot stream, or `--json` with standard output, all found before
 /// anything is written; a [`Failure::Core`] for everything the library refuses, and for an event
 /// that cannot be written to standard output.
-pub(crate) fn run(args: &ExportArgs, report: Report) -> Result<(), Failure> {
+pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Result<(), Failure> {
     refuse_events_on_stdout(args, report)?;
     let columns = columns(args.format, args.columns.as_deref())?;
     let destination = destination(args.format, &args.output)?;
@@ -211,18 +284,15 @@ pub(crate) fn run(args: &ExportArgs, report: Report) -> Result<(), Failure> {
     let export = Export::new(pipeline, Arc::new(mailbox), destination)
         .selection(selected.selection)
         .overwrite(args.overwrite_policy());
-    if report == Report::Text {
-        return export
-            .run(exporter)
-            .map(|_summary| ())
-            .map_err(|error| Failure::after_open(Box::new(error)));
-    }
     let reported = Reported {
         args,
         count: selected.count,
+        feedback,
         origin,
+        report,
     };
-    run_with_events(export, exporter, &reported)
+    progress::note_origin(feedback, origin).map_err(stderr_failure)?;
+    run_export(export, exporter, &reported)
 }
 
 /// Standard output carries the events, so it cannot also carry the data.
@@ -235,58 +305,59 @@ fn refuse_events_on_stdout(args: &ExportArgs, report: Report) -> Result<(), Fail
     Ok(())
 }
 
-/// Runs `export` and writes its events: `start`, `index`, throttled `progress`, a last
-/// `progress`, `file` and `summary`.
+/// Runs `export`, drawing the bar and writing the events its `reported` mode asks for: with
+/// events, `start`, `index`, throttled `progress`, a last `progress`, `file` and `summary`; then
+/// the summary line on standard error.
 ///
 /// A failed event write cancels the export and is reported as an I/O failure once it has stopped.
-fn run_with_events(
+fn run_export(
     export: Export,
     exporter: Box<dyn Exporter>,
     reported: &Reported<'_>,
 ) -> Result<(), Failure> {
-    events::start(&Start {
-        command: "export",
-        format: reported.args.format.name(),
-        mailbox: &reported.args.mailbox,
-        output: &reported.args.output,
-        selected: reported.count,
-    })
-    .and_then(|()| events::index(reported.origin))
-    .map_err(stdout_failure)?;
+    if reported.report == Report::Events {
+        events::start(&Start {
+            command: "export",
+            format: reported.args.format.name(),
+            mailbox: &reported.args.mailbox,
+            output: &reported.args.output,
+            selected: reported.count,
+        })
+        .and_then(|()| events::index(reported.origin))
+        .map_err(stdout_failure)?;
+    }
     let failure = Arc::new(OnceLock::new());
     let cancel = CancelToken::new();
-    let hook = progress_hook(Arc::clone(&failure), cancel.clone());
-    let result = export.cancel_token(cancel).on_progress(hook).run(exporter);
+    let mut observer = Observer::new(reported, Arc::clone(&failure), cancel.clone());
+    let result = export
+        .cancel_token(cancel)
+        .on_progress(move |progress| observer.observe(progress))
+        .run(exporter);
+    if reported.feedback.draws() {
+        Bar::new(io::stderr(), Instant::now())
+            .clear()
+            .map_err(stderr_failure)?;
+    }
     if let Some(source) = Arc::into_inner(failure).and_then(OnceLock::into_inner) {
         return Err(stdout_failure(source));
     }
     let summary = result.map_err(|error| Failure::after_open(Box::new(error)))?;
-    finish(reported, &summary).map_err(stdout_failure)
+    finish(reported, &summary)
 }
 
-/// A progress hook that writes at most one event per interval; the first write that fails is kept
-/// in `failure` and cancels the export.
-fn progress_hook(
-    failure: Arc<OnceLock<io::Error>>,
-    cancel: CancelToken,
-) -> impl FnMut(Progress) + Send + 'static {
-    let mut throttle = Throttle::new(events::PROGRESS_INTERVAL);
-    move |progress| {
-        if !throttle.admit(Instant::now()) {
-            return;
-        }
-        if let Err(error) = events::progress(Counts::from(progress))
-            && failure.set(error).is_ok()
-        {
-            cancel.cancel();
-        }
+/// Finishes a successful export: the events when asked for, then the summary line.
+fn finish(reported: &Reported<'_>, summary: &ExportSummary) -> Result<(), Failure> {
+    // Standard output is refused for `--json`, so an event run always committed a path; a text
+    // run to standard output names it `-`.
+    let path = summary.path.as_deref().unwrap_or(&reported.args.output);
+    if reported.report == Report::Events {
+        finish_events(reported, summary, path).map_err(stdout_failure)?;
     }
+    progress::print_summary(reported.feedback, summary, path).map_err(stderr_failure)
 }
 
 /// Writes the events that follow a finished export: the last `progress`, `file` and `summary`.
-fn finish(reported: &Reported<'_>, summary: &ExportSummary) -> io::Result<()> {
-    // Standard output is refused for `--json`, so the export always committed a path.
-    let path = summary.path.as_deref().unwrap_or(&reported.args.output);
+fn finish_events(reported: &Reported<'_>, summary: &ExportSummary, path: &Path) -> io::Result<()> {
     events::progress(Counts {
         bytes: summary.bytes,
         messages: summary.messages,
@@ -310,6 +381,14 @@ fn finish(reported: &Reported<'_>, summary: &ExportSummary) -> io::Result<()> {
 fn stdout_failure(source: io::Error) -> Failure {
     Failure::after_open(Box::new(MboxTurboError::Io {
         path: PathBuf::from("standard output"),
+        source,
+    }))
+}
+
+/// A line that could not be written to standard error, as an I/O failure.
+fn stderr_failure(source: io::Error) -> Failure {
+    Failure::after_open(Box::new(MboxTurboError::Io {
+        path: PathBuf::from("standard error"),
         source,
     }))
 }
