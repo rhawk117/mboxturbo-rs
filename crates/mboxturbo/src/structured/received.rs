@@ -50,13 +50,13 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 /// One list of `{key, value, offset}` entries per element.
 #[derive(Debug)]
 struct PairLists {
-    /// Keys.
+    /// The key of each pair, as written before the separator.
     key: StringBuilder,
     /// Byte offsets of the keys into the header value.
     offset: UInt64Builder,
-    /// List boundaries.
+    /// List boundaries: which pairs belong to which element.
     shape: Shape,
-    /// Values.
+    /// The value of each pair, as written after the separator; empty when the pair has none.
     value: StringBuilder,
 }
 
