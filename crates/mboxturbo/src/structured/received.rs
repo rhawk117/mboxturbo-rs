@@ -19,10 +19,8 @@ use super::{
     struct_item, struct_list_field, with_issues,
 };
 use crate::fields::Mail;
+use crate::verdict::RECEIVED;
 use crate::width::widen;
-
-/// The `Received` header name, lowercase.
-const RECEIVED: &str = "received";
 
 /// The `Received-SPF` header name, lowercase.
 const RECEIVED_SPF: &str = "received-spf";

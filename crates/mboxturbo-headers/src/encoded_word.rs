@@ -4,13 +4,13 @@
 //! whitespace byte, so the work stays linear in the input length however hostile the input.
 
 use std::borrow::Cow;
-use std::iter;
+use std::{iter, mem};
 
 use encoding_rs::{Encoding, REPLACEMENT};
 
 use crate::caps::{Cap, MAX_ENCODED_WORDS};
 use crate::issue::{Issue, IssueKind, Parsed};
-use crate::tokenize::bound;
+use crate::tokenize::{bound, slice_checked};
 
 /// The output being built.
 struct Decoder {
@@ -27,6 +27,8 @@ struct Decoder {
 struct Found<'src> {
     /// Offset of the first word beyond [`MAX_ENCODED_WORDS`]; the scan stopped there.
     cap_offset: Option<usize>,
+    /// Issues from locating the words.
+    issues: Vec<Issue>,
     /// The bytes after the last word found.
     tail: &'src [u8],
     /// Offset where `tail` starts.
@@ -136,16 +138,17 @@ fn decode_base64(text: &[u8]) -> Option<Vec<u8>> {
 #[must_use]
 pub fn decode_encoded_words(value: &[u8]) -> Parsed<Cow<'_, str>> {
     let (head, cut) = bound(value);
-    let found = find_words(head);
+    let mut found = find_words(head);
     if found.words.is_empty()
         && found.cap_offset.is_none()
+        && found.issues.is_empty()
         && let Ok(text) = str::from_utf8(head)
     {
         return Parsed::new(Cow::Borrowed(text), cut);
     }
     let mut decoder = Decoder {
         after_word: false,
-        issues: Vec::new(),
+        issues: mem::take(&mut found.issues),
         out: String::new(),
     };
     for word in &found.words {
@@ -209,6 +212,7 @@ fn find_words(value: &[u8]) -> Found<'_> {
     let mut prev_end = 0;
     let mut pos = 0;
     let mut cap_offset = None;
+    let mut issues = Vec::new();
     while let Some(start) = next_marker(value, pos) {
         let Some(word) = locate_word(value, start, prev_end) else {
             pos = start.saturating_add(1);
@@ -222,9 +226,11 @@ fn find_words(value: &[u8]) -> Found<'_> {
         pos = prev_end;
         words.push(word);
     }
+    let tail = slice_checked(value, prev_end, value.len(), &mut issues);
     Found {
         cap_offset,
-        tail: value.get(prev_end..).unwrap_or(&[]),
+        issues,
+        tail,
         tail_offset: prev_end,
         words,
     }

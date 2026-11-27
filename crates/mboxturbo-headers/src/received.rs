@@ -562,6 +562,8 @@ fn read_date(value: &[u8], semicolon: Option<usize>) -> (Option<Instant>, Vec<Is
         );
     };
     let base = offset.saturating_add(1);
+    // `base` is at most the value length, so the empty date text the `;` ends on is a real
+    // slice; any other miss would mean no text after the `;`, which reads as no date.
     let (date, issues) = parse_date(value.get(base..).unwrap_or(&[])).into_parts();
     let shifted = issues
         .into_iter()
@@ -1061,6 +1063,18 @@ mod tests {
             parsed.value().hops().first().and_then(Hop::ip),
             Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
             "the recorded address wins over the literal"
+        );
+    }
+
+    #[test]
+    fn a_literal_only_from_clause_is_an_untrusted_sender() {
+        let literal_only = "from [192.0.2.9] by mx.example.com; 3 Nov 2026 10:00:00 +0000";
+        let set = trusting_our_servers();
+        let parsed = parse(&[literal_only], Some(&set));
+        assert_eq!(
+            parsed.value().first_external(),
+            Some(0),
+            "a literal with no recorded comment is the sender's claim, so the hop crosses"
         );
     }
 

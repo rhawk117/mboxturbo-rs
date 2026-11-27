@@ -204,7 +204,7 @@ impl<'src> Scanner<'src> {
     }
 
     /// The decoded text of `body`, borrowed when nothing was dropped.
-    fn body_text(&self, body: &Body) -> Cow<'src, str> {
+    fn body_text(&mut self, body: &Body) -> Cow<'src, str> {
         let content = self.slice(body.start, body.end);
         if body.skips.is_empty() {
             return String::from_utf8_lossy(content);
@@ -267,10 +267,9 @@ impl<'src> Scanner<'src> {
         body
     }
 
-    /// The bytes in `start..end`; both bounds are always within the input by construction,
-    /// so the empty fallback is unreachable.
-    fn slice(&self, start: usize, end: usize) -> &'src [u8] {
-        self.bytes.get(start..end).unwrap_or(&[])
+    /// The bytes in `start..end`, through [`slice_checked`].
+    fn slice(&mut self, start: usize, end: usize) -> &'src [u8] {
+        slice_checked(self.bytes, start, end, &mut self.issues)
     }
 
     /// Emits a one-byte special token and moves past it.
@@ -329,6 +328,26 @@ pub(crate) fn bound(value: &[u8]) -> (&[u8], Vec<Issue>) {
         },
         _ => (value, Vec::new()),
     }
+}
+
+/// The bytes of `bytes` in `start..end`. Every caller derives both bounds from the input, so a
+/// range outside it means a broken cursor: it is reported as a [`IssueKind::MalformedEntry`] at
+/// `start` and read as empty, so the parse goes on and the fault shows in the issues.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "shared with sibling parsers; `pub` would trip unreachable_pub"
+)]
+pub(crate) fn slice_checked<'bytes>(
+    bytes: &'bytes [u8],
+    start: usize,
+    end: usize,
+    issues: &mut Vec<Issue>,
+) -> &'bytes [u8] {
+    let Some(slice) = bytes.get(start..end) else {
+        issues.push(Issue::new(IssueKind::MalformedEntry, start));
+        return &[];
+    };
+    slice
 }
 
 /// One [`IssueKind::InvalidUtf8`] issue for each invalid sequence in `bytes`.

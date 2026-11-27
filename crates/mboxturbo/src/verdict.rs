@@ -14,21 +14,21 @@ pub(crate) const RECEIVED: &str = "received";
 
 /// One `Authentication-Results` header with the trust its authserv-id and position earn.
 pub(crate) struct DecidedResults<'mail> {
-    /// The issues the parse reported.
+    /// The issues the parse reported, in the order the parser found them.
     issues: Vec<Issue>,
-    /// The parsed header.
+    /// The parsed header, with the trust each of its results earned.
     results: AuthenticationResults<'mail>,
     /// Whether the header is trusted, from [`decide_status`].
     status: TrustStatus,
 }
 
 impl<'mail> DecidedResults<'mail> {
-    /// The issues the parse reported.
+    /// The issues the parse reported, in the order the parser found them.
     pub(crate) fn issues(&self) -> &[Issue] {
         &self.issues
     }
 
-    /// The parsed header.
+    /// The parsed header, with the trust each of its results earned.
     pub(crate) const fn results(&self) -> &AuthenticationResults<'mail> {
         &self.results
     }
@@ -131,6 +131,7 @@ fn decide_status(
 /// `received` holds the position and raw value of every `Received` header in header order.
 fn first_external_position(received: &[(usize, &[u8])], trust: &TrustSet) -> Option<usize> {
     let values: Vec<&[u8]> = received.iter().map(|&(_, value)| value).collect();
+    // The hop issues are not lost: they surface through the `received_hops` column.
     let (chain, _issues) = parse_received_hops(&values, Some(trust)).into_parts();
     let hop = chain.hops().get(chain.first_external()?)?;
     received

@@ -56,6 +56,17 @@ impl<'src> ChainValidation<'src> {
             Self::Other(Cow::Borrowed(text))
         }
     }
+
+    /// The `cv=` text: lowercase for a status with a variant of its own, verbatim for any other.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Fail => "fail",
+            Self::None => "none",
+            Self::Other(text) => text,
+            Self::Pass => "pass",
+        }
+    }
 }
 
 /// The ARC headers that share one instance number; any of the three may be absent.
@@ -165,6 +176,7 @@ fn read_tags<'src>(value: &'src [u8], issues: &mut Vec<Issue>) -> Option<(u8, Ta
 
 /// Offset of the first byte at or after `at` that is not ASCII whitespace.
 fn skip_space(value: &[u8], at: usize) -> usize {
+    // An offset past the end has no bytes to skip, so the empty rest is the right answer.
     let rest = value.get(at..).unwrap_or(&[]);
     at.saturating_add(
         rest.iter()

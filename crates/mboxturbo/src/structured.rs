@@ -511,7 +511,7 @@ impl ArcSetsColumn {
             None => self.results.push_absent(),
         }
         self.chain_validation
-            .append_option(set.chain_validation().as_ref().map(chain_validation_name));
+            .append_option(set.chain_validation().as_ref().map(ChainValidation::name));
     }
 }
 
@@ -707,17 +707,6 @@ fn arc_sets_fields() -> Fields {
 /// The struct of one `auth_results` element: the results plus their issues.
 fn auth_results_fields() -> Fields {
     with_issues(&results_fields())
-}
-
-/// The `cv=` text of a seal, lowercase for the known statuses.
-fn chain_validation_name<'status>(status: &'status ChainValidation<'_>) -> &'status str {
-    match status {
-        ChainValidation::Fail => "fail",
-        ChainValidation::None => "none",
-        ChainValidation::Other(text) => text,
-        ChainValidation::Pass => "pass",
-        _ => "unknown",
-    }
 }
 
 /// The struct of one `dkim_signatures` element.

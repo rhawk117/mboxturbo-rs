@@ -9,7 +9,7 @@
 use std::ops::RangeInclusive;
 
 use crate::issue::{Issue, IssueKind, Parsed};
-use crate::tokenize::{Token, TokenKind, bound, tokenize};
+use crate::tokenize::{Token, TokenKind, bound, slice_checked, tokenize};
 
 /// Seconds in a day.
 const DAY_SECONDS: i64 = 86_400;
@@ -171,7 +171,8 @@ impl<'tok> Cursor<'tok> {
     fn numeric_zone(&mut self, token: &Token<'_>, sign: Sign) -> Option<i16> {
         self.bump();
         let offset = token.offset();
-        let digits = token.text().as_bytes().get(1..).unwrap_or(&[]);
+        let text = token.text().as_bytes();
+        let digits = slice_checked(text, 1, text.len(), &mut self.issues);
         let digits_offset = offset.saturating_add(1);
         let pieces = match digits.len() {
             4 => number_of(digits.get(..2)?, digits_offset).zip(Some(number_of(
@@ -447,7 +448,12 @@ impl<'src> Raw<'src> {
     /// that point when it does.
     fn looks_iso(&mut self) -> bool {
         self.skip_space();
-        let rest = self.value.get(self.position..).unwrap_or(&[]);
+        let rest = slice_checked(
+            self.value,
+            self.position,
+            self.value.len(),
+            &mut self.issues,
+        );
         let year = rest
             .get(..4)
             .is_some_and(|bytes| bytes.iter().all(u8::is_ascii_digit));
