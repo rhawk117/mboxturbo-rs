@@ -166,10 +166,18 @@ fn clock(seconds: u128) -> String {
     format!("{}h{:02}m", minutes.div_euclid(60), minutes.rem_euclid(60))
 }
 
-/// The summary line of a finished export written to `path`.
-pub(crate) fn summary_line(summary: &ExportSummary, path: &Path) -> String {
+/// The summary line of a finished export written to `path`, with the number of undated messages
+/// the date bounds excluded when it is not zero.
+pub(crate) fn summary_line(
+    summary: &ExportSummary,
+    path: &Path,
+    excluded_undated: Option<usize>,
+) -> String {
+    let excluded = excluded_undated
+        .filter(|&count| count > 0)
+        .map_or_else(String::new, |count| format!(" ({count} undated excluded)"));
     format!(
-        "exported {} messages, {} bytes to {} in {:.1}s",
+        "exported {} messages, {} bytes to {} in {:.1}s{excluded}",
         summary.messages,
         summary.bytes,
         path.display(),
@@ -198,11 +206,16 @@ pub(crate) fn print_summary(
     feedback: Feedback,
     summary: &ExportSummary,
     path: &Path,
+    excluded_undated: Option<usize>,
 ) -> io::Result<()> {
     if !feedback.speaks() {
         return Ok(());
     }
-    writeln!(io::stderr(), "{}", summary_line(summary, path))
+    writeln!(
+        io::stderr(),
+        "{}",
+        summary_line(summary, path, excluded_undated)
+    )
 }
 
 #[cfg(test)]

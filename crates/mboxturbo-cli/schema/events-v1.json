@@ -62,7 +62,7 @@
     },
     {
       "title": "summary",
-      "description": "The export finished; the last line of a successful run.",
+      "description": "The export finished; the last line of a successful run. excluded_undated is present only when --since or --until was given: the number of messages with no index date, which the bounds exclude.",
       "type": "object",
       "required": ["v", "event", "messages", "bytes", "path", "elapsed_ms"],
       "additionalProperties": false,
@@ -72,7 +72,8 @@
         "messages": { "type": "integer" },
         "bytes": { "type": "integer" },
         "path": { "type": "string" },
-        "elapsed_ms": { "type": "integer" }
+        "elapsed_ms": { "type": "integer" },
+        "excluded_undated": { "type": "integer", "minimum": 0 }
       }
     },
     {

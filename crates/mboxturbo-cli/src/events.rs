@@ -97,6 +97,8 @@ pub(crate) struct Summary<'run> {
     pub bytes: u64,
     /// Wall-clock time the export took.
     pub elapsed: Duration,
+    /// Undated messages the date bounds excluded; `None` when no bound was given.
+    pub excluded_undated: Option<usize>,
     /// Messages written.
     pub messages: u64,
     /// The committed file or directory.
@@ -222,14 +224,18 @@ pub(crate) fn start(start: &Start<'_>) -> io::Result<()> {
 ///
 /// The I/O error of writing to standard output.
 pub(crate) fn summary(summary: &Summary<'_>) -> io::Result<()> {
-    emit(&json!({
+    let mut event = json!({
         "v": VERSION,
         "event": "summary",
         "bytes": summary.bytes,
         "elapsed_ms": millis(summary.elapsed),
         "messages": summary.messages,
         "path": summary.path.display().to_string(),
-    }))
+    });
+    if let (Some(count), Some(object)) = (summary.excluded_undated, event.as_object_mut()) {
+        let _absent = object.insert("excluded_undated".to_owned(), json!(count));
+    }
+    emit(&event)
 }
 
 /// Whole milliseconds in `duration`, saturating rather than wrapping.

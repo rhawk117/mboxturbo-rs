@@ -15,6 +15,7 @@ use mboxturbo::{
     Selection,
 };
 
+use crate::dates::{Bounds, DateError};
 use crate::events::{self, Counts, File, Report, Start, Summary, Throttle};
 use crate::exit::{self, Stage};
 use crate::progress::{self, Bar, Feedback};
@@ -83,6 +84,12 @@ impl fmt::Display for Failure {
     }
 }
 
+impl From<DateError> for Failure {
+    fn from(error: DateError) -> Self {
+        Self::Usage(error.to_string())
+    }
+}
+
 impl From<SelectError> for Failure {
     fn from(error: SelectError) -> Self {
         Self::Usage(error.to_string())
@@ -117,6 +124,14 @@ pub(crate) struct ExportArgs {
     /// A file of selections, one SPEC per line; blank lines are ignored.
     #[arg(long, value_name = "FILE")]
     select_file: Option<PathBuf>,
+    /// Keep only messages dated at or after this moment: an RFC 3339 timestamp with an offset or
+    /// a date `YYYY-MM-DD` (midnight UTC). Messages with no date are excluded.
+    #[arg(long, value_name = "WHEN")]
+    since: Option<Box<str>>,
+    /// Keep only messages dated before this moment, in the same forms as `--since`. Messages
+    /// with no date are excluded.
+    #[arg(long, value_name = "WHEN")]
+    until: Option<Box<str>>,
 }
 
 impl ExportArgs {
@@ -184,6 +199,8 @@ struct Selected {
     count: usize,
     /// What the library is asked to write.
     selection: Selection,
+    /// How many undated messages the date bounds excluded; `None` when no bound was given.
+    undated: Option<usize>,
 }
 
 /// What one export reports besides the library's own progress and summary, and how.
@@ -198,6 +215,8 @@ struct Reported<'run> {
     origin: IndexOrigin,
     /// Whether standard output carries events or text.
     report: Report,
+    /// How many undated messages the date bounds excluded; `None` when no bound was given.
+    undated: Option<usize>,
 }
 
 /// Receives the library's progress: redraws the bar and, with events, writes throttled
@@ -281,8 +300,9 @@ pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Resu
     let columns = columns(args.format, args.columns.as_deref())?;
     let destination = destination(args.format, &args.output)?;
     let ranges = select::parse_all(&args.select)?;
+    let bounds = Bounds::parse(args.since.as_deref(), args.until.as_deref())?;
     let mailbox = open(&args.mailbox, args.index.as_deref())?;
-    let selected = selection(args, ranges, &mailbox)?;
+    let selected = selection(args, ranges, bounds, &mailbox)?;
     let pipeline = Arc::new(Pipeline::new(columns, BATCH_SIZE));
     let exporter = args.format.exporter(mailbox.len());
     let origin = mailbox.index_origin();
@@ -295,6 +315,7 @@ pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Resu
         feedback,
         origin,
         report,
+        undated: selected.undated,
     };
     progress::note_origin(feedback, origin).map_err(stderr_failure)?;
     run_export(export, exporter, &reported)
@@ -382,7 +403,8 @@ fn finish(reported: &Reported<'_>, summary: &ExportSummary) -> Result<(), Failur
     if reported.report == Report::Events {
         finish_events(reported, summary, path).map_err(stdout_failure)?;
     }
-    progress::print_summary(reported.feedback, summary, path).map_err(stderr_failure)
+    progress::print_summary(reported.feedback, summary, path, reported.undated)
+        .map_err(stderr_failure)
 }
 
 /// Writes the events that follow a finished export: the last `progress`, `file` and `summary`.
@@ -403,6 +425,7 @@ fn finish_events(reported: &Reported<'_>, summary: &ExportSummary, path: &Path) 
         elapsed: summary.elapsed,
         messages: summary.messages,
         path,
+        excluded_undated: reported.undated,
     })
 }
 
@@ -524,18 +547,59 @@ fn is_missing(error: &MboxTurboError, mailbox: &Path) -> bool {
     )
 }
 
-/// The messages to export: every message when no selection is given, otherwise the union of
-/// `ranges` (from `--select`) and the `--select-file` lines.
+/// The messages to export: those `args` select by position, or every message, that also fall
+/// inside `bounds`.
+///
+/// Positions come out ascending and without repeats whatever order `--select` lists them in, so
+/// the export keeps mailbox order.
 fn selection(
+    args: &ExportArgs,
+    ranges: Vec<Range<usize>>,
+    bounds: Bounds,
+    mailbox: &Mailbox,
+) -> Result<Selected, Failure> {
+    let chosen = chosen_positions(args, ranges, mailbox)?;
+    if bounds.is_open() {
+        return Ok(unbounded(chosen, mailbox.len()));
+    }
+    let dated = mailbox.date_range(bounds.since, bounds.until);
+    let undated = dated.undated;
+    let mut positions = dated.positions;
+    if let Some(picked) = chosen {
+        positions.retain(|position| picked.binary_search(position).is_ok());
+    }
+    Ok(Selected {
+        count: positions.len(),
+        selection: Selection::Positions(positions),
+        undated: Some(undated),
+    })
+}
+
+/// What an export with no date bound writes: the `chosen` positions, or all `len` messages.
+fn unbounded(chosen: Option<Vec<usize>>, len: usize) -> Selected {
+    chosen.map_or_else(
+        || Selected {
+            count: len,
+            selection: Selection::All,
+            undated: None,
+        },
+        |positions| Selected {
+            count: positions.len(),
+            selection: Selection::Positions(positions),
+            undated: None,
+        },
+    )
+}
+
+/// The ascending positions named by `ranges` (from `--select`) united with the `--select-file`
+/// lines; `None` when neither is given.
+fn chosen_positions(
     args: &ExportArgs,
     mut ranges: Vec<Range<usize>>,
     mailbox: &Mailbox,
-) -> Result<Selected, Failure> {
+) -> Result<Option<Vec<usize>>, Failure> {
     if args.select.is_empty() && args.select_file.is_none() {
-        return Ok(Selected {
-            count: mailbox.len(),
-            selection: Selection::All,
-        });
+        return Ok(None);
     }
     if let Some(path) = &args.select_file {
         ranges.extend(select_file(path)?);
@@ -546,11 +610,7 @@ fn selection(
             )));
         }
     }
-    let positions = select::positions(ranges, mailbox.len())?;
-    Ok(Selected {
-        count: positions.len(),
-        selection: Selection::Positions(positions),
-    })
+    Ok(Some(select::positions(ranges, mailbox.len())?))
 }
 
 /// The ranges named by the lines of the file at `path`; blank lines are ignored.

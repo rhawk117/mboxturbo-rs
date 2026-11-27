@@ -24,6 +24,7 @@
               uses syn 3"
 )]
 
+mod dates;
 mod events;
 mod exit;
 mod export;
