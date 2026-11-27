@@ -3,9 +3,9 @@
 
 #[cfg(test)]
 mod show_info {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::path::PathBuf;
-    use std::process::{Command, Output};
+    use std::process::{Command, Output, Stdio};
 
     use tempfile::TempDir;
 
@@ -221,5 +221,26 @@ mod show_info {
             stderr(&quiet)
         );
         assert_eq!(loud.stdout, quiet.stdout, "stdout does not change");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn show_exits_74_when_standard_output_cannot_take_the_bytes() {
+        let fixture = Fixture::new();
+        let full = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full opens for writing");
+        let output = Command::new(env!("CARGO_BIN_EXE_mboxturbo"))
+            .args(["show", fixture.mailbox(), "0"])
+            .stdout(Stdio::from(full))
+            .output()
+            .expect("the built mboxturbo binary runs");
+        assert_eq!(
+            code(&output),
+            74_i32,
+            "T13 FC-1: show must not exit 0 when its bytes did not reach stdout: {}",
+            stderr(&output)
+        );
     }
 }

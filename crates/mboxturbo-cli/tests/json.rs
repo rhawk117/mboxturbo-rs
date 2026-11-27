@@ -502,6 +502,39 @@ mod json {
     }
 
     #[test]
+    fn info_of_a_dated_mailbox_writes_its_span_as_strings_valid_against_the_schema() {
+        let dir = TempDir::new().expect("a temporary directory is created");
+        let mbox = dir.path().join("dated.mbox");
+        fs::write(
+            &mbox,
+            concat!(
+                "From a@example.com Mon Jan  1 00:00:00 2024\nSubject: zero\n",
+                "Date: Tue, 5 Mar 2024 12:30:15 +0000\n\nbody zero\n\n",
+                "From b@example.com Mon Jan  1 00:00:00 2024\nSubject: one\n",
+                "Date: Mon, 1 Jan 2024 00:00:00 +0000\n\nbody one\n"
+            ),
+        )
+        .expect("the dated mailbox is written");
+        let output = run(&["info", mbox.to_str().expect("the path is UTF-8"), "--json"]);
+        assert_eq!(code(&output), 0_i32, "info succeeds: {}", stderr(&output));
+        let events = events(&output);
+        assert_eq!(names(&events), ["info"], "one info event and nothing else");
+        assert_eq!(
+            (&events[0]["earliest"], &events[0]["latest"]),
+            (
+                &Value::from("2024-01-01T00:00:00Z"),
+                &Value::from("2024-03-05T12:30:15Z")
+            ),
+            "T13 FC-2: a dated mailbox reports its span as strings"
+        );
+        assert_eq!(
+            violations(&schema(), &events[0]),
+            Vec::<String>::new(),
+            "the dated info event is valid against the schema"
+        );
+    }
+
+    #[test]
     fn show_with_json_ends_in_an_error_event_and_writes_no_message() {
         let fixture = Fixture::new();
         let mbox = fixture.mbox.to_str().expect("the fixture path is UTF-8");

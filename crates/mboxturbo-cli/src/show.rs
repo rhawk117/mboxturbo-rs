@@ -45,8 +45,7 @@ pub(crate) fn run(args: &ShowArgs, report: Report, feedback: Feedback) -> Result
             },
         )));
     };
-    io::stdout()
-        .lock()
-        .write_all(raw)
-        .map_err(export::stdout_failure)
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(raw).map_err(export::stdout_failure)?;
+    stdout.flush().map_err(export::stdout_failure)
 }
