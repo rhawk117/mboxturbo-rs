@@ -8,8 +8,8 @@ mod properties {
     use mboxturbo_headers::{
         ArcHeader, Cap, Issue, IssueKind, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES,
         MAX_HEADER_BYTES, MAX_RECEIVED_HOPS, TrustSet, decode_encoded_words, parse_arc_sets,
-        parse_authentication_results, parse_date, parse_dkim_signature, parse_received_hops,
-        parse_received_spf, parse_tag_list, tokenize,
+        parse_authentication_results, parse_date, parse_dkim_signature, parse_ms_antispam,
+        parse_received_hops, parse_received_spf, parse_tag_list, tokenize,
     };
     use proptest::prelude::*;
 
@@ -68,6 +68,10 @@ mod properties {
 
     fn received_spf_adversarial() -> impl Strategy<Value = Vec<u8>> {
         from_alphabet(b";;==  \r\n\"()passfilnetrk-ip.:1a0")
+    }
+
+    fn ms_antispam_adversarial() -> impl Strategy<Value = Vec<u8>> {
+        from_alphabet(b";;::  \r\n()SCLBCIPSRV.-0123456789abcdef\xff")
     }
 
     fn received_adversarial() -> impl Strategy<Value = Vec<Vec<u8>>> {
@@ -233,6 +237,16 @@ mod properties {
         }
 
         #[test]
+        fn parse_ms_antispam_survives_arbitrary_bytes(input in arbitrary_bytes()) {
+            assert_offsets_within(parse_ms_antispam(&input).issues(), input.len())?;
+        }
+
+        #[test]
+        fn parse_ms_antispam_survives_adversarial_separators(input in ms_antispam_adversarial()) {
+            assert_offsets_within(parse_ms_antispam(&input).issues(), input.len())?;
+        }
+
+        #[test]
         fn parse_received_hops_survives_arbitrary_headers(
             raw in prop::collection::vec(arbitrary_bytes(), 0..8),
             trusted in any::<bool>(),
@@ -344,6 +358,14 @@ mod properties {
             let mut input = b"pass".to_vec();
             input.extend(b"; k=v".repeat(MAX_ENTRIES.saturating_add(extra)));
             let issues = parse_received_spf(&input).issues().to_vec();
+            prop_assert_eq!(cap_issues(&issues, Cap::Entries), 1, "one Entries issue");
+            assert_offsets_within(&issues, input.len())?;
+        }
+
+        #[test]
+        fn more_ms_antispam_entries_than_the_cap_are_reported_once(extra in 1_usize..64) {
+            let input = b"K:v;".repeat(MAX_ENTRIES.saturating_add(extra));
+            let issues = parse_ms_antispam(&input).issues().to_vec();
             prop_assert_eq!(cap_issues(&issues, Cap::Entries), 1, "one Entries issue");
             assert_offsets_within(&issues, input.len())?;
         }
