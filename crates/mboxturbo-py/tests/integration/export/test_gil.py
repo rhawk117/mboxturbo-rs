@@ -23,7 +23,9 @@ COLUMNS = (
     'text',
     'attachment_sha256',
 )
-MIN_SHARE = 0.2
+MIN_SHARE = 0.3
+READS = 12
+FLOATS = 3_000_000
 
 
 def count_while(work: Callable[[], object]) -> tuple[int, float]:
@@ -49,7 +51,19 @@ def count_while(work: Callable[[], object]) -> tuple[int, float]:
     return counts[0], elapsed
 
 
+def share(work: Callable[[], object]) -> tuple[float, float]:
+    """A Python thread's iterations during ``work`` over an idle run's, and the time."""
+    busy, elapsed = count_while(work)
+    idle, _ = count_while(lambda: time.sleep(elapsed))
+    return busy / idle, elapsed
+
+
 class TestGilRelease:
+    def test_a_call_that_holds_the_gil_starves_the_python_thread(self) -> None:
+        values = [float(index * 7919 % 1_000_003) for index in range(FLOATS)]
+        measured, elapsed = share(lambda: sorted(values))
+        assert measured < MIN_SHARE, f'share={measured:.3f} over {elapsed:.3f}s'
+
     @pytest.fixture
     def mailbox(self, mailbox_writer: MailboxWriter) -> Mailbox:
         drafts = [
@@ -70,10 +84,10 @@ class TestGilRelease:
     def test_a_python_thread_runs_while_a_consumer_reads_the_stream(
         self, mailbox: Mailbox, consume: Callable[[object], object]
     ) -> None:
-        def read() -> object:
-            return consume(mailbox.select(COLUMNS, batch_size=64))
+        def read() -> None:
+            for _ in range(READS):
+                consume(mailbox.select(COLUMNS, batch_size=64))
 
         read()
-        busy, elapsed = count_while(read)
-        idle, _ = count_while(lambda: time.sleep(elapsed))
-        assert busy > MIN_SHARE * idle, f'busy={busy} idle={idle} over {elapsed:.3f}s'
+        measured, elapsed = share(read)
+        assert measured > MIN_SHARE, f'share={measured:.3f} over {elapsed:.3f}s'
