@@ -3,9 +3,9 @@
 
 use std::borrow::Cow;
 
-use mail_parser::DateTime;
+use mboxturbo_headers::parse_date;
 
-use crate::fields::{timestamp, unfold};
+use crate::fields::unfold;
 
 /// Name of the header read, compared without regard to letter case.
 const NAME: &[u8; 5] = b"date:";
@@ -17,9 +17,10 @@ type Split<'bytes> = (&'bytes [u8], &'bytes [u8]);
 ///
 /// `message` is the stored bytes, with or without its leading `From ` line. Only the head is
 /// read, up to the first blank line, so a `Date:` line in the body never counts. When the
-/// header repeats, the last occurrence wins, as in `mail-parser`; if that one does not parse,
-/// the result is `None` even when an earlier one would. Absent, unparsable and out-of-range
-/// dates all give `None`, so a real date at exactly the Unix epoch is `Some(0)`.
+/// header repeats, the last occurrence wins; if that one does not parse, the result is `None`
+/// even when an earlier one would. The value is read by [`mboxturbo_headers::parse_date`], so
+/// asctime and the other lenient forms it accepts are dated. Absent, unparsable and
+/// out-of-range dates all give `None`, so a real date at exactly the Unix epoch is `Some(0)`.
 pub(crate) fn extract(message: &[u8]) -> Option<i64> {
     let mut rest = message;
     let mut last = None;
@@ -35,8 +36,8 @@ pub(crate) fn extract(message: &[u8]) -> Option<i64> {
 
 /// The unix seconds of the unfolded header text `value`; `None` when it is not a valid date.
 fn parse(value: &str) -> Option<i64> {
-    let date = DateTime::parse_rfc822(value).filter(DateTime::is_valid)?;
-    timestamp(&date, value).map(|stamp| stamp.unix_seconds)
+    let (instant, _issues) = parse_date(value.as_bytes()).into_parts();
+    instant.map(|found| found.unix_seconds())
 }
 
 /// The text after the colon of `header` when it is a `Date:` header, unfolded onto one line.
@@ -101,6 +102,7 @@ mod tests {
     const TWICE: &[u8] = b"From a\nDate: Mon, 01 Jan 2024 12:00:00 +0000\n\
                            Date: Tue, 02 Jan 2024 12:00:00 +0000\n\nb\n";
     const CRLF: &[u8] = b"From a\r\nDate: Mon, 01 Jan 2024 12:00:00 +0100\r\n\r\nb\r\n";
+    const ASCTIME: &[u8] = b"From a\nDate: Mon Jan  1 12:00:00 2024\n\nb\n";
     const BAD: &[u8] = b"From a\nDate: not a date\n\nb\n";
     const BODY_ONLY: &[u8] = b"From a\nSubject: s\n\nDate: Mon, 01 Jan 2024 12:00:00 +0000\n";
     const NONE: &[u8] = b"From a\nSubject: s\n\nb\n";
@@ -134,6 +136,21 @@ mod tests {
                 "the fixture carries a real date"
             );
         }
+    }
+
+    #[test]
+    fn an_asctime_date_is_dated_through_the_lenient_parser() {
+        assert_eq!(
+            extract(ASCTIME),
+            Some(1_704_110_400),
+            "asctime reads as 2024-01-01 12:00:00 UTC"
+        );
+        let (_file, mailbox) = mailbox(&[ASCTIME]);
+        assert_eq!(
+            mailbox.date(0),
+            Some(1_704_110_400),
+            "the index carries the asctime date"
+        );
     }
 
     #[test]

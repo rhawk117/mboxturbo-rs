@@ -437,6 +437,28 @@ body\n\n";
     }
 
     #[test]
+    fn a_version_three_cache_is_rebuilt_once_and_rewritten_as_version_four() {
+        let fixture = Fixture::new();
+        let _built = fixture.cached();
+        let mut old = fs::read(&fixture.index).expect("cache file is written");
+        assert_eq!(
+            old[8..12],
+            4_u32.to_le_bytes(),
+            "a fresh cache is version 4"
+        );
+        old[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        fs::write(&fixture.index, &old).expect("cache file is aged to version 3");
+        let rebuilt = fixture.cached();
+        assert_eq!(rebuilt.len(), 3, "the version-3 cache is rebuilt on open");
+        let after = fs::read(&fixture.index).expect("cache file is rewritten");
+        assert_eq!(
+            after[8..12],
+            4_u32.to_le_bytes(),
+            "the rewrite reads version 4"
+        );
+    }
+
+    #[test]
     fn a_corrupt_cache_is_reported_as_a_checksum_failure() {
         let fixture = Fixture::new();
         let built = fixture.cached();

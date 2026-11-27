@@ -15,6 +15,7 @@ categories.workspace = true
 arrow-array = { version = "60.1", features = ["ffi"] }
 arrow-schema = "60.1"
 mail-parser = { version = "=1.0.1", features = ["full_encoding"] }
+mboxturbo-headers = { path = "../mboxturbo-headers" }
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 parquet = { version = "60.1", default-features = false, features = ["arrow", "zstd", "snap"] }

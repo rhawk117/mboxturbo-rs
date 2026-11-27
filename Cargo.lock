@@ -620,6 +620,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "mail-parser",
+ "mboxturbo-headers",
  "memchr",
  "memmap2",
  "parquet",
