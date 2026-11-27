@@ -8,9 +8,9 @@
 //! | 1 | any other failure |
 //! | 64 | usage error: bad arguments, or a message position past the last message |
 //! | 65 | corrupt or stale index |
-//! | 66 | the mailbox does not exist |
+//! | 66 | the mailbox does not exist (not found while opening it) |
 //! | 73 | the export target exists and `--overwrite` was not given |
-//! | 74 | any other I/O error |
+//! | 74 | any other I/O error, including a path not found after the mailbox is open |
 //! | 130 | interrupted (the export was cancelled) |
 #![expect(
     clippy::redundant_pub_crate,
@@ -41,11 +41,13 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => {
             let code = if error.use_stderr() { USAGE } else { 0 };
+            // A clap message that cannot be written (a closed stdout or stderr) has nowhere left
+            // to be reported, so it exits 1, "any other failure", rather than the code it carried.
             return match error.print() {
                 Ok(()) => ExitCode::from(code),
                 Err(_) => ExitCode::from(1),
             };
         },
     };
-    ExitCode::from(exit::outcome_code(&Ok(())))
+    ExitCode::from(exit::outcome_code(exit::Stage::OpeningMailbox, &Ok(())))
 }

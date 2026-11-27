@@ -8,6 +8,8 @@ mod cli {
     fn run(args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_mboxturbo"))
             .args(args)
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
             .output()
             .expect("the built mboxturbo binary runs")
     }
@@ -28,7 +30,10 @@ mod cli {
     fn help_exits_zero() {
         let output = run(&["--help"]);
         assert_eq!(output.status.code(), Some(0_i32), "--help exits 0");
-        assert!(!output.stdout.is_empty(), "--help prints usage on stdout");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Usage: mboxturbo"),
+            "--help prints usage on stdout"
+        );
     }
 
     #[test]
@@ -39,7 +44,10 @@ mod cli {
             Some(64_i32),
             "a usage error exits 64, not clap's 2"
         );
-        assert!(!output.stderr.is_empty(), "clap's message goes to stderr");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--bogus"),
+            "clap's message names the bad flag on stderr"
+        );
         assert!(output.stdout.is_empty(), "nothing is printed on stdout");
     }
 }
