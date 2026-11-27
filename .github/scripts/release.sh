@@ -91,6 +91,9 @@ bump_release() {
   working_tree_status=$(git status --porcelain)
   [[ -z "${working_tree_status}" ]] || panic "Working tree is not clean."
 
+  uv lock --check --project "${PYTHON_PROJECT}" ||
+    panic "uv.lock is stale before the version bump; run uv lock and commit it."
+
   uv version --project "${PYTHON_PROJECT}" --bump "${VERSION_BUMP}" --no-sync
 
   release_version=$(uv version --project "${PYTHON_PROJECT}" --short)
@@ -127,9 +130,6 @@ synchronize_cargo_version() {
 
 synchronize_cli_extra_pin() {
   log::step "Synchronize CLI Extra Pin"
-
-  uv lock --check --project "${PYTHON_PROJECT}" ||
-    panic "uv.lock is stale before the version bump; run uv lock and commit it."
 
   local pin="mboxturbo-cli==${release_version}"
   sed -E "s/^(cli = \\[\")mboxturbo-cli==[^\"]*(\"\\])$/\\1${pin}\\2/" \
