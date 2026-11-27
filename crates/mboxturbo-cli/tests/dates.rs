@@ -2,6 +2,9 @@
 //! undated messages the bounds excluded, and exit 64 for a bound that is not a date.
 
 #[cfg(test)]
+mod common;
+
+#[cfg(test)]
 mod dates {
     use std::fs;
     use std::path::PathBuf;
@@ -9,6 +12,8 @@ mod dates {
 
     use serde_json::Value;
     use tempfile::TempDir;
+
+    use crate::common::{schema, violations};
 
     /// Positions 0 to 2 are at midnight UTC on 1 to 3 January 2024, 3 has no Date header, 4 has
     /// a Date that does not parse, and 5 is 12:00 at +02:00 on 4 January, which is 10:00 UTC.
@@ -26,8 +31,6 @@ mod dates {
         "From f@example.com Mon Jan  1 00:00:00 2024\n",
         "Date: Thu, 4 Jan 2024 12:00:00 +0200\nSubject: five\n\nbody five\n\n",
     );
-
-    const SCHEMA: &str = include_str!("../schema/events-v1.json");
 
     /// A temporary directory holding the six-message mailbox.
     struct Fixture {
@@ -104,18 +107,6 @@ mod dates {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let last = stdout.lines().last().expect("a run writes events");
         serde_json::from_str(last).expect("the last event is JSON")
-    }
-
-    /// The `summary` branch of the event schema.
-    fn summary_schema() -> Value {
-        let schema: Value = serde_json::from_str(SCHEMA).expect("the schema is JSON");
-        schema["oneOf"]
-            .as_array()
-            .expect("the schema lists its events")
-            .iter()
-            .find(|branch| branch["title"] == "summary")
-            .expect("the schema has a summary event")
-            .clone()
     }
 
     #[test]
@@ -203,42 +194,16 @@ mod dates {
         );
     }
 
-    /// Checks that the schema declares `excluded_undated` as an optional non-negative integer
-    /// and every key of `event`.
-    fn assert_declared_by_schema(event: &Value) {
-        let schema = summary_schema();
-        let declared = &schema["properties"]["excluded_undated"];
-        assert_eq!(
-            (declared["type"].as_str(), declared["minimum"].as_u64()),
-            (Some("integer"), Some(0)),
-            "the schema declares excluded_undated as a non-negative integer"
-        );
-        assert!(
-            !schema["required"]
-                .as_array()
-                .expect("required is a list")
-                .contains(&Value::from("excluded_undated")),
-            "the schema leaves excluded_undated optional"
-        );
-        let known = schema["properties"]
-            .as_object()
-            .expect("the summary schema lists its properties");
-        assert!(
-            event
-                .as_object()
-                .expect("an event is an object")
-                .keys()
-                .all(|key| known.contains_key(key)),
-            "every summary key is declared by the schema: {event}"
-        );
-    }
-
     #[test]
     fn the_summary_event_counts_the_undated_messages_a_bound_excluded() {
         let fixture = Fixture::new();
         let output = fixture.export(&["--json", "--since", "2024-01-01"]);
         let event = summary(&output);
-        assert_declared_by_schema(&event);
+        let broken = violations(&schema(), &event);
+        assert!(
+            broken.is_empty(),
+            "the summary event {event} breaks the schema: {broken:?}"
+        );
         assert_eq!(
             (
                 event["excluded_undated"].as_u64(),
@@ -308,5 +273,20 @@ mod dates {
                 stderr(&output)
             );
         }
+    }
+
+    #[test]
+    fn a_negative_excluded_undated_breaks_the_schema() {
+        let fixture = Fixture::new();
+        let mut event = summary(&fixture.export(&["--json", "--since", "2024-01-01"]));
+        assert!(
+            violations(&schema(), &event).is_empty(),
+            "the real summary event is valid: {event}"
+        );
+        event["excluded_undated"] = Value::from(-1_i32);
+        assert!(
+            !violations(&schema(), &event).is_empty(),
+            "a negative count is rejected: {event}"
+        );
     }
 }
