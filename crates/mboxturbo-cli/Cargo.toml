@@ -8,6 +8,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+# Ships as a maturin bin wheel (see pyproject.toml), not as a crate.
+publish = false
 keywords.workspace = true
 categories.workspace = true
 

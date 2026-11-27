@@ -8,6 +8,9 @@ authors = [{ name = "rhawk117", email = "noplaceLike127dot0dot0dot1@proton.me" }
 requires-python = ">=3.14"
 dependencies = []
 
+[project.optional-dependencies]
+cli = ["mboxturbo-cli==0.1.0"]
+
 [dependency-groups]
 dev = [
     "actionlint-py>=1.7.12.25",
@@ -41,6 +44,9 @@ markers = [
     "integration: exercises the compiled extension against files on disk",
     "regression: pins a bug that was fixed",
 ]
+
+[tool.uv.sources]
+mboxturbo-cli = { path = "crates/mboxturbo-cli" }
 
 [tool.uv]
 default-groups = ["dev", "polars"]
