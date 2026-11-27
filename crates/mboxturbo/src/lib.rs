@@ -34,6 +34,7 @@ mod scan;
 mod selection;
 mod staging;
 mod stream;
+mod structured;
 mod width;
 
 pub use builder::{IndexPolicy, IndexSource, MailboxBuilder};
@@ -43,6 +44,7 @@ pub use export::{CancelToken, Export, Exporter, Progress};
 pub use fingerprint::Fingerprint;
 pub use index::{BlockSize, Index, IndexBytes};
 pub use mailbox::{Mailbox, ParsedBatch};
+pub use mboxturbo_headers::TrustSet;
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use parquet::ParquetExporter;
 pub use pipeline::{BatchReader, Compression, Pipeline};

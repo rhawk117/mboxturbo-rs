@@ -9,11 +9,11 @@ mod pipeline {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray as _;
-    use arrow_array::types::{Int32Type, TimestampMicrosecondType, UInt64Type};
-    use arrow_array::{Array as _, RecordBatch};
+    use arrow_array::types::{Int32Type, TimestampMicrosecondType, UInt8Type, UInt64Type};
+    use arrow_array::{Array as _, RecordBatch, StructArray};
     use mboxturbo::{
         Column, Compression, Destination, Export, Mailbox, MboxTurboError, ParquetExporter,
-        Pipeline, Selection,
+        Pipeline, Selection, TrustSet,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use proptest::prelude::*;
@@ -57,6 +57,35 @@ AAEC\n\
         "Subject: no date\n",
         "Date: Mon, 01 Jan 2024 12:00:00 +0000\nDate: not a date\n",
     ];
+
+    const STRUCTURED: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Authentication-Results: evil.example; dmarc=pass header.from=example.org\n\
+Authentication-Results: mx.example.org; spf=pass smtp.mailfrom=example.org;\n\
+\tdkim=fail reason=\"bad sig\"\n\
+Subject: forged above real\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+ARC-Seal: i=1; a=rsa-sha256; cv=none; d=example.org; s=arc; b=c2VhbA==\n\
+ARC-Message-Signature: i=1; a=rsa-sha256; d=example.org; s=arc; h=from; bh=aGFzaA==; b=c2ln\n\
+ARC-Authentication-Results: i=1; mx.example.org; spf=pass\n\
+DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=sel; h=from:to; bh=aGFzaA==;\n\
+\tb=c2ln; t=1700000000\n\
+Subject: signed\n\
+\n\
+body\n\
+\n\
+From c@example.com Wed Jan  3 00:00:00 2024\n\
+DKIM-Signature: v=1; garbage\n\
+Subject: malformed signature\n\
+\n\
+body\n\
+\n\
+From d@example.com Thu Jan  4 00:00:00 2024\n\
+Subject: none of these headers\n\
+\n\
+body\n";
 
     struct Fixture {
         directory: TempDir,
@@ -591,6 +620,276 @@ AAEC\n\
             pool.install(|| 1_i32.saturating_add(1)),
             2_i32,
             "the pool still runs work after the reader was dropped"
+        );
+    }
+
+    fn structured_batch(columns: &[Column], trust: Option<TrustSet>) -> RecordBatch {
+        let fixture = Fixture::with(STRUCTURED);
+        let base = Pipeline::new(columns.to_vec(), 8);
+        let pipeline = Arc::new(match trust {
+            Some(set) => base.with_trust(set),
+            None => base,
+        });
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("four messages fit one batch of eight")
+            .expect("the structured batch is assembled")
+    }
+
+    fn trust_mx() -> TrustSet {
+        TrustSet::new().add_authserv_id("mx.example.org").clone()
+    }
+
+    /// The elements of row `row` of the list-of-struct column `column`.
+    fn elements(batch: &RecordBatch, column: usize, row: usize) -> StructArray {
+        batch
+            .column(column)
+            .as_list::<i32>()
+            .value(row)
+            .as_struct()
+            .clone()
+    }
+
+    fn text_field(elements: &StructArray, name: &str) -> Vec<Option<String>> {
+        elements
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("the element struct has a {name} field"))
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.map(str::to_owned))
+            .collect()
+    }
+
+    fn trusted_flags(elements: &StructArray) -> Vec<Option<bool>> {
+        elements
+            .column_by_name("trusted")
+            .expect("the element struct has a trusted field")
+            .as_boolean()
+            .iter()
+            .collect()
+    }
+
+    fn issue_kinds(elements: &StructArray, element: usize) -> Vec<String> {
+        let issues = elements
+            .column_by_name("issues")
+            .expect("the element struct has an issues field")
+            .as_list::<i32>()
+            .value(element);
+        text_field(issues.as_struct(), "kind")
+            .into_iter()
+            .map(|kind| kind.expect("an issue always has a kind"))
+            .collect()
+    }
+
+    #[test]
+    fn a_forged_topmost_authentication_results_is_untrusted_and_the_real_one_trusted() {
+        let batch = structured_batch(&[Column::AuthResults], Some(trust_mx()));
+        let first = elements(&batch, 0, 0);
+        assert_eq!(
+            text_field(&first, "authserv_id"),
+            vec![
+                Some("evil.example".to_owned()),
+                Some("mx.example.org".to_owned())
+            ],
+            "both headers are listed in header order"
+        );
+        assert_eq!(
+            trusted_flags(&first),
+            vec![Some(false), Some(true)],
+            "only the authserv-id in the trust set is trusted"
+        );
+    }
+
+    #[test]
+    fn without_a_trust_set_every_trusted_flag_is_null() {
+        let batch = structured_batch(&[Column::AuthResults], None);
+        assert_eq!(
+            trusted_flags(&elements(&batch, 0, 0)),
+            vec![None, None],
+            "nothing can be said without a trust set"
+        );
+    }
+
+    /// The `entries` of element `element` of the first message's `auth_results`.
+    fn entries_of(batch: &RecordBatch, element: usize) -> StructArray {
+        let first = elements(batch, 0, 0);
+        let list = first
+            .column_by_name("entries")
+            .expect("the element struct has an entries field")
+            .as_list::<i32>()
+            .value(element);
+        list.as_struct().clone()
+    }
+
+    #[test]
+    fn auth_results_entries_carry_method_result_and_reason() {
+        let batch = structured_batch(&[Column::AuthResults], None);
+        let entries = entries_of(&batch, 1);
+        assert_eq!(
+            text_field(&entries, "method"),
+            vec![Some("spf".to_owned()), Some("dkim".to_owned())],
+            "methods are named as written, in order"
+        );
+        assert_eq!(
+            text_field(&entries, "result"),
+            vec![Some("pass".to_owned()), Some("fail".to_owned())],
+            "results are named as written"
+        );
+        assert_eq!(
+            text_field(&entries, "reason"),
+            vec![None, Some("bad sig".to_owned())],
+            "a missing reason is null and a quoted one is unquoted"
+        );
+    }
+
+    #[test]
+    fn auth_results_entries_carry_their_properties() {
+        let batch = structured_batch(&[Column::AuthResults], None);
+        let entries = entries_of(&batch, 1);
+        let properties = entries
+            .column_by_name("properties")
+            .expect("the entry struct has a properties field")
+            .as_list::<i32>()
+            .value(0);
+        assert_eq!(
+            text_field(properties.as_struct(), "property"),
+            vec![Some("mailfrom".to_owned())],
+            "the spf entry has its smtp.mailfrom property"
+        );
+    }
+
+    #[test]
+    fn a_message_without_the_headers_gets_empty_lists_never_null() {
+        let batch = structured_batch(
+            &[Column::AuthResults, Column::ArcSets, Column::DkimSignatures],
+            None,
+        );
+        for column in 0..3 {
+            let list = batch.column(column).as_list::<i32>();
+            assert!(
+                list.is_valid(3),
+                "column {column} is not null for a bare message"
+            );
+            assert_eq!(
+                list.value(3).len(),
+                0,
+                "column {column} is empty for a bare message"
+            );
+        }
+    }
+
+    fn arc_sets_of_second_message() -> StructArray {
+        let batch = structured_batch(&[Column::ArcSets], Some(trust_mx()));
+        elements(&batch, 0, 1)
+    }
+
+    #[test]
+    fn three_arc_headers_of_one_instance_form_one_set_with_its_seal() {
+        let sets = arc_sets_of_second_message();
+        assert_eq!(sets.len(), 1, "the three ARC headers form one set");
+        let instances = sets
+            .column_by_name("instance")
+            .expect("the element struct has an instance field")
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec();
+        assert_eq!(instances, vec![1_u8], "the set is instance 1");
+        assert_eq!(
+            text_field(&sets, "chain_validation"),
+            vec![Some("none".to_owned())],
+            "the seal's cv tag is exposed"
+        );
+        assert!(
+            issue_kinds(&sets, 0).is_empty(),
+            "a complete ARC set has no issues"
+        );
+    }
+
+    #[test]
+    fn an_arc_sets_authentication_results_are_judged_by_the_trust_set() {
+        let sets = arc_sets_of_second_message();
+        let results = sets
+            .column_by_name("authentication_results")
+            .expect("the element struct has an authentication_results field")
+            .as_struct();
+        assert_eq!(
+            text_field(results, "authserv_id"),
+            vec![Some("mx.example.org".to_owned())],
+            "the ARC AR carries its authserv-id"
+        );
+        assert_eq!(
+            trusted_flags(results),
+            vec![Some(true)],
+            "the ARC AR is trusted"
+        );
+    }
+
+    #[test]
+    fn one_dkim_signature_yields_one_element_with_its_tags_and_no_issues() {
+        let batch = structured_batch(&[Column::DkimSignatures], None);
+        let signatures = elements(&batch, 0, 1);
+        assert_eq!(signatures.len(), 1, "one DKIM-Signature header");
+        assert_eq!(
+            text_field(&signatures, "domain"),
+            vec![Some("example.org".to_owned())],
+            "the d tag is exposed"
+        );
+        let other = signatures
+            .column_by_name("tags")
+            .expect("the element struct has a tags field")
+            .as_list::<i32>()
+            .value(0);
+        assert_eq!(
+            text_field(other.as_struct(), "name"),
+            vec![Some("t".to_owned())],
+            "only the tags without a column of their own are listed"
+        );
+        assert!(
+            issue_kinds(&signatures, 0).is_empty(),
+            "a well-formed signature, folded over two lines, has no issues"
+        );
+    }
+
+    #[test]
+    fn a_malformed_dkim_signature_yields_an_element_with_issues() {
+        let batch = structured_batch(&[Column::DkimSignatures], None);
+        let signatures = elements(&batch, 0, 2);
+        assert_eq!(
+            signatures.len(),
+            1,
+            "the malformed header still yields an element"
+        );
+        let kinds = issue_kinds(&signatures, 0);
+        assert!(
+            kinds.contains(&"missing_tag".to_owned()),
+            "the absent required tags are reported by name: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn structured_columns_round_trip_through_parquet() {
+        let fixture = Fixture::with(STRUCTURED);
+        let pipeline = Arc::new(
+            Pipeline::new(
+                vec![Column::AuthResults, Column::ArcSets, Column::DkimSignatures],
+                2,
+            )
+            .with_trust(trust_mx()),
+        );
+        assert_eq!(
+            fixture.export_parquet(&pipeline),
+            4,
+            "every message is written"
+        );
+        let rows: usize = fixture
+            .written_batches()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows, 4,
+            "the nested columns are read back for every message"
         );
     }
 

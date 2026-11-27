@@ -16,6 +16,7 @@ use arrow_array::builder::{
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
+use mboxturbo_headers::TrustSet;
 use sha2::{Digest as _, Sha256};
 
 use crate::columns::Column;
@@ -27,6 +28,7 @@ use crate::mailbox::Mailbox;
 use crate::message::Timestamp;
 use crate::selection::{Plan, Selection};
 use crate::stream::Ordered;
+use crate::structured::{ArcSetsColumn, AuthResultsColumn, DkimSignaturesColumn};
 use crate::width::widen;
 
 /// Parquet page compression.
@@ -68,6 +70,9 @@ pub struct Pipeline {
     probe: Option<Arc<dyn Probe>>,
     /// Arrow schema derived from `columns`, shared by every batch.
     schema: SchemaRef,
+    /// The trust set deciding the `trusted` flags of the structured columns; without one they
+    /// are null.
+    trust: Option<Arc<TrustSet>>,
 }
 
 /// A test hook told which runs each extraction job covers as the job starts.
@@ -90,6 +95,8 @@ struct Record<'mail> {
     raw: &'mail [u8],
     /// Byte range of the message in the mailbox file.
     span: Range<usize>,
+    /// The trust set of the pipeline, if it has one.
+    trust: Option<&'mail TrustSet>,
 }
 
 impl Record<'_> {
@@ -155,13 +162,18 @@ impl Pipeline {
                 raw,
                 span,
                 mail: parsed.as_ref(),
+                trust: self.trust.as_deref(),
             };
             for slot in &mut slots {
                 slot.append(&record);
             }
         }
-        let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
-        RecordBatch::try_new(self.schema(), arrays).map_err(|source| MboxTurboError::Arrow {
+        let batch = slots
+            .iter_mut()
+            .map(Slot::finish)
+            .collect::<Result<Vec<ArrayRef>, ArrowError>>()
+            .and_then(|arrays| RecordBatch::try_new(self.schema(), arrays));
+        batch.map_err(|source| MboxTurboError::Arrow {
             positions: covering(runs),
             source,
         })
@@ -178,6 +190,7 @@ impl Pipeline {
             batch_size: batch_size.max(1),
             #[cfg(test)]
             probe: None,
+            trust: None,
         }
     }
 
@@ -242,6 +255,14 @@ impl Pipeline {
             stream: Ordered::new(),
         })
     }
+
+    /// Sets the trust set that decides the `trusted` flag of the `auth_results` and `arc_sets`
+    /// columns. Without one every flag is null.
+    #[must_use]
+    pub fn with_trust(mut self, trust: TrustSet) -> Self {
+        self.trust = Some(Arc::new(trust));
+        self
+    }
 }
 
 impl BatchReader {
@@ -299,12 +320,18 @@ impl RecordBatchReader for BatchReader {
 enum Slot {
     /// Email addresses of one address header; an absent header gives an empty list.
     Addresses(AddressHeader, ListBuilder<StringBuilder>),
+    /// ARC sets parsed from the ARC headers.
+    ArcSets(Box<ArcSetsColumn>),
     /// One of the attachment list columns.
     Attachments(AttachmentSlot),
+    /// Parsed `Authentication-Results` headers.
+    AuthResults(Box<AuthResultsColumn>),
     /// Date as UTC microseconds, null when absent or invalid.
     Date(TimestampMicrosecondBuilder),
     /// Minutes east of UTC from the Date header, null when absent or invalid.
     DateOffset(Int32Builder),
+    /// Parsed `DKIM-Signature` headers.
+    DkimSignatures(Box<DkimSignaturesColumn>),
     /// First value of the named header (matched in any case), null when absent.
     FirstHeaderValue(String, StringBuilder),
     /// Every value of the named header (matched in any case); empty list when absent.
@@ -438,12 +465,19 @@ impl Slot {
             Self::Text(builder) => builder.append_option(mail.map(text_body)),
             Self::Html(builder) => builder.append_option(mail.map(html_body)),
             Self::Attachments(slot) => slot.append(mail),
+            Self::AuthResults(column) => column.append(mail, record.trust),
+            Self::ArcSets(column) => column.append(mail, record.trust),
+            Self::DkimSignatures(column) => column.append(mail),
         }
     }
 
     /// Finishes the builder into an Arrow array and resets it for reuse.
-    fn finish(&mut self) -> ArrayRef {
-        match self {
+    ///
+    /// # Errors
+    ///
+    /// The Arrow error when a structured column's nested arrays do not fit its layout.
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        let array: ArrayRef = match self {
             Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
                 Arc::new(builder.finish())
             },
@@ -459,7 +493,11 @@ impl Slot {
             Self::Date(builder) => Arc::new(builder.finish()),
             Self::DateOffset(builder) => Arc::new(builder.finish()),
             Self::Attachments(slot) => slot.finish(),
-        }
+            Self::ArcSets(column) => column.finish()?,
+            Self::AuthResults(column) => column.finish()?,
+            Self::DkimSignatures(column) => column.finish()?,
+        };
+        Ok(array)
     }
 
     /// A slot keeping only the first value of the header `name` (matched in any case).
@@ -476,7 +514,6 @@ impl Slot {
     /// supports it.
     fn new(column: &Column, rows: usize) -> Self {
         let addresses = |header| Self::Addresses(header, text_list());
-        let attachments = |slot| Self::Attachments(slot);
         match column {
             Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
             Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
@@ -497,11 +534,14 @@ impl Slot {
             Column::ReturnPath => Self::first_header_value("return-path"),
             Column::Text => Self::Text(StringBuilder::new()),
             Column::Html => Self::Html(StringBuilder::new()),
-            Column::AttachmentNames => attachments(AttachmentSlot::Names(text_list())),
-            Column::AttachmentTypes => attachments(AttachmentSlot::Types(text_list())),
-            Column::AttachmentSizes => attachments(AttachmentSlot::sizes()),
-            Column::AttachmentSha256 => attachments(AttachmentSlot::Sha256(text_list())),
+            Column::AttachmentNames => Self::Attachments(AttachmentSlot::Names(text_list())),
+            Column::AttachmentTypes => Self::Attachments(AttachmentSlot::Types(text_list())),
+            Column::AttachmentSizes => Self::Attachments(AttachmentSlot::sizes()),
+            Column::AttachmentSha256 => Self::Attachments(AttachmentSlot::Sha256(text_list())),
             Column::Header(name) => Self::header_values(name),
+            Column::AuthResults => Self::AuthResults(Box::new(AuthResultsColumn::new())),
+            Column::ArcSets => Self::ArcSets(Box::new(ArcSetsColumn::new())),
+            Column::DkimSignatures => Self::DkimSignatures(Box::new(DkimSignaturesColumn::new())),
         }
     }
 }
@@ -563,6 +603,9 @@ const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm
         | Column::AttachmentTypes
         | Column::AttachmentSizes
         | Column::AttachmentSha256
+        | Column::AuthResults
+        | Column::ArcSets
+        | Column::DkimSignatures
         | Column::Header(_) => None,
     }
 }

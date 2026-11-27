@@ -4,11 +4,13 @@ use std::borrow::Cow;
 
 use arrow_schema::{DataType, Field, TimeUnit};
 
+use crate::structured;
+
 /// Prefix that selects an arbitrary header column; the rest of the name is the header name.
 const HEADER_PREFIX: &str = "header:";
 
 /// Public name and variant of every named column; the order is what [`Column::names`] yields.
-const NAMED: [(&str, Column); 23] = [
+const NAMED: [(&str, Column); 26] = [
     ("position", Column::Position),
     ("offset", Column::Offset),
     ("size", Column::Size),
@@ -32,12 +34,28 @@ const NAMED: [(&str, Column); 23] = [
     ("attachment_types", Column::AttachmentTypes),
     ("attachment_sizes", Column::AttachmentSizes),
     ("attachment_sha256", Column::AttachmentSha256),
+    ("auth_results", Column::AuthResults),
+    ("arc_sets", Column::ArcSets),
+    ("dkim_signatures", Column::DkimSignatures),
 ];
 
 /// One per-message column the pipeline can extract.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Column {
+    /// Every `ARC-Authentication-Results`, `ARC-Message-Signature` and `ARC-Seal` header grouped
+    /// into ARC sets by instance, parsed from the raw header bytes; opt-in, never a default.
+    ///
+    /// A list of one struct per set, ordered by instance, empty when the message has none:
+    /// `instance: UInt8`; `seal` and `message_signature`: `List<Struct<name: Utf8, value: Utf8,
+    /// offset: UInt64>>`, null when the set lacks that header; `authentication_results`: a
+    /// struct with the fields of [`Column::AuthResults`] except `issues`, null when the set
+    /// lacks that header; `chain_validation: Utf8`, the seal's `cv` tag, null when absent;
+    /// `issues: List<Struct<kind: Utf8, offset: UInt64>>`, the parse issues that name the set's
+    /// instance (issues that name none, such as a malformed seal tag list, are not exposed).
+    /// `trusted` inside `authentication_results` is true or false when a trust set was given
+    /// to [`Pipeline::with_trust`](crate::Pipeline::with_trust) and null otherwise.
+    ArcSets,
     /// Attachment file names; unnamed attachments are null.
     AttachmentNames,
     /// Lowercase hex SHA-256 of each decoded attachment.
@@ -46,6 +64,18 @@ pub enum Column {
     AttachmentSizes,
     /// Attachment media types such as `application/pdf`.
     AttachmentTypes,
+    /// Every `Authentication-Results:` header parsed from its raw bytes, in header order;
+    /// opt-in, never a default.
+    ///
+    /// A list of one struct per header, empty when the message has none: `authserv_id: Utf8`;
+    /// `version: UInt32`, null when absent; `entries: List<Struct<method: Utf8, result: Utf8,
+    /// reason: Utf8 (nullable), properties: List<Struct<ptype: Utf8, property: Utf8, value:
+    /// Utf8>>>>`; `trusted: Boolean`, true when the authserv-id is in the trust set given to
+    /// [`Pipeline::with_trust`](crate::Pipeline::with_trust), false when it is not and null
+    /// when no trust set was given; `issues: List<Struct<kind: Utf8, offset: UInt64>>`, where
+    /// `kind` is the `snake_case` name of the issue and `offset` a byte offset into the
+    /// header value.
+    AuthResults,
     /// Every raw `Authentication-Results:` value.
     AuthenticationResults,
     /// Addresses in `Cc:`.
@@ -56,6 +86,15 @@ pub enum Column {
     DateOffsetMinutes,
     /// Every raw `DKIM-Signature:` value.
     DkimSignature,
+    /// Every `DKIM-Signature:` header parsed from its raw bytes, in header order; opt-in, never
+    /// a default.
+    ///
+    /// A list of one struct per header, empty when the message has none: `version`, `algorithm`,
+    /// `body_hash`, `domain`, `selector` and `signature`, each `Utf8` and null when the tag is
+    /// absent; `signed_headers: List<Utf8>`; `tags: List<Struct<name: Utf8, value: Utf8,
+    /// offset: UInt64>>`, the tags other than those six and `h`; `issues: List<Struct<kind:
+    /// Utf8, offset: UInt64>>` as in [`Column::AuthResults`].
+    DkimSignatures,
     /// Addresses in `From:`.
     From,
     /// Every raw value of any header, named `header:<Name>`.
@@ -101,6 +140,9 @@ impl Column {
             Self::DateOffsetMinutes => DataType::Int32,
             Self::Raw => DataType::LargeBinary,
             Self::AttachmentSizes => DataType::new_list(DataType::UInt64, true),
+            Self::AuthResults => structured::auth_results_type(),
+            Self::ArcSets => structured::arc_sets_type(),
+            Self::DkimSignatures => structured::dkim_signatures_type(),
             Self::From
             | Self::To
             | Self::Cc
@@ -117,13 +159,14 @@ impl Column {
     }
 
     /// The columns selected when none are named: everything that needs only the header block,
-    /// except [`Column::Raw`], which is opt-in.
+    /// except the opt-in [`Column::Raw`] and the structured columns [`Column::AuthResults`],
+    /// [`Column::ArcSets`] and [`Column::DkimSignatures`].
     #[must_use]
     pub fn defaults() -> Vec<Self> {
         NAMED
             .iter()
             .map(|(_, column)| column.clone())
-            .filter(|column| !column.needs_body() && *column != Self::Raw)
+            .filter(|column| !column.needs_body() && !column.is_opt_in())
             .collect()
     }
 
@@ -142,6 +185,15 @@ impl Column {
             .iter()
             .find(|(known, _)| *known == name)
             .map(|(_, column)| column.clone())
+    }
+
+    /// Whether this column is left out of [`Column::defaults`]: raw bytes and the structured
+    /// header columns.
+    const fn is_opt_in(&self) -> bool {
+        matches!(
+            self,
+            Self::Raw | Self::AuthResults | Self::ArcSets | Self::DkimSignatures
+        )
     }
 
     /// This column's name, as accepted by [`Column::from_name`].
@@ -231,6 +283,19 @@ mod tests {
             !Column::defaults().contains(&Column::Raw),
             "raw is opt-in and not a default"
         );
+    }
+
+    #[test]
+    fn structured_columns_are_opt_in_and_need_no_body() {
+        for name in ["auth_results", "arc_sets", "dkim_signatures"] {
+            let column = Column::from_name(name).expect("a structured column name parses");
+            assert!(!column.needs_body(), "{name} reads headers only");
+            assert!(column.needs_parsing(), "{name} reads the parsed headers");
+            assert!(
+                !Column::defaults().contains(&column),
+                "{name} is opt-in, not a default"
+            );
+        }
     }
 
     #[test]
