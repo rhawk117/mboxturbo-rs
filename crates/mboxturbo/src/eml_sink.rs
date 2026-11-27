@@ -1,5 +1,6 @@
 //! The EML directory sink of the export driver.
 
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write as _};
 use std::panic::resume_unwind;
@@ -13,6 +14,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, SchemaRef};
 use mail_parser::DateTime;
+use memchr::memmem;
 use serde_json::{Value, json};
 
 use crate::columns::Column;
@@ -27,6 +29,8 @@ const NEWLINE: u8 = b'\n';
 const QUOTE: u8 = b'>';
 /// What a `From ` line starts with once its quoting is removed.
 const FROM: &[u8] = b"From ";
+/// What every `>+From ` line holds, so a body without it has no line to unquote.
+const QUOTED_FROM: &[u8] = b">From ";
 /// Microseconds in a second.
 const MICROS_PER_SECOND: i64 = 1_000_000;
 /// The manifest's file name.
@@ -122,35 +126,36 @@ impl Exporter for EmlExporter {
         };
         let mut files = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            let (position, eml) = columns.message(row)?;
+            let (position, raw) = columns.message(row)?;
             let name = self.file_name(position);
             files.push(EmlFile {
-                eml,
                 path: directory.join(&name),
                 name,
                 position,
+                raw,
             });
         }
-        write_files(&files)?;
-        let mut bytes = 0_u64;
+        let bytes = write_files(&files)?;
         for (row, file) in files.iter().enumerate() {
-            bytes = bytes.saturating_add(widen(file.eml.len()));
             self.write_entry(&columns.entry(row, file.position, &file.name), &label)?;
         }
         Ok(bytes)
     }
 }
 
+/// A message's position and its stored bytes, `From ` separator line and quoting included.
+type Message<'batch> = (u64, &'batch [u8]);
+
 /// One message's file, ready to write.
-struct EmlFile {
-    /// The unquoted message bytes.
-    eml: Vec<u8>,
+struct EmlFile<'batch> {
     /// The file name, as the manifest lists it.
     name: String,
     /// Where the file goes.
     path: PathBuf,
     /// The message's position.
     position: u64,
+    /// The stored message bytes, `From ` separator line and quoting included.
+    raw: &'batch [u8],
 }
 
 /// The columns of a batch that the sink reads.
@@ -184,12 +189,12 @@ impl<'batch> Columns<'batch> {
         })
     }
 
-    /// The position and the EML bytes of the message at `row`.
-    fn message(&self, row: usize) -> Result<(u64, Vec<u8>), MboxTurboError> {
+    /// The position and the stored bytes of the message at `row`.
+    fn message(&self, row: usize) -> Result<Message<'batch>, MboxTurboError> {
         if self.raws.is_null(row) || self.positions.is_null(row) {
             return Err(null_error(row));
         }
-        Ok((self.positions.value(row), unquote(self.raws.value(row))))
+        Ok((self.positions.value(row), self.raws.value(row)))
     }
 
     /// The columns of `batch`, or an Arrow schema error naming a missing `raw` or `position`.
@@ -245,13 +250,15 @@ fn rfc3339(micros: i64) -> String {
 }
 
 /// `raw` without its `From ` separator line, with one `>` removed from each `>+From ` line.
-fn unquote(raw: &[u8]) -> Vec<u8> {
-    let body = raw
-        .iter()
-        .position(|byte| *byte == NEWLINE)
-        .map_or(&[][..], |end| {
-            raw.get(end.saturating_add(1)..).unwrap_or(&[])
-        });
+///
+/// Borrows the body when no line is quoted, which is most messages, and copies it otherwise.
+fn unquote(raw: &[u8]) -> Cow<'_, [u8]> {
+    let body = memchr::memchr(NEWLINE, raw).map_or(&[][..], |end| {
+        raw.get(end.saturating_add(1)..).unwrap_or(&[])
+    });
+    if memmem::find(body, QUOTED_FROM).is_none() {
+        return Cow::Borrowed(body);
+    }
     let mut out = Vec::with_capacity(body.len());
     for line in body.split_inclusive(|byte| *byte == NEWLINE) {
         out.extend_from_slice(if is_quoted_from(line) {
@@ -260,7 +267,7 @@ fn unquote(raw: &[u8]) -> Vec<u8> {
             line
         });
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Whether `line` matches `>+From `.
@@ -272,21 +279,27 @@ fn is_quoted_from(line: &[u8]) -> bool {
             .is_some_and(|rest| rest.starts_with(FROM))
 }
 
-/// Writes each file of `files` (path first, bytes second) from up to [`MAX_WORKERS`] scoped
-/// threads, each taking a contiguous chunk, and returns the first error by position order.
+/// Writes the unquoted bytes of `file` to its path and returns how many there were.
+fn write_file(file: &EmlFile<'_>) -> Result<u64, MboxTurboError> {
+    let eml = unquote(file.raw);
+    fs::write(&file.path, &eml).map_err(|source| MboxTurboError::io(&file.path, source))?;
+    Ok(widen(eml.len()))
+}
+
+/// Writes each file of `files` from up to [`MAX_WORKERS`] scoped threads, each taking a
+/// contiguous chunk, and returns the bytes written, or the first error by position order.
 ///
 /// Every thread is joined before this returns, so no write is in flight afterwards; a chunk after
 /// the failing one may still have written its files.
-fn write_files(files: &[EmlFile]) -> Result<(), MboxTurboError> {
+fn write_files(files: &[EmlFile<'_>]) -> Result<u64, MboxTurboError> {
     let available = thread::available_parallelism().map_or(1, usize::from);
     let workers = available
         .min(MAX_WORKERS)
         .min(files.len().div_ceil(MIN_FILES_PER_WORKER))
         .max(1);
-    let write_chunk = |chunk: &[EmlFile]| {
-        chunk.iter().try_for_each(|file| {
-            fs::write(&file.path, &file.eml)
-                .map_err(|source| MboxTurboError::io(&file.path, source))
+    let write_chunk = |chunk: &[EmlFile<'_>]| {
+        chunk.iter().try_fold(0_u64, |total, file| {
+            write_file(file).map(|bytes| total.saturating_add(bytes))
         })
     };
     if workers == 1 {
@@ -297,11 +310,11 @@ fn write_files(files: &[EmlFile]) -> Result<(), MboxTurboError> {
             .chunks(files.len().div_ceil(workers))
             .map(|chunk| scope.spawn(move || write_chunk(chunk)))
             .collect();
-        let mut first = Ok(());
+        let mut total = Ok(0_u64);
         for handle in handles {
             let result = handle.join().unwrap_or_else(|panic| resume_unwind(panic));
-            first = first.and(result);
+            total = total.and_then(|sum: u64| result.map(|bytes| sum.saturating_add(bytes)));
         }
-        first
+        total
     })
 }

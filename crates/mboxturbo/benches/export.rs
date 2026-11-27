@@ -3,7 +3,9 @@
 //! the synthetic fixture the index bench uses. The rows, in print order, are `select`, `parquet`,
 //! `raw-parquet`, `raw-parquet-uncompressed`, `copy`, `mbox`, `eml`, `eml-floor`, `jsonl`, `csv`
 //! and `ipc`. `eml-floor` writes the files the `eml` row wrote, with the same worker count and
-//! chunking but no manifest and no selection, so it is the least the `eml` row can take.
+//! chunking but no manifest and no selection, so it is the least the `eml` row can take. Both
+//! rows time the same work: each removes its previous output before a pass, outside the timing,
+//! so deleting a previous export is in neither.
 //! The raw-only export with compression off (`raw-parquet-uncompressed`) is the row held to three
 //! times the copy; the zstd `raw-parquet` row is reported only, because compressing the raw bytes
 //! is work a copy does not do.
@@ -223,6 +225,14 @@ fn sink_rows(mailbox: &Arc<Mailbox>, scratch: &Path, expected: u64) -> Outcome<(
         Ok(u64::try_from(files.len())?)
     }
 
+    /// Removes `directory` and what it holds, when it exists.
+    fn remove_previous(directory: &Path) -> Outcome<()> {
+        match fs::remove_dir_all(directory) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// The names of the files in `directory` but its manifest, in name order.
     fn file_names(directory: &Path) -> Outcome<Vec<String>> {
         Ok(read_eml_files(directory)?
@@ -245,21 +255,24 @@ fn sink_rows(mailbox: &Arc<Mailbox>, scratch: &Path, expected: u64) -> Outcome<(
             Box::new(MboxExporter::new()),
         )
     })?;
-    report("eml", expected, || {
-        let directory = Destination::Directory(scratch.join("eml"));
-        let exporter = EmlExporter::new(mailbox.len());
-        export_pass(&raw, mailbox, directory, Box::new(exporter))
-    })?;
     let eml_directory = scratch.join("eml");
+    let eml = median_prepared(
+        "eml",
+        expected,
+        || remove_previous(&eml_directory),
+        || {
+            let directory = Destination::Directory(eml_directory.clone());
+            let exporter = EmlExporter::new(mailbox.len());
+            export_pass(&raw, mailbox, directory, Box::new(exporter))
+        },
+    )?;
+    row("eml", eml)?;
     let eml_files = read_eml_files(&eml_directory)?;
     let floor_directory = scratch.join("eml-floor");
     let floor = median_prepared(
         "eml-floor",
         expected,
-        || match fs::remove_dir_all(&floor_directory) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
-            _ => Ok(()),
-        },
+        || remove_previous(&floor_directory),
         || write_floor(&floor_directory, &eml_files),
     )?;
     if file_names(&floor_directory)? != file_names(&eml_directory)? {

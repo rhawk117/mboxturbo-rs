@@ -19,6 +19,41 @@ mod export_eml {
     const HOSTILE_ID: &str = "<..\\..\\C:\\evil/../../escape\0@host>";
     const HOSTILE_SUBJECT: &[u8] = b"../../etc/passwd C:\\boot.ini \\\\server\\share \0 /abs";
     const MESSAGES: usize = 12;
+    /// The files the EML sink writes for [`QUOTED_MBOX`].
+    const QUOTED_FILES: [(&str, &[u8]); 4] = [
+        (
+            "0.eml",
+            b"Subject: plain\n\nhello\n> a quoted reply\nsee >From inline\n\n",
+        ),
+        (
+            "1.eml",
+            b"Subject: quoted\n\nbody\nFrom quoted\n>From twice\n>Fromage\n\n",
+        ),
+        (
+            "2.eml",
+            b"From the first line\nSubject: leading\n\nbody\n\n",
+        ),
+        (
+            "3.eml",
+            b"> not a From line\nSubject: leading reply\n\nbody\n\n",
+        ),
+    ];
+    /// The manifest the EML sink writes for [`QUOTED_MBOX`] with only `raw` and `position`.
+    const QUOTED_MANIFEST: &str = "\
+        {\"date\":null,\"file\":\"0.eml\",\"message_id\":null,\"position\":0}\n\
+        {\"date\":null,\"file\":\"1.eml\",\"message_id\":null,\"position\":1}\n\
+        {\"date\":null,\"file\":\"2.eml\",\"message_id\":null,\"position\":2}\n\
+        {\"date\":null,\"file\":\"3.eml\",\"message_id\":null,\"position\":3}\n";
+    /// One message with no `>+From ` line, two with one in the body or on the first line, and one
+    /// whose first line is quoted but not a `From ` line.
+    const QUOTED_MBOX: &[u8] = b"From a@example.com Mon Jan  1 00:00:00 2024\n\
+        Subject: plain\n\nhello\n> a quoted reply\nsee >From inline\n\n\
+        From b@example.com Mon Jan  1 00:00:00 2024\n\
+        Subject: quoted\n\nbody\n>From quoted\n>>From twice\n>Fromage\n\n\
+        From c@example.com Mon Jan  1 00:00:00 2024\n\
+        >From the first line\nSubject: leading\n\nbody\n\n\
+        From d@example.com Mon Jan  1 00:00:00 2024\n\
+        > not a From line\nSubject: leading reply\n\nbody\n\n";
 
     struct Fixture {
         _input: TempDir,
@@ -58,16 +93,20 @@ mod export_eml {
             self.output.path().join("eml")
         }
 
-        fn with_messages(count: usize) -> Self {
-            let mbox: Vec<u8> = (0..count).flat_map(message).collect();
+        fn with_mbox(mbox: &[u8]) -> Self {
             let input = tempfile::tempdir().expect("input directory creates");
             let path = input.path().join("inbox.mbox");
-            fs::write(&path, &mbox).expect("fixture mbox is written");
+            fs::write(&path, mbox).expect("fixture mbox is written");
             Self {
                 mailbox: Arc::new(Mailbox::open(&path).expect("fixture mbox opens")),
                 _input: input,
                 output: tempfile::tempdir().expect("output directory creates"),
             }
+        }
+
+        fn with_messages(count: usize) -> Self {
+            let mbox: Vec<u8> = (0..count).flat_map(message).collect();
+            Self::with_mbox(&mbox)
         }
     }
 
@@ -254,6 +293,34 @@ mod export_eml {
         assert_eq!(
             runs[0], runs[1],
             "the same names and bytes whatever the worker count"
+        );
+    }
+
+    #[test]
+    fn quoted_and_unquoted_messages_are_written_as_the_expected_files_and_manifest() {
+        let fixture = Fixture::with_mbox(QUOTED_MBOX);
+        drop(
+            fixture
+                .export(
+                    vec![Column::Raw, Column::Position],
+                    Destination::Directory(fixture.target()),
+                )
+                .run(Box::new(EmlExporter::new(QUOTED_FILES.len())))
+                .expect("the export succeeds"),
+        );
+
+        for (name, bytes) in QUOTED_FILES {
+            assert_eq!(
+                fs::read(fixture.target().join(name)).expect("the file is readable"),
+                bytes,
+                "{name}: no From_ line, one `>` removed from each `>+From ` line only"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.target().join("manifest.jsonl"))
+                .expect("the manifest is readable"),
+            QUOTED_MANIFEST,
+            "one line per message in selection order"
         );
     }
 
