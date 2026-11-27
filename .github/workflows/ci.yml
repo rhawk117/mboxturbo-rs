@@ -222,9 +222,37 @@ jobs:
             *) echo "::error::find_mboxturbo_bin is outside the venv: $bin_path"; exit 1 ;;
           esac
 
+  cli-tests:
+    name: 🖥️ CLI Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Pinned Toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Restore Cargo Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: .
+
+      - name: Run CLI Tests
+        run: cargo test -p mboxturbo-cli --locked
+
   workflow-narrator:
     name: 🔉 Workflow Narrator
-    needs: [labeler, rust-checks, python-checks, cli-install]
+    needs: [labeler, rust-checks, python-checks, cli-install, cli-tests]
     if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
