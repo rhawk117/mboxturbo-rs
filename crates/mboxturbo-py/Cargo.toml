@@ -18,6 +18,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 arrow-array = { version = "60.1", features = ["ffi"] }
+arrow-schema = "60.1"
 mboxturbo = { path = "../mboxturbo" }
 pyo3 = "0.30.1"
 

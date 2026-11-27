@@ -7,6 +7,7 @@
 
 mod errors;
 mod export;
+mod exporter;
 mod mailbox;
 mod message;
 mod predicates;

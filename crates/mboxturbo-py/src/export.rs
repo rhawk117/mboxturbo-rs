@@ -17,14 +17,15 @@ use std::time::Duration;
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use mboxturbo::{
-    Column, Compression, Destination, Export, ExportSummary, Exporter, Filter, MboxTurboError,
-    Overwrite, ParquetExporter, Pipeline, Progress,
+    Column, Compression, Destination, DestinationKind, Export, ExportSummary, Exporter, Filter,
+    MboxTurboError, Overwrite, ParquetExporter, Pipeline, Progress,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDateTime, PyDelta, PyDeltaAccess as _, PyTzInfo};
 
 use crate::errors::into_py_err;
+use crate::exporter::{Failure, PythonExporter};
 use crate::predicates::{Predicate, Trust};
 
 /// The longest the calling thread waits for an export before it checks for signals.
@@ -228,6 +229,42 @@ impl Selection {
         self.excluded_undated
     }
 
+    /// Writes the selection through ``exporter``, a Python object with ``begin(schema, out)``,
+    /// ``write_batch(batch, out)`` and ``finish(out)``, and returns the row count. Its optional
+    /// ``kind`` is ``'file'`` (default) or ``'directory'``. ``schema`` and ``batch`` expose the
+    /// Arrow `PyCapsule` interface; ``out`` has ``write(data)`` for a file and is the staging
+    /// ``pathlib.Path`` for a directory. Nothing lands at ``path`` unless ``finish`` succeeds.
+    /// An exception from the exporter is raised as is, after the staged output is discarded.
+    /// Overwrite, ``progress``, ``cancel`` and Ctrl-C behave as in ``to_parquet``.
+    #[pyo3(signature = (exporter, path, *, overwrite = false, progress = None, cancel = None))]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Python's `overwrite=` keyword is a bool by the requested interface"
+    )]
+    fn export(
+        &self,
+        py: Python<'_>,
+        exporter: &Bound<'_, PyAny>,
+        path: PathBuf,
+        overwrite: bool,
+        progress: Option<Py<PyAny>>,
+        cancel: Option<&CancelToken>,
+    ) -> PyResult<u64> {
+        let kind = PythonExporter::declared_kind(exporter)?;
+        let destination = if kind == DestinationKind::Directory {
+            Destination::Directory(path)
+        } else {
+            Destination::File(path)
+        };
+        let failure = Arc::new(Failure::default());
+        let sink = PythonExporter::new(exporter.clone().unbind(), kind, Arc::clone(&failure));
+        let export = prepare(self, destination, overwrite_policy(overwrite));
+        let result = run_export(py, export, Box::new(sink), progress, cancel);
+        failure
+            .take()
+            .map_or_else(|| result.map(|summary| summary.messages), Err)
+    }
+
     /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
     /// An existing file raises ``FileExistsError`` and is left untouched unless ``overwrite`` is
     /// true. The GIL is released while exporting. ``progress(done, total)`` runs after each
@@ -249,22 +286,35 @@ impl Selection {
         progress: Option<Py<PyAny>>,
         cancel: Option<&CancelToken>,
     ) -> PyResult<u64> {
-        let policy = if overwrite {
-            Overwrite::Replace
-        } else {
-            Overwrite::Refuse
-        };
         let codec = parse_compression(compression)?;
         let sink = ParquetExporter::new(codec).with_row_group_batches(self.batch_size);
-        let export = Export::new(
-            Arc::clone(&self.pipeline),
-            Arc::clone(&self.mailbox),
-            Destination::File(path),
-        )
-        .overwrite(policy)
-        .selection(self.rows.clone());
+        let export = prepare(self, Destination::File(path), overwrite_policy(overwrite));
         run_export(py, export, Box::new(sink), progress, cancel).map(|summary| summary.messages)
     }
+}
+
+/// The policy for an existing target: replaced when `overwrite` is true, refused otherwise.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Python's `overwrite=` keyword is a bool by the requested interface"
+)]
+const fn overwrite_policy(overwrite: bool) -> Overwrite {
+    if overwrite {
+        Overwrite::Replace
+    } else {
+        Overwrite::Refuse
+    }
+}
+
+/// An export of `selection` to `destination` that handles an existing target as `policy` says.
+fn prepare(selection: &Selection, destination: Destination, policy: Overwrite) -> Export {
+    Export::new(
+        Arc::clone(&selection.pipeline),
+        Arc::clone(&selection.mailbox),
+        destination,
+    )
+    .overwrite(policy)
+    .selection(selection.rows.clone())
 }
 
 /// Runs `export` through `sink` on a worker thread with the interpreter released, while this

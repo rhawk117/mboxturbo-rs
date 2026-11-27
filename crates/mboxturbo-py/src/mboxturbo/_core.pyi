@@ -2,8 +2,11 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from email.message import EmailMessage
 from os import PathLike
+from pathlib import Path
 from types import CapsuleType
 from typing import ClassVar, Literal, Self, final, overload
+
+from mboxturbo import ByteSink, Exporter
 
 type StrPath = str | PathLike[str]
 type Compression = Literal['zstd', 'snappy', 'none']
@@ -112,6 +115,15 @@ class Selection:
     def __arrow_c_stream__(
         self, requested_schema: object | None = None
     ) -> CapsuleType: ...
+    def export(
+        self,
+        exporter: Exporter[ByteSink] | Exporter[Path],
+        path: StrPath,
+        *,
+        overwrite: bool = False,
+        progress: Callable[[int, int], object] | None = None,
+        cancel: CancelToken | None = None,
+    ) -> int: ...
     def to_parquet(
         self,
         path: StrPath,
