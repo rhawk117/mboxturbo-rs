@@ -1,0 +1,23 @@
+[package]
+name = "mboxturbo-cli"
+description = "Command-line exporter for large mbox files"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "mboxturbo"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.10", features = ["derive"] }
+mboxturbo = { path = "../mboxturbo" }
+
+[lints]
+workspace = true
