@@ -661,6 +661,27 @@ body\n";
             .collect()
     }
 
+    fn assert_tags(elements: &StructArray, column: &str, expected: &[&str]) {
+        let list = elements
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("the element struct has a {column} field"))
+            .as_list::<i32>()
+            .value(0);
+        let tags = list.as_struct();
+        let pairs: Vec<String> = text_field(tags, "name")
+            .into_iter()
+            .zip(text_field(tags, "value"))
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    name.expect("a tag has a name"),
+                    value.expect("a tag has a value")
+                )
+            })
+            .collect();
+        assert_eq!(pairs, expected, "the {column} tag list is exposed");
+    }
+
     fn trusted_flags(elements: &StructArray) -> Vec<Option<bool>> {
         elements
             .column_by_name("trusted")
@@ -803,6 +824,36 @@ body\n";
         assert!(
             issue_kinds(&sets, 0).is_empty(),
             "a complete ARC set has no issues"
+        );
+    }
+
+    #[test]
+    fn an_arc_sets_seal_and_message_signature_expose_their_tag_lists_in_header_order() {
+        let sets = arc_sets_of_second_message();
+        assert_tags(
+            &sets,
+            "seal",
+            &[
+                "i=1",
+                "a=rsa-sha256",
+                "cv=none",
+                "d=example.org",
+                "s=arc",
+                "b=c2VhbA==",
+            ],
+        );
+        assert_tags(
+            &sets,
+            "message_signature",
+            &[
+                "i=1",
+                "a=rsa-sha256",
+                "d=example.org",
+                "s=arc",
+                "h=from",
+                "bh=aGFzaA==",
+                "b=c2ln",
+            ],
         );
     }
 

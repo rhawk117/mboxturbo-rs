@@ -704,8 +704,8 @@ fn issue_fields() -> Fields {
 
 /// A stable `snake_case` name for each kind of issue.
 ///
-/// A kind added to the headers crate after this was written reads `unknown` until it is named
-/// here.
+/// A kind added to the headers crate after this was written reads `unknown` until someone gives
+/// it a name in this function.
 const fn issue_kind_name(kind: IssueKind) -> &'static str {
     match kind {
         IssueKind::ArcInstance { .. } => "arc_instance",
