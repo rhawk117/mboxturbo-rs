@@ -73,7 +73,12 @@ trusts nothing.
 - `trust_idless_inside`: Exchange Online writes `Authentication-Results` with no
   authserv-id, so an id cannot vouch for it. With this switch on, such a header is trusted
   only when it sits above the `Received` header of the first external hop, the newest hop
-  whose `by` host is trusted and whose `from` host and address are not. A header below that
+  whose `by` host is trusted and whose sender is not. The sender is judged only by the
+  address your relay recorded in the `from` comment (`from name (rdns [address])`), matched
+  against `ip_ranges`. The `from` name and a `[address]` word are the HELO the sender typed,
+  so they never make it trusted, and a hop that records no address counts as an untrusted
+  sender: it can be the boundary, which fails closed. Put the addresses of relays that pass
+  mail to each other in `ip_ranges`, not only their names in `hosts`. A header below that
   hop, or in a message with no such hop, was added outside your relays and stays untrusted.
   The switch is off by default and never makes an empty authserv-id a trusted entry.
 

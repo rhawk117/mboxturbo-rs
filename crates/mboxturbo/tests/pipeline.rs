@@ -118,6 +118,31 @@ Subject: id-less below the first external hop\n\
 \n\
 body\n";
 
+    /// Two messages whose real boundary hop presents a trusted HELO, a name in the first and a
+    /// `[literal]` in the second, from an untrusted recorded address, over a forged hop the
+    /// sender wrote and an id-less `dmarc=pass` between them (MV-1).
+    const HELO_SPOOF: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Received: from mx.example.org (unknown [198.51.100.7])\n\
+\tby mx.example.org with ESMTP id 1; Mon, 2 Nov 2026 10:00:01 +0000\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Received: from x.example.net ([198.51.100.66])\n\
+\tby mx.example.org with ESMTP id 0; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Subject: HELO names a trusted relay\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+Received: from [192.0.2.9] (unknown [198.51.100.7])\n\
+\tby mx.example.org with ESMTP id 1; Mon, 2 Nov 2026 10:00:01 +0000\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Received: from x.example.net ([198.51.100.66])\n\
+\tby mx.example.org with ESMTP id 0; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Subject: HELO literal is a trusted relay address\n\
+\n\
+body\n";
+
     const VERDICT_COLUMNS: [Column; 4] = [
         Column::VerdictDmarc,
         Column::VerdictSpf,
@@ -949,6 +974,48 @@ body\n";
         );
     }
 
+    /// The `received_hops`, `auth_results` and `verdict_dmarc` columns of the `HELO_SPOOF`
+    /// messages, trusting the id-less relay set plus `192.0.2.0/24`.
+    fn helo_spoof_batch() -> RecordBatch {
+        let mut trust = trust_mx_relay_idless();
+        let _relays = trust
+            .add_ip_range("192.0.2.0/24")
+            .expect("the documentation range is a valid CIDR");
+        let fixture = Fixture::with(HELO_SPOOF);
+        let columns = vec![
+            Column::ReceivedHops,
+            Column::AuthResults,
+            Column::VerdictDmarc,
+        ];
+        let pipeline = Arc::new(Pipeline::new(columns, 8).with_trust(trust));
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("two messages fit one batch of eight")
+            .expect("the HELO spoof batch is assembled")
+    }
+
+    #[test]
+    fn a_trusted_helo_from_an_untrusted_address_leaves_a_forged_idless_header_untrusted() {
+        let batch = helo_spoof_batch();
+        for row in 0..2 {
+            assert!(
+                batch.column(2).is_null(row),
+                "message {row}: a header below the real boundary sets no dmarc verdict"
+            );
+            assert_eq!(
+                trusted_flags(&elements(&batch, 1, row)),
+                vec![Some(false)],
+                "message {row}: the id-less header the sender wrote is untrusted"
+            );
+            assert_eq!(
+                first_external_flags(&hops_of(&batch, row)),
+                [Some(false), Some(true)],
+                "message {row}: the real hop is first_external, not the forged one below it"
+            );
+        }
+    }
+
     /// The `entries` of element `element` of the first message's `auth_results`.
     fn entries_of(batch: &RecordBatch, element: usize) -> StructArray {
         let first = elements(batch, 0, 0);
@@ -1363,10 +1430,11 @@ body\n",
 
     #[test]
     fn first_external_is_true_on_exactly_the_hop_from_outside_the_trust_set() {
-        let trust = TrustSet::new()
-            .add_host("mx.example.com")
-            .add_host("mx2.example.com")
-            .clone();
+        let mut trust = TrustSet::new();
+        let _hosts = trust.add_host("mx.example.com").add_host("mx2.example.com");
+        let _relay = trust
+            .add_ip_range("192.0.2.10")
+            .expect("a bare address is a valid range");
         let chain = hops_of(&received_hops_batch(Some(trust)), 11);
         assert_eq!(
             text_field(&chain, "from_host"),

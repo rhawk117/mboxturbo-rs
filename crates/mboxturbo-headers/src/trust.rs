@@ -138,10 +138,14 @@ impl TrustSet {
     ///
     /// With the switch on, such a header is trusted only when it appears above (before, in
     /// header order) the `Received` header of the first external hop: the newest hop whose
-    /// `by` host is trusted and whose `from` host and address are not. A header below that
-    /// hop, or in a message with no such hop, was added outside the trusted relays and stays
-    /// untrusted. [`TrustSet::add_authserv_id`] still ignores an empty id; the switch is the
-    /// only way an id-less header becomes trusted.
+    /// `by` host is trusted and whose sender is not. The sender is judged only by the address
+    /// the receiving relay recorded in the `from` comment, matched against the address
+    /// ranges; the `from` host name and a `[literal]` are the sender's own HELO and never make
+    /// it trusted, and a hop that records no address counts as an untrusted sender. So a
+    /// trusted relay that hands mail to another needs its address in the set, not only its
+    /// host. A header below that hop, or in a message with no such hop, was added outside the
+    /// trusted relays and stays untrusted. [`TrustSet::add_authserv_id`] still ignores an
+    /// empty id; the switch is the only way an id-less header becomes trusted.
     #[expect(
         clippy::fn_params_excessive_bools,
         reason = "a setter for one switch; a two-variant enum would only wrap the flag"

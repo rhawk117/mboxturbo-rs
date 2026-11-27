@@ -53,6 +53,17 @@ enum ItemKind {
     Word,
 }
 
+/// Where a hop's client address was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressSource {
+    /// A `[literal]` word, which Postfix, Sendmail and Exchange fill with the HELO the client
+    /// sent, so the sender chose it.
+    Claimed,
+    /// A `from` comment, where the receiving MTA writes the address it accepted the
+    /// connection from. Only this source can make a sender trusted.
+    Recorded,
+}
+
 /// The TLS details a receiver wrote in a comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tls<'src> {
@@ -94,8 +105,8 @@ pub struct Hop<'src> {
     header_index: usize,
     /// The first word after `id`.
     id: Option<Cow<'src, str>>,
-    /// The client address read from the `from` clause.
-    ip: Option<IpAddr>,
+    /// The client address read from the `from` clause, and whether the receiver recorded it.
+    ip: Option<(IpAddr, AddressSource)>,
     /// The words after `with`, joined by single spaces.
     protocol: Option<Cow<'src, str>>,
     /// The first word after `for`, without angle brackets.
@@ -159,11 +170,17 @@ impl Hop<'_> {
         self.id.as_deref()
     }
 
-    /// The client address: a `[address]` word or comment text in the `from` clause, or a
-    /// comment that is only an address. An `IPv6:` prefix is accepted.
+    /// The client address: the one the receiver recorded in a `from` comment (in its
+    /// `[brackets]`, or a comment that is only an address), else a `[address]` word, which is
+    /// the address the client claimed in its HELO. A bracketed address tagged `helo=` and a
+    /// qmail `(HELO ...)` comment are claims too and never the recorded address. An `IPv6:`
+    /// prefix is accepted.
     #[must_use]
     pub const fn ip(&self) -> Option<IpAddr> {
-        self.ip
+        match self.ip {
+            Some((ip, _)) => Some(ip),
+            None => None,
+        }
     }
 
     /// The protocol words after `with`, such as `ESMTPS` or `Microsoft SMTP Server`.
@@ -197,8 +214,8 @@ pub struct ReceivedHops<'src> {
 
 impl<'src> ReceivedHops<'src> {
     /// Index into [`Self::hops`] of the first external hop: the newest hop whose `by` host is
-    /// trusted and whose `from` host and address are not. `None` without a trust set or when
-    /// no hop qualifies.
+    /// trusted and whose sender is not, judged by the address the receiver recorded (see
+    /// [`parse_received_hops`]). `None` without a trust set or when no hop qualifies.
     #[must_use]
     pub const fn first_external(&self) -> Option<usize> {
         self.first_external
@@ -407,13 +424,43 @@ fn parse_ip(text: &str) -> Option<IpAddr> {
     untagged.parse().ok()
 }
 
-/// The address a comment names: the one in its `[brackets]`, else the whole text.
+/// Whether `text` is a qmail `HELO name` comment, which repeats the client's claim.
+fn is_helo_comment(text: &str) -> bool {
+    text.split_ascii_whitespace()
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case("HELO"))
+}
+
+/// Whether the text before a `[` ends in an Exim `helo=` tag, so the literal is a claim.
+fn ends_in_helo_tag(before: &str) -> bool {
+    before
+        .rsplit(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .next()
+        .is_some_and(|last| last.eq_ignore_ascii_case("helo="))
+}
+
+/// The first `[bracketed]` address in `text` that is not tagged `helo=`.
+fn bracketed_ip(text: &str) -> Option<IpAddr> {
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once('[') {
+        let (inner, tail) = after.split_once(']')?;
+        if !ends_in_helo_tag(before)
+            && let Some(ip) = parse_ip(inner)
+        {
+            return Some(ip);
+        }
+        rest = tail;
+    }
+    None
+}
+
+/// The address the receiver recorded in a comment: the first one in `[brackets]` that is not
+/// tagged `helo=`, else the whole text. A qmail `(HELO ...)` comment records none.
 fn comment_ip(text: &str) -> Option<IpAddr> {
-    let bracketed = text
-        .split_once('[')
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .and_then(|(inner, _)| parse_ip(inner));
-    bracketed.or_else(|| parse_ip(text))
+    if is_helo_comment(text) {
+        return None;
+    }
+    bracketed_ip(text).or_else(|| parse_ip(text))
 }
 
 /// The address of a `[literal]` word; an unreadable literal is reported at the word.
@@ -426,12 +473,20 @@ fn word_ip(item: &Item<'_>, issues: &mut Vec<Issue>) -> Option<IpAddr> {
     ip
 }
 
-/// The first address found in the `from` clause.
-fn from_ip(items: &[&Item<'_>], issues: &mut Vec<Issue>) -> Option<IpAddr> {
-    items.iter().find_map(|item| match item.kind {
-        ItemKind::Comment => comment_ip(&item.text),
-        ItemKind::Word => word_ip(item, issues),
-    })
+/// The client address of the `from` clause: the first one a comment records, else the first
+/// `[literal]` word. The words are read either way, so an unreadable literal is reported.
+fn from_ip(items: &[&Item<'_>], issues: &mut Vec<Issue>) -> Option<(IpAddr, AddressSource)> {
+    let claimed = items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Word)
+        .find_map(|item| word_ip(item, issues));
+    let recorded = items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Comment)
+        .find_map(|item| comment_ip(&item.text));
+    recorded
+        .map(|ip| (ip, AddressSource::Recorded))
+        .or_else(|| claimed.map(|ip| (ip, AddressSource::Claimed)))
 }
 
 /// Byte ranges of the pieces of `text` split at ASCII whitespace and commas.
@@ -574,15 +629,16 @@ const fn has_sender(hop: &Hop<'_>) -> bool {
     hop.from_host.is_some() || hop.ip.is_some()
 }
 
-/// Whether `hop` was received by a trusted host from a sender that is not trusted.
+/// Whether `hop` was received by a trusted host from a sender that is not trusted. The sender
+/// is judged only by the address the receiver recorded: the `from` word and a `[literal]` are
+/// what the client sent in its HELO, so they cannot make it trusted, and a hop that records
+/// no address counts as an untrusted sender.
 fn crosses_boundary(hop: &Hop<'_>, trust: &TrustSet) -> bool {
     let received_by_us = hop
         .by_host()
         .is_some_and(|host| trust.trusts_host(host.as_bytes()));
-    let sender_trusted = hop
-        .from_host()
-        .is_some_and(|host| trust.trusts_host(host.as_bytes()))
-        || hop.ip.is_some_and(|ip| trust.trusts_ip(ip));
+    let sender_trusted =
+        matches!(hop.ip, Some((ip, AddressSource::Recorded)) if trust.trusts_ip(ip));
     received_by_us && has_sender(hop) && !sender_trusted
 }
 
@@ -597,10 +653,16 @@ fn crosses_boundary(hop: &Hop<'_>, trust: &TrustSet) -> bool {
 /// [`IssueKind::NegativeDelay`] at the hop's `;`. Only the newest [`MAX_RECEIVED_HOPS`] headers
 /// are read; the rest are dropped and reported once as [`IssueKind::CapExceeded`] at offset 0.
 ///
-/// With `trust`, [`ReceivedHops::first_external`] is the newest hop whose `by` host is trusted
-/// and whose `from` host and address are not, and which names a sender at all. Walking from
-/// the newest hop means a forged hop further back in the path cannot move it. Without `trust`
-/// there is none.
+/// With `trust`, [`ReceivedHops::first_external`] is the newest hop whose `by` host is trusted,
+/// which names a sender at all, and whose sender is not trusted. The sender is judged only by
+/// the address the receiving MTA recorded in a `from` comment, matched against the trusted
+/// address ranges; the `from` word and a `[literal]` word are the client's HELO, which the
+/// sender chooses, so they never make it trusted. A hop that records no address (a bare
+/// `from host`, an Exim `from [address] (helo=...)`, or a qmail hop with only its
+/// `(HELO ...)` comment) counts as an untrusted sender and can be the boundary, so a
+/// relay chain without recorded addresses fails closed.
+/// Walking from the newest hop means a forged hop further back in the path cannot move it.
+/// Without `trust` there is none.
 #[must_use]
 pub fn parse_received_hops<'src>(
     headers: &[&'src [u8]],
@@ -665,6 +727,10 @@ mod tests {
         " (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);\r\n",
         " Tue, 03 Nov 2026 01:02:04 -0800 (PST)"
     );
+
+    /// A forged hop the sender wrote below its real boundary hop, claiming a trusted receiver.
+    const FORGED_BELOW: &str =
+        "from x.example.net ([198.51.100.66]) by mx.example.com; 3 Nov 2026 10:00:00 +0000";
 
     const QMAIL_LOCAL: &str = "(qmail 4242 invoked by uid 1000); 3 Nov 2026 10:00:00 -0000";
 
@@ -955,6 +1021,87 @@ mod tests {
             parse(&[local], Some(&set)).value().first_external(),
             None,
             "a hop that names no sender did not cross from outside"
+        );
+    }
+
+    /// `first_external` of the real boundary hop `boundary` over [`FORGED_BELOW`].
+    fn first_external_over_a_forged_hop(boundary: &str) -> Option<usize> {
+        let set = trusting_our_servers();
+        parse(&[boundary, FORGED_BELOW], Some(&set))
+            .value()
+            .first_external()
+    }
+
+    #[test]
+    fn a_trusted_helo_name_from_an_untrusted_recorded_address_is_the_boundary() {
+        let boundary = concat!(
+            "from mx2.example.com (unknown [198.51.100.7]) by mx.example.com; ",
+            "3 Nov 2026 10:00:01 +0000"
+        );
+        assert_eq!(
+            first_external_over_a_forged_hop(boundary),
+            Some(1),
+            "the HELO name is the sender's claim, so the hop still crosses (MV-1)"
+        );
+    }
+
+    #[test]
+    fn a_trusted_helo_literal_from_an_untrusted_recorded_address_is_the_boundary() {
+        let boundary = concat!(
+            "from [192.0.2.9] (unknown [198.51.100.7]) by mx.example.com; ",
+            "3 Nov 2026 10:00:01 +0000"
+        );
+        assert_eq!(
+            first_external_over_a_forged_hop(boundary),
+            Some(1),
+            "the HELO literal is the sender's claim, so the hop still crosses (MV-1)"
+        );
+        let parsed = parse(&[boundary], None);
+        assert_eq!(
+            parsed.value().hops().first().and_then(Hop::ip),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+            "the recorded address wins over the literal"
+        );
+    }
+
+    #[test]
+    fn a_helo_tagged_literal_in_the_comment_is_not_the_recorded_address() {
+        let exim = concat!(
+            "from [198.51.100.7] (helo=[192.0.2.9]) by mx.example.com; ",
+            "3 Nov 2026 10:00:01 +0000"
+        );
+        let qmail = concat!(
+            "from unknown (HELO [192.0.2.9]) (198.51.100.7) by mx.example.com; ",
+            "3 Nov 2026 10:00:01 +0000"
+        );
+        for boundary in [exim, qmail] {
+            assert_eq!(
+                parse(&[boundary], None)
+                    .value()
+                    .hops()
+                    .first()
+                    .and_then(Hop::ip),
+                Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+                "the HELO claim is skipped in {boundary}"
+            );
+            assert_eq!(
+                first_external_over_a_forged_hop(boundary),
+                Some(1),
+                "a trusted HELO address in a comment does not make the sender trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hop_that_records_no_sender_address_fails_closed_as_the_boundary() {
+        let bare = "from mx2.example.com by mx3.example.com; 3 Nov 2026 10:00:02 +0000";
+        let edge =
+            "from edge.example.org ([198.51.100.5]) by mx2.example.com; 3 Nov 2026 10:00:01 +0000";
+        let set = trusting_our_servers();
+        assert_eq!(
+            parse(&[bare, edge], Some(&set)).value().first_external(),
+            Some(1),
+            "a sender named only by its HELO is untrusted, so the newer hop is the boundary"
         );
     }
 
