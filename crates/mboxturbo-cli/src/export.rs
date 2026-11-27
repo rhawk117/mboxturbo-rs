@@ -19,6 +19,7 @@ use crate::events::{self, Counts, File, Report, Start, Summary, Throttle};
 use crate::exit::{self, Stage};
 use crate::progress::{self, Bar, Feedback};
 use crate::select::{self, SelectError};
+use crate::signals::Interrupts;
 
 /// Messages per batch: the unit the pipeline extracts and a sink writes at a time.
 const BATCH_SIZE: usize = 4096;
@@ -34,6 +35,13 @@ pub(crate) enum Failure {
         error: Box<MboxTurboError>,
         /// Whether the mailbox was open when it failed.
         stage: Stage,
+    },
+    /// A termination signal stopped the export; the process exits with the signal's code.
+    Interrupted {
+        /// The library's cancellation error.
+        error: Box<MboxTurboError>,
+        /// The exit code of the signal that arrived.
+        code: u8,
     },
     /// The command line was well formed but asks for something that cannot be done.
     Usage(String),
@@ -52,6 +60,7 @@ impl Failure {
     pub(crate) fn code(&self) -> u8 {
         match self {
             Self::Core { error, stage } => exit::error_code(*stage, error),
+            Self::Interrupted { code, .. } => *code,
             Self::Usage(_) => exit::USAGE,
         }
     }
@@ -64,14 +73,10 @@ impl fmt::Display for Failure {
     )]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Core { error, .. } => {
-                write!(formatter, "{error}")?;
-                let mut cause = error.source();
-                while let Some(source) = cause {
-                    write!(formatter, ": {source}")?;
-                    cause = source.source();
-                }
-                Ok(())
+            Self::Core { error, .. } => write_chain(formatter, error),
+            Self::Interrupted { error, .. } => {
+                formatter.write_str("interrupted: ")?;
+                write_chain(formatter, error)
             },
             Self::Usage(message) => formatter.write_str(message),
         }
@@ -310,24 +315,18 @@ fn refuse_events_on_stdout(args: &ExportArgs, report: Report) -> Result<(), Fail
 /// the summary line on standard error.
 ///
 /// A failed event write cancels the export and is reported as an I/O failure once it has stopped.
+/// A termination signal cancels it too and is reported as [`Failure::Interrupted`].
 fn run_export(
     export: Export,
     exporter: Box<dyn Exporter>,
     reported: &Reported<'_>,
 ) -> Result<(), Failure> {
     if reported.report == Report::Events {
-        events::start(&Start {
-            command: "export",
-            format: reported.args.format.name(),
-            mailbox: &reported.args.mailbox,
-            output: &reported.args.output,
-            selected: reported.count,
-        })
-        .and_then(|()| events::index(reported.origin))
-        .map_err(stdout_failure)?;
+        write_start(reported).map_err(stdout_failure)?;
     }
     let failure = Arc::new(OnceLock::new());
     let cancel = CancelToken::new();
+    let interrupts = Interrupts::watch(cancel.clone()).map_err(signal_failure)?;
     let mut observer = Observer::new(reported, Arc::clone(&failure), cancel.clone());
     let result = export
         .cancel_token(cancel)
@@ -338,11 +337,41 @@ fn run_export(
             .clear()
             .map_err(stderr_failure)?;
     }
-    if let Some(source) = Arc::into_inner(failure).and_then(OnceLock::into_inner) {
-        return Err(stdout_failure(source));
+    if let Some(source) = failure.get() {
+        return Err(stdout_failure(io::Error::new(
+            source.kind(),
+            source.to_string(),
+        )));
     }
-    let summary = result.map_err(|error| Failure::after_open(Box::new(error)))?;
+    let summary = result.map_err(|error| core_failure(error, &interrupts))?;
     finish(reported, &summary)
+}
+
+/// Writes the `start` and `index` events.
+fn write_start(reported: &Reported<'_>) -> io::Result<()> {
+    events::start(&Start {
+        command: "export",
+        format: reported.args.format.name(),
+        mailbox: &reported.args.mailbox,
+        output: &reported.args.output,
+        selected: reported.count,
+    })?;
+    events::index(reported.origin)
+}
+
+/// The failure for a library `error` after the mailbox is open: an interruption when it is a
+/// cancellation and a signal has arrived, otherwise an ordinary core failure.
+fn core_failure(error: MboxTurboError, interrupts: &Interrupts) -> Failure {
+    let signalled = interrupts
+        .code()
+        .filter(|_| matches!(error, MboxTurboError::Cancelled { .. }));
+    match signalled {
+        Some(code) => Failure::Interrupted {
+            error: Box::new(error),
+            code,
+        },
+        None => Failure::after_open(Box::new(error)),
+    }
 }
 
 /// Finishes a successful export: the events when asked for, then the summary line.
@@ -377,10 +406,29 @@ fn finish_events(reported: &Reported<'_>, summary: &ExportSummary, path: &Path) 
     })
 }
 
+/// Writes `error` and each of its causes, separated by `: `.
+fn write_chain(formatter: &mut fmt::Formatter<'_>, error: &MboxTurboError) -> fmt::Result {
+    write!(formatter, "{error}")?;
+    let mut cause = error.source();
+    while let Some(source) = cause {
+        write!(formatter, ": {source}")?;
+        cause = source.source();
+    }
+    Ok(())
+}
+
 /// An event that could not be written to standard output, as an I/O failure.
 fn stdout_failure(source: io::Error) -> Failure {
     Failure::after_open(Box::new(MboxTurboError::Io {
         path: PathBuf::from("standard output"),
+        source,
+    }))
+}
+
+/// Signal handlers that could not be installed, as an I/O failure.
+fn signal_failure(source: io::Error) -> Failure {
+    Failure::after_open(Box::new(MboxTurboError::Io {
+        path: PathBuf::from("signal handlers"),
         source,
     }))
 }

@@ -11,7 +11,9 @@
 //! | 66 | the mailbox does not exist (not found while opening it) |
 //! | 73 | the export target exists and `--overwrite` was not given |
 //! | 74 | any other I/O error, including a path not found after the mailbox is open |
-//! | 130 | interrupted (the export was cancelled) |
+//! | 129 | interrupted by SIGHUP |
+//! | 130 | interrupted by SIGINT (Ctrl-C), or cancelled with no signal |
+//! | 143 | interrupted by SIGTERM |
 #![expect(
     clippy::redundant_pub_crate,
     reason = "contradicts rustc's unreachable_pub, which is the lint this workspace keeps"
@@ -27,6 +29,7 @@ mod exit;
 mod export;
 mod progress;
 mod select;
+mod signals;
 
 use std::env;
 use std::io::{self, Write as _};
@@ -101,32 +104,37 @@ fn parse(choice: ColorChoice) -> Result<Cli, clap::Error> {
 }
 
 /// Prints a clap message and returns its exit code; with `--json` among the arguments a usage
-/// error is also written as an `error` event.
+/// error is also written as an `error` event, even when the message could not be printed.
 fn usage_error(error: &clap::Error) -> ExitCode {
-    let code = if error.use_stderr() { exit::USAGE } else { 0 };
+    let json = env::args_os().any(|argument| argument == "--json");
     // A clap message that cannot be written (a closed stdout or stderr) has nowhere left to be
     // reported, so it exits 1, "any other failure", rather than the code it carried.
-    if error.print().is_err() {
-        return ExitCode::from(1);
-    }
-    let json = env::args_os().any(|argument| argument == "--json");
+    let code = if error.print().is_err() {
+        1
+    } else if error.use_stderr() {
+        exit::USAGE
+    } else {
+        0
+    };
     if json && error.use_stderr() && events::error(code, &error.to_string()).is_err() {
         return ExitCode::from(74);
     }
     ExitCode::from(code)
 }
 
-/// Prints the failure as one line on stderr and returns its exit code; a line that cannot be
-/// written has nowhere to go, so it exits 1 like an unwritable clap message. With events, the
-/// same line is also written as the last `error` event, and an event that cannot be written exits
-/// 74.
+/// Prints the failure as one line on stderr and returns its exit code. With events, the same
+/// line is also written as the last `error` event, and an event that cannot be written exits 74.
+/// A line that cannot be written to stderr has nowhere to go, so it exits 1 like an unwritable
+/// clap message, after the event.
 fn describe(failure: &Failure, report: Report) -> ExitCode {
     let line = format!("mboxturbo: {failure}");
-    if writeln!(io::stderr(), "{line}").is_err() {
-        return ExitCode::from(1);
-    }
-    if report == Report::Events && events::error(failure.code(), &line).is_err() {
+    let code = if writeln!(io::stderr(), "{line}").is_err() {
+        1
+    } else {
+        failure.code()
+    };
+    if report == Report::Events && events::error(code, &line).is_err() {
         return ExitCode::from(74);
     }
-    ExitCode::from(failure.code())
+    ExitCode::from(code)
 }
