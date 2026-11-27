@@ -11,6 +11,7 @@ use crate::auth_results::{AuthenticationResults, parse_authentication_results};
 use crate::caps::{Cap, MAX_ENTRIES};
 use crate::dkim::{TagList, parse_tag_list};
 use crate::issue::{ArcPart, ArcProblem, Issue, IssueKind, Parsed};
+use crate::tokenize::bound;
 use crate::trust::TrustSet;
 
 /// Highest instance number RFC 8617 allows.
@@ -212,12 +213,14 @@ fn read_results<'src>(
     trust: Option<&TrustSet>,
     issues: &mut Vec<Issue>,
 ) -> Option<(u8, AuthenticationResults<'src>)> {
-    let Some((number, number_at, body_at)) = split_instance(value) else {
+    let (head, cut) = bound(value);
+    issues.extend(cut);
+    let Some((number, number_at, body_at)) = split_instance(head) else {
         issues.push(Issue::new(IssueKind::MalformedEntry, 0));
         return None;
     };
     let instance = check_instance(number, number_at, issues)?;
-    let body = value.get(body_at..)?;
+    let body = head.get(body_at..)?;
     let (results, found) = parse_authentication_results(body, trust).into_parts();
     issues.extend(
         found
@@ -348,7 +351,7 @@ pub fn parse_arc_sets<'src>(
 #[cfg(test)]
 mod tests {
     use super::{ArcHeader, ArcSet, ChainValidation, parse_arc_sets};
-    use crate::caps::{Cap, MAX_ENTRIES};
+    use crate::caps::{Cap, MAX_ENTRIES, MAX_HEADER_BYTES};
     use crate::dkim::Tag;
     use crate::issue::{ArcPart, ArcProblem, Issue, IssueKind};
 
@@ -566,6 +569,30 @@ mod tests {
             offsets,
             [17],
             "the malformed result is located in the whole header"
+        );
+    }
+
+    #[test]
+    fn an_authentication_results_value_one_byte_over_the_header_cap_is_cut_and_reported_at_the_cap()
+    {
+        let mut value = b"i=1;".to_vec();
+        value.resize(MAX_HEADER_BYTES + 1, b' ');
+        let raw = [(2, value)];
+        let parsed = parse_arc_sets(&headers(&raw), None);
+        let cap = IssueKind::CapExceeded {
+            cap: Cap::HeaderBytes,
+        };
+        let capped: Vec<usize> = parsed
+            .issues()
+            .iter()
+            .filter(|issue| issue.kind() == cap)
+            .map(Issue::offset)
+            .collect();
+        assert_eq!(capped, [MAX_HEADER_BYTES], "one issue at the cap");
+        assert_eq!(
+            parsed.value().first().map(ArcSet::instance),
+            Some(1),
+            "the instance before the cut is read"
         );
     }
 

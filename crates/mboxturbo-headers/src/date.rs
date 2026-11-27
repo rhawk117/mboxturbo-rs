@@ -9,7 +9,7 @@
 use std::ops::RangeInclusive;
 
 use crate::issue::{Issue, IssueKind, Parsed};
-use crate::tokenize::{Token, TokenKind, tokenize};
+use crate::tokenize::{Token, TokenKind, bound, tokenize};
 
 /// Seconds in a day.
 const DAY_SECONDS: i64 = 86_400;
@@ -697,18 +697,21 @@ fn number_of(bytes: &[u8], offset: usize) -> Option<Number> {
 /// [`IssueKind::WeekdayMismatch`], [`IssueKind::WidenedYear`], [`IssueKind::OutOfRange`] for
 /// a clamped leap second, and [`IssueKind::TrailingText`] for ignored text. A value that
 /// cannot be read, or has a field out of range, gives `None` and an issue; empty input and
-/// arbitrary bytes never panic. Input past [`crate::MAX_HEADER_BYTES`] is dropped and
-/// reported by the tokenizer.
+/// arbitrary bytes never panic. Input past [`crate::MAX_HEADER_BYTES`] is dropped before either
+/// reading and reported as one [`IssueKind::CapExceeded`] issue at the cap.
 #[must_use]
 pub fn parse_date(value: &[u8]) -> Parsed<Option<Instant>> {
-    let mut raw = Raw::new(value);
+    let (head, cut) = bound(value);
+    let mut raw = Raw::new(head);
     if raw.looks_iso() {
         let instant = raw.instant();
+        raw.issues.extend(cut);
         return Parsed::new(instant, raw.issues);
     }
-    let (tokens, issues) = tokenize(value).into_parts();
-    let mut cursor = Cursor::new(&tokens, issues, value.len());
+    let (tokens, issues) = tokenize(head).into_parts();
+    let mut cursor = Cursor::new(&tokens, issues, head.len());
     let instant = cursor.instant();
+    cursor.issues.extend(cut);
     Parsed::new(instant, cursor.issues)
 }
 
@@ -771,6 +774,7 @@ mod tests {
     use std::iter::repeat_with;
 
     use super::{Instant, parse_date};
+    use crate::caps::{Cap, MAX_HEADER_BYTES};
     use crate::issue::{Issue, IssueKind};
 
     /// 2024-01-01T12:00:00Z.
@@ -792,6 +796,27 @@ mod tests {
         let found = instant.expect("the date is readable");
         assert!(issues.is_empty(), "{text:?} is clean, got {issues:?}");
         (found.unix_seconds(), found.offset_minutes())
+    }
+
+    #[test]
+    fn an_iso_value_one_byte_over_the_header_cap_is_cut_and_reported_at_the_cap() {
+        let input = format!("2024-01-01T12:00:00Z{}", " ".repeat(MAX_HEADER_BYTES - 19));
+        let (instant, issues) = parse(&input);
+        assert_eq!(
+            instant.map(|found| found.unix_seconds()),
+            Some(NOON),
+            "the date before the cut is read"
+        );
+        assert_eq!(
+            kinds(&issues),
+            [(
+                IssueKind::CapExceeded {
+                    cap: Cap::HeaderBytes
+                },
+                MAX_HEADER_BYTES
+            )],
+            "one issue at the cap"
+        );
     }
 
     #[test]
