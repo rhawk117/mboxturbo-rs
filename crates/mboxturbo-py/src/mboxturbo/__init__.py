@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Protocol
 
+from mboxturbo._bin import MboxTurboBinNotFoundError, find_mboxturbo_bin
 from mboxturbo._core import (
     Address,
     Attachment,
@@ -82,6 +83,7 @@ __all__ = [
     'Exporter',
     'HeaderBuilder',
     'Mailbox',
+    'MboxTurboBinNotFoundError',
     'MboxTurboError',
     'Message',
     'Predicate',
@@ -89,6 +91,7 @@ __all__ = [
     'StaleIndexError',
     'Trust',
     'VerdictBuilder',
+    'find_mboxturbo_bin',
     'header',
     'verdict',
 ]
