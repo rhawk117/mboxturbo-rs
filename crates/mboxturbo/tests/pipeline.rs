@@ -786,7 +786,7 @@ body\n";
             &[Column::AuthResults, Column::ArcSets, Column::DkimSignatures],
             None,
         );
-        for column in 0..3 {
+        for column in [0, 2] {
             let list = batch.column(column).as_list::<i32>();
             assert!(
                 list.is_valid(3),
@@ -800,14 +800,68 @@ body\n";
         }
     }
 
+    #[test]
+    fn a_message_without_arc_headers_gets_an_arc_sets_struct_of_empty_lists() {
+        let batch = structured_batch(&[Column::ArcSets], None);
+        let arc_sets = batch.column(0).as_struct();
+        for name in ["sets", "issues"] {
+            let list = arc_sets
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("arc_sets has a {name} field"))
+                .as_list::<i32>();
+            assert!(
+                list.is_valid(3),
+                "arc_sets.{name} is not null for a bare message"
+            );
+            assert_eq!(
+                list.value(3).len(),
+                0,
+                "arc_sets.{name} is empty for a bare message"
+            );
+        }
+        assert!(
+            arc_sets.is_valid(3),
+            "arc_sets is not null for a bare message"
+        );
+    }
+
     fn arc_sets_of_second_message() -> StructArray {
         let batch = structured_batch(&[Column::ArcSets], Some(trust_mx()));
-        elements(&batch, 0, 1)
+        arc_sets_of(&batch, 1)
+    }
+
+    /// The sets of message `row` in the `arc_sets` struct column 0.
+    fn arc_sets_of(batch: &RecordBatch, row: usize) -> StructArray {
+        batch
+            .column(0)
+            .as_struct()
+            .column_by_name("sets")
+            .expect("arc_sets has a sets field")
+            .as_list::<i32>()
+            .value(row)
+            .as_struct()
+            .clone()
+    }
+
+    /// The chain-level issue kinds of message `row` in the `arc_sets` struct column 0.
+    fn arc_chain_issue_kinds(batch: &RecordBatch, row: usize) -> Vec<String> {
+        let issues = batch
+            .column(0)
+            .as_struct()
+            .column_by_name("issues")
+            .expect("arc_sets has an issues field")
+            .as_list::<i32>()
+            .value(row);
+        text_field(issues.as_struct(), "kind")
+            .into_iter()
+            .map(|kind| kind.expect("an issue always has a kind"))
+            .collect()
     }
 
     #[test]
     fn three_arc_headers_of_one_instance_form_one_set_with_its_seal() {
-        let sets = arc_sets_of_second_message();
+        let batch = structured_batch(&[Column::ArcSets], Some(trust_mx()));
+        let sets = arc_sets_of(&batch, 1);
         assert_eq!(sets.len(), 1, "the three ARC headers form one set");
         let instances = sets
             .column_by_name("instance")
@@ -822,8 +876,30 @@ body\n";
             "the seal's cv tag is exposed"
         );
         assert!(
-            issue_kinds(&sets, 0).is_empty(),
+            arc_chain_issue_kinds(&batch, 1).is_empty(),
             "a complete ARC set has no issues"
+        );
+    }
+
+    #[test]
+    fn an_arc_chain_problem_that_names_no_instance_is_reported_in_arc_sets_issues() {
+        let fixture = Fixture::with(
+            "From a@example.com Mon Jan  1 00:00:00 2024\n\
+ARC-Seal: a=rsa-sha256; cv=none; d=example.org; s=arc; b=c2VhbA==\n\
+Subject: seal without an instance\n\
+\n\
+body\n",
+        );
+        let batches = fixture.batches(&[Column::ArcSets], 8);
+        let batch = batches.first().expect("one batch holds the message");
+        assert_eq!(
+            arc_sets_of(batch, 0).len(),
+            0,
+            "the seal without an instance forms no set"
+        );
+        assert!(
+            !arc_chain_issue_kinds(batch, 0).is_empty(),
+            "the dropped header is reported at the chain level"
         );
     }
 

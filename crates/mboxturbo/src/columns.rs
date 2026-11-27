@@ -46,13 +46,14 @@ pub enum Column {
     /// Every `ARC-Authentication-Results`, `ARC-Message-Signature` and `ARC-Seal` header grouped
     /// into ARC sets by instance, parsed from the raw header bytes; opt-in, never a default.
     ///
-    /// A list of one struct per set, ordered by instance, empty when the message has none:
+    /// One struct per message, never null: `sets: List<Struct>`, one struct per ARC set ordered
+    /// by instance and empty when the message has none, and `issues: List<Struct<kind: Utf8,
+    /// offset: UInt64>>`, every parse issue of the chain in the parser's order (instance
+    /// problems, the cap, tag-list and `ARC-Authentication-Results` problems). A set has
     /// `instance: UInt8`; `seal` and `message_signature`: `List<Struct<name: Utf8, value: Utf8,
     /// offset: UInt64>>`, null when the set lacks that header; `authentication_results`: a
     /// struct with the fields of [`Column::AuthResults`] except `issues`, null when the set
-    /// lacks that header; `chain_validation: Utf8`, the seal's `cv` tag, null when absent;
-    /// `issues: List<Struct<kind: Utf8, offset: UInt64>>`, the parse issues that name the set's
-    /// instance (issues that name none, such as a malformed seal tag list, are not exposed).
+    /// lacks that header; `chain_validation: Utf8`, the seal's `cv` tag, null when absent.
     /// `trusted` inside `authentication_results` is true or false when a trust set was given
     /// to [`Pipeline::with_trust`](crate::Pipeline::with_trust) and null otherwise.
     ArcSets,

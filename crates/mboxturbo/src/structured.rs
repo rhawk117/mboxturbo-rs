@@ -426,7 +426,7 @@ pub(crate) struct ArcSetsColumn {
     chain_validation: StringBuilder,
     /// Instance numbers.
     instance: UInt8Builder,
-    /// Issues that name each set's instance.
+    /// Every issue of each message's chain.
     issues: IssueLists,
     /// `ARC-Message-Signature` tags.
     message_signature: TagLists,
@@ -434,27 +434,29 @@ pub(crate) struct ArcSetsColumn {
     results: ResultsRows,
     /// `ARC-Seal` tags.
     seal: TagLists,
-    /// Message boundaries.
+    /// Set boundaries of each message.
     shape: Shape,
 }
 
 impl ArcSetsColumn {
-    /// Appends the list of ARC sets of `mail`, parsed from the raw bytes of its ARC headers; an
-    /// unparsed message appends an empty list.
+    /// Appends the ARC sets and chain issues of `mail`, parsed from the raw bytes of its ARC
+    /// headers; an unparsed message appends an empty list of each.
     pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>, trust: Option<&TrustSet>) {
         let headers: Vec<ArcHeader<'_>> = mail.into_iter().flat_map(arc_headers).collect();
         let (sets, issues) = parse_arc_sets(&headers, trust).into_parts();
         for set in &sets {
-            self.push_set(set, &issues);
+            self.push_set(set);
         }
         self.shape.push_list(sets.len());
+        self.issues.push(issues.iter());
     }
 
-    /// The column, as an Arrow array with one list per message appended.
+    /// The column, as an Arrow struct array holding the `{sets, issues}` of every message appended.
     ///
     /// # Errors
     ///
-    /// The Arrow error when the nested arrays do not fit [`arc_set_fields`].
+    /// The Arrow error when the nested arrays do not fit [`arc_set_fields`] or
+    /// [`arc_sets_fields`].
     pub(crate) fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
         let columns: Vec<ArrayRef> = vec![
             Arc::new(self.instance.finish()),
@@ -462,11 +464,16 @@ impl ArcSetsColumn {
             self.message_signature.finish()?,
             self.results.finish_struct()?,
             Arc::new(self.chain_validation.finish()),
-            self.issues.finish()?,
         ];
         let values = StructArray::try_new(arc_set_fields(), columns, None)?;
-        self.shape
-            .wrap(struct_item(arc_set_fields()), Arc::new(values))
+        let sets = self
+            .shape
+            .wrap(struct_item(arc_set_fields()), Arc::new(values))?;
+        Ok(Arc::new(StructArray::try_new(
+            arc_sets_fields(),
+            vec![sets, self.issues.finish()?],
+            None,
+        )?))
     }
 
     /// An empty column.
@@ -482,8 +489,8 @@ impl ArcSetsColumn {
         }
     }
 
-    /// Appends the row for `set` with the `issues` that name its instance.
-    fn push_set(&mut self, set: &ArcSet<'_>, issues: &[Issue]) {
+    /// Appends the row for `set`.
+    fn push_set(&mut self, set: &ArcSet<'_>) {
         self.instance.append_value(set.instance());
         push_optional_tags(&mut self.seal, set.seal().map(TagList::tags));
         push_optional_tags(
@@ -496,11 +503,6 @@ impl ArcSetsColumn {
         }
         self.chain_validation
             .append_option(set.chain_validation().as_ref().map(chain_validation_name));
-        self.issues.push(
-            issues
-                .iter()
-                .filter(|issue| names_instance(issue, set.instance())),
-        );
     }
 }
 
@@ -607,7 +609,7 @@ impl DkimSignaturesColumn {
 
 /// The Arrow type of the `arc_sets` column.
 pub(crate) fn arc_sets_type() -> DataType {
-    list_of_structs(arc_set_fields())
+    DataType::Struct(arc_sets_fields())
 }
 
 /// The Arrow type of the `auth_results` column.
@@ -640,13 +642,21 @@ fn arc_headers<'mail>(mail: &'mail Mail<'mail>) -> impl Iterator<Item = ArcHeade
 
 /// The struct of one `arc_sets` element.
 fn arc_set_fields() -> Fields {
-    with_issues(&Fields::from(vec![
+    Fields::from(vec![
         field("instance", DataType::UInt8),
         struct_list_field("seal", tag_fields()),
         struct_list_field("message_signature", tag_fields()),
         field("authentication_results", DataType::Struct(results_fields())),
         field("chain_validation", DataType::Utf8),
-    ]))
+    ])
+}
+
+/// The struct of one `arc_sets` value: the sets plus the issues of the whole chain.
+fn arc_sets_fields() -> Fields {
+    Fields::from(vec![
+        struct_list_field("sets", arc_set_fields()),
+        struct_list_field("issues", issue_fields()),
+    ])
 }
 
 /// The struct of one `auth_results` element: the results plus their issues.
@@ -750,11 +760,6 @@ fn method_name<'method>(method: &'method AuthMethod<'_>) -> &'method str {
         AuthMethod::Spf => "spf",
         _ => "unknown",
     }
-}
-
-/// Whether `issue` is an ARC problem of `instance`.
-const fn names_instance(issue: &Issue, instance: u8) -> bool {
-    matches!(issue.kind(), IssueKind::ArcInstance { instance: named, .. } if named == instance)
 }
 
 /// The `{ptype, property, value}` struct of one result property.
