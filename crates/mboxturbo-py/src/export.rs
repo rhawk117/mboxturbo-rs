@@ -165,6 +165,15 @@ impl Filters {
         }
         Ok(narrowing.select(mailbox, None)?)
     }
+
+    /// A pipeline over `columns` in batches of `batch_size`, carrying this trust set when there
+    /// is one.
+    fn pipeline(&self, columns: Vec<Column>, batch_size: usize) -> Pipeline {
+        self.trust
+            .clone()
+            .into_iter()
+            .fold(Pipeline::new(columns, batch_size), Pipeline::with_trust)
+    }
 }
 
 #[pymethods]
@@ -436,25 +445,24 @@ pub(crate) fn select_columns(
     filters: &Filters,
 ) -> PyResult<Selection> {
     let columns = checked_columns(requested, batch_size)?;
-    let names = columns
-        .iter()
-        .map(|column| column.name().into_owned())
-        .collect();
     let rows = narrowed_rows(py, &mailbox, filters)?;
-    let extraction = filters
-        .trust
-        .clone()
-        .into_iter()
-        .fold(Pipeline::new(columns, batch_size), Pipeline::with_trust);
     Ok(Selection {
         batch_size,
         excluded_undated: rows.excluded_undated.unwrap_or(0),
         mailbox,
         messages: rows.count,
-        names,
-        pipeline: Arc::new(extraction),
+        names: names_of(&columns),
+        pipeline: Arc::new(filters.pipeline(columns, batch_size)),
         rows: rows.selection,
     })
+}
+
+/// The names of `columns`, in order.
+fn names_of(columns: &[Column]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|column| column.name().into_owned())
+        .collect()
 }
 
 /// The columns `requested` names (every default when `None`), or `ValueError` for a zero
