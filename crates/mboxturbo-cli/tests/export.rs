@@ -587,6 +587,73 @@ mod export {
     }
 
     #[test]
+    fn overwrite_refuses_a_non_empty_directory_for_a_file_format() {
+        let fixture = Fixture::new();
+        let directory = fixture.path("out.csv");
+        fs::create_dir_all(&directory).expect("the existing directory is created");
+        fs::write(directory.join("keep.txt"), "keep me").expect("the directory is filled");
+        let target = fixture.target("out.csv");
+        let output = fixture.export(&["--format", "csv", "-o", &target, "--overwrite"]);
+        assert_eq!(code(&output), 73_i32, "a directory where a file goes is 73");
+        assert_eq!(
+            file_names(&directory),
+            ["keep.txt"],
+            "the directory is unchanged"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("keep.txt")).expect("the file is still there"),
+            "keep me",
+            "the file inside is untouched"
+        );
+    }
+
+    #[test]
+    fn overwrite_refuses_a_directory_without_a_manifest_for_eml() {
+        let fixture = Fixture::new();
+        let directory = fixture.path("emls");
+        fs::create_dir_all(&directory).expect("the existing directory is created");
+        fs::write(directory.join("keep.txt"), "keep me").expect("the directory is filled");
+        let target = fixture.target("emls");
+        let output = fixture.export(&["--format", "eml", "-o", &target, "--overwrite"]);
+        assert_eq!(code(&output), 73_i32, "an unrelated directory is 73");
+        assert_eq!(
+            file_names(&directory),
+            ["keep.txt"],
+            "the directory is unchanged"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("keep.txt")).expect("the file is still there"),
+            "keep me",
+            "the file inside is untouched"
+        );
+    }
+
+    #[test]
+    fn overwrite_replaces_an_earlier_eml_export() {
+        let fixture = Fixture::new();
+        let target = fixture.target("emls");
+        let first = fixture.export(&["--format", "eml", "-o", &target]);
+        assert_eq!(
+            code(&first),
+            0_i32,
+            "the first export succeeds: {}",
+            stderr(&first)
+        );
+        let second = fixture.export(&["--format", "eml", "-o", &target, "--overwrite"]);
+        assert_eq!(
+            code(&second),
+            0_i32,
+            "re-exporting succeeds: {}",
+            stderr(&second)
+        );
+        assert_eq!(
+            file_names(&fixture.path("emls")),
+            ["0.eml", "1.eml", "2.eml", "3.eml", "manifest.jsonl"],
+            "the directory holds the new export"
+        );
+    }
+
+    #[test]
     fn a_missing_mailbox_exits_66() {
         let fixture = Fixture::new();
         let target = fixture.target("out.csv");

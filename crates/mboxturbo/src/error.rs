@@ -166,6 +166,14 @@ pub enum MboxTurboError {
         /// The existing file or directory.
         path: PathBuf,
     },
+    /// The export target exists, overwriting was requested, and the target may not be replaced.
+    #[error("export target {} was not replaced: it is {reason}", path.display())]
+    TargetNotReplaceable {
+        /// The existing file or directory, left unchanged.
+        path: PathBuf,
+        /// Why the existing target may not be replaced.
+        reason: &'static str,
+    },
     /// The exporter cannot write to this kind of destination.
     #[error(
         "this export format cannot write to a {kind} destination (target: {})",

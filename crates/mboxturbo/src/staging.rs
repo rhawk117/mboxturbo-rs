@@ -13,6 +13,9 @@ use crate::error::MboxTurboError;
 /// Name of the previous output inside its set-aside holder directory.
 const SET_ASIDE: &str = "previous";
 
+/// The manifest's file name, as the EML exporter writes it (`MANIFEST` in `eml_sink.rs`).
+const MANIFEST: &str = "manifest.jsonl";
+
 /// Where an error about a stream destination says it happened.
 const STREAM_LABEL: &str = "<stream>";
 
@@ -187,7 +190,7 @@ impl Destination {
     pub fn stage(self, overwrite: Overwrite) -> Result<Staged, MboxTurboError> {
         match self {
             Self::Directory(target) => {
-                refuse_existing(&target, overwrite)?;
+                refuse_existing(&target, overwrite, DestinationKind::Directory)?;
                 let directory = staging_directory(parent_of(&target))
                     .map_err(|source| MboxTurboError::io(&target, source))?;
                 Ok(Staged {
@@ -197,7 +200,7 @@ impl Destination {
                 })
             },
             Self::File(target) => {
-                refuse_existing(&target, overwrite)?;
+                refuse_existing(&target, overwrite, DestinationKind::File)?;
                 let file = NamedTempFile::new_in(parent_of(&target))
                     .map_err(|source| MboxTurboError::io(&target, source))?;
                 Ok(Staged {
@@ -307,7 +310,7 @@ fn commit_directory_with(
     overwrite: Overwrite,
     rename: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<PathBuf, MboxTurboError> {
-    refuse_existing(&target, overwrite)?;
+    refuse_existing(&target, overwrite, DestinationKind::Directory)?;
     let set_aside = match overwrite {
         Overwrite::Replace => set_aside_existing(&target)?,
         Overwrite::Refuse => None,
@@ -407,6 +410,7 @@ fn commit_file(
 ) -> Result<PathBuf, MboxTurboError> {
     file.flush()
         .map_err(|source| MboxTurboError::io(&target, source))?;
+    refuse_existing(&target, overwrite, DestinationKind::File)?;
     let persisted: Result<File, _> = match overwrite {
         Overwrite::Refuse => file.persist_noclobber(&target),
         Overwrite::Replace => file.persist(&target),
@@ -432,10 +436,19 @@ fn parent_of(target: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// Fails with [`MboxTurboError::TargetExists`] when `target` exists and may not be replaced.
-fn refuse_existing(target: &Path, overwrite: Overwrite) -> Result<(), MboxTurboError> {
+/// Fails when `target` exists and may not be replaced by output of `kind`.
+///
+/// Without [`Overwrite::Replace`] any existing target is refused with
+/// [`MboxTurboError::TargetExists`]. With it, a target of the other kind and a directory that is
+/// neither empty nor holds a [`MANIFEST`] from an earlier export are refused with
+/// [`MboxTurboError::TargetNotReplaceable`].
+fn refuse_existing(
+    target: &Path,
+    overwrite: Overwrite,
+    kind: DestinationKind,
+) -> Result<(), MboxTurboError> {
     if overwrite == Overwrite::Replace {
-        return Ok(());
+        return refuse_unreplaceable(target, kind);
     }
     let exists = target
         .try_exists()
@@ -446,6 +459,42 @@ fn refuse_existing(target: &Path, overwrite: Overwrite) -> Result<(), MboxTurboE
         });
     }
     Ok(())
+}
+
+/// The replace-path half of [`refuse_existing`]: nothing at `target` is fine, a target of the
+/// wanted kind is fine unless it is an unrelated directory.
+fn refuse_unreplaceable(target: &Path, kind: DestinationKind) -> Result<(), MboxTurboError> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(MboxTurboError::io(target, source)),
+    };
+    let reason = match (kind, metadata.is_dir()) {
+        (DestinationKind::Directory, false) => "a file where a directory goes",
+        (DestinationKind::File, true) => "a directory where a file goes",
+        (DestinationKind::Directory, true) if !is_replaceable_directory(target)? => {
+            "a directory that is not empty and holds no manifest.jsonl from an earlier export"
+        },
+        _ => return Ok(()),
+    };
+    Err(MboxTurboError::TargetNotReplaceable {
+        path: target.to_path_buf(),
+        reason,
+    })
+}
+
+/// Whether `directory` is empty or holds a [`MANIFEST`].
+fn is_replaceable_directory(directory: &Path) -> Result<bool, MboxTurboError> {
+    let has_manifest = directory
+        .join(MANIFEST)
+        .try_exists()
+        .map_err(|source| MboxTurboError::io(directory, source))?;
+    if has_manifest {
+        return Ok(true);
+    }
+    let mut entries =
+        fs::read_dir(directory).map_err(|source| MboxTurboError::io(directory, source))?;
+    Ok(entries.next().is_none())
 }
 
 #[cfg(test)]
@@ -463,6 +512,7 @@ mod tests {
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.txt"), b"previous").expect("previous output is written");
+        fs::write(target.join("manifest.jsonl"), b"").expect("previous manifest is written");
         let staged = TempDir::new_in(parent.path()).expect("staged directory creates");
 
         let error = commit_directory_with(staged, target.clone(), Overwrite::Replace, |_, _| {

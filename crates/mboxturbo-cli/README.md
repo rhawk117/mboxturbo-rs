@@ -86,7 +86,7 @@ mboxturbo export [OPTIONS] --format <FORMAT> --output <OUT> <MAILBOX>
 | `--where <JSON>` | Keep only messages matching a predicate in its JSON form. See [Predicates](#predicates). |
 | `--where-file <PATH>` | A file holding the predicate, as for `--where`. Conflicts with `--where`. |
 | `--index <PATH>` | Keep the message index in this file instead of beside the mailbox. |
-| `--overwrite` | Replace the output if it already exists. Without it an existing output is refused with exit 73 and left unchanged. |
+| `--overwrite` | Replace the output if it already exists. Without it an existing output is refused with exit 73 and left unchanged. Even with it, a directory where a file goes, a file where a directory goes, and a directory that is not empty and holds no `manifest.jsonl` from an earlier export are refused with exit 73 and left unchanged. |
 
 An export prints one summary line on standard error, preceded by `mboxturbo: index rebuilt` when the index had to be built:
 
@@ -289,7 +289,7 @@ $ mboxturbo export mail.mbox --format jsonl --columns position,verdict_dmarc -o 
 | 64 | Usage error: bad arguments, a message position past the last message, or a `--where` or `--where-file` predicate that is not valid. |
 | 65 | Corrupt or stale index. |
 | 66 | The mailbox does not exist. |
-| 73 | The export target exists and `--overwrite` was not given. |
+| 73 | The export target exists and `--overwrite` was not given, or `--overwrite` may not replace it: it is of the other kind (file or directory) or a directory with no `manifest.jsonl` that is not empty. |
 | 74 | Any other I/O error, including a path not found after the mailbox is open, such as a missing output directory. |
 | 129 | Interrupted by SIGHUP. |
 | 130 | Interrupted by SIGINT (Ctrl-C), or cancelled with no signal. |

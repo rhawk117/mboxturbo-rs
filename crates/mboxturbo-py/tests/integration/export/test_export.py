@@ -231,6 +231,18 @@ class TestParquetOverwrite:
         assert selection.to_parquet(target, overwrite=True) == 1
         assert pq.read_table(target).to_pylist() == [{'subject': 's'}]
 
+    def test_overwrite_refuses_an_unrelated_directory_and_leaves_it_unchanged(
+        self, selection: Selection, tmp_path: Path
+    ) -> None:
+        target = tmp_path / 'out.parquet'
+        target.mkdir()
+        (target / 'keep.txt').write_bytes(b'precious')
+        with pytest.raises(FileExistsError) as refused:
+            selection.to_parquet(target, overwrite=True)
+        assert str(target) in str(refused.value.filename)
+        assert [entry.name for entry in target.iterdir()] == ['keep.txt']
+        assert (target / 'keep.txt').read_bytes() == b'precious'
+
 
 @pytest.mark.skipif(
     bool(sysconfig.get_config_var('Py_GIL_DISABLED')),

@@ -125,6 +125,7 @@ mod staging {
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.eml"), b"old").expect("previous output fills");
+        fs::write(target.join("manifest.jsonl"), b"").expect("previous manifest is written");
         let mut staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
             .expect("staging a target succeeds");
@@ -155,6 +156,7 @@ mod staging {
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.eml"), b"old").expect("previous output fills");
+        fs::write(target.join("manifest.jsonl"), b"").expect("previous manifest is written");
         let mut staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
             .expect("staging a target succeeds");
@@ -241,6 +243,8 @@ mod staging {
         fs::create_dir_all(&target).expect("creating the existing target directory succeeds");
         fs::write(target.join("old.eml"), b"old")
             .expect("writing the old directory content succeeds");
+        fs::write(target.join("manifest.jsonl"), b"")
+            .expect("writing the previous manifest succeeds");
         let mut staged = Destination::Directory(target.clone())
             .stage(Overwrite::Replace)
             .expect("staging a target succeeds");
@@ -252,6 +256,112 @@ mod staging {
                 .expect("committing the staged target succeeds"),
         );
         assert_eq!(entries(&target), ["new.eml"], "old contents are gone");
+    }
+
+    /// Stages `destination` with replacing asked for and returns the refusal reason.
+    fn replace_refusal(destination: Destination, target: &Path) -> &'static str {
+        let error = destination
+            .stage(Overwrite::Replace)
+            .expect_err("an unreplaceable target is refused at staging");
+        let MboxTurboError::TargetNotReplaceable { path, reason } = error else {
+            panic!("expected TargetNotReplaceable, got {error:?}");
+        };
+        assert_eq!(path, target, "the error names the target");
+        reason
+    }
+
+    #[test]
+    fn replace_refuses_a_directory_where_a_file_goes() {
+        let parent = TempDir::new().expect("the parent temp directory is created");
+        let target = parent.path().join("out.csv");
+        fs::create_dir_all(&target).expect("the directory is created");
+        fs::write(target.join("keep.txt"), b"keep").expect("the directory is filled");
+        let reason = replace_refusal(Destination::File(target.clone()), &target);
+        assert_eq!(
+            reason, "a directory where a file goes",
+            "the reason names the kind"
+        );
+        assert_eq!(entries(&target), ["keep.txt"], "the directory is unchanged");
+        assert_eq!(
+            entries(parent.path()),
+            ["out.csv"],
+            "nothing is left staged"
+        );
+    }
+
+    #[test]
+    fn replace_refuses_a_file_where_a_directory_goes() {
+        let parent = TempDir::new().expect("the parent temp directory is created");
+        let target = parent.path().join("out");
+        fs::write(&target, b"keep").expect("the file is written");
+        let reason = replace_refusal(Destination::Directory(target.clone()), &target);
+        assert_eq!(
+            reason, "a file where a directory goes",
+            "the reason names the kind"
+        );
+        assert_eq!(
+            fs::read(&target).expect("the file is readable"),
+            b"keep",
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn replace_refuses_a_non_empty_directory_without_a_manifest() {
+        let parent = TempDir::new().expect("the parent temp directory is created");
+        let target = parent.path().join("out");
+        fs::create_dir_all(&target).expect("the directory is created");
+        fs::write(target.join("keep.txt"), b"keep").expect("the directory is filled");
+        let reason = replace_refusal(Destination::Directory(target.clone()), &target);
+        assert!(
+            reason.contains("manifest.jsonl"),
+            "the reason names the manifest: {reason}"
+        );
+        assert_eq!(entries(&target), ["keep.txt"], "the directory is unchanged");
+        assert_eq!(
+            fs::read(target.join("keep.txt")).expect("the file is readable"),
+            b"keep",
+            "the file is byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn replace_refuses_at_commit_a_target_that_became_unreplaceable_after_staging() {
+        let parent = TempDir::new().expect("the parent temp directory is created");
+        let target = parent.path().join("out");
+        let mut staged = Destination::Directory(target.clone())
+            .stage(Overwrite::Replace)
+            .expect("an absent target stages");
+        fs::write(staged_directory(&mut staged).join("new.eml"), b"new")
+            .expect("the staged directory is filled");
+        fs::create_dir_all(&target).expect("the target appears");
+        fs::write(target.join("keep.txt"), b"keep").expect("the target is filled");
+        let error = staged.commit().expect_err("the target may not be replaced");
+        assert!(
+            matches!(error, MboxTurboError::TargetNotReplaceable { .. }),
+            "commit refuses the new unrelated directory"
+        );
+        assert_eq!(entries(&target), ["keep.txt"], "the directory is unchanged");
+    }
+
+    #[test]
+    fn replace_accepts_an_empty_directory_and_one_holding_a_manifest() {
+        let parent = TempDir::new().expect("the parent temp directory is created");
+        for (name, manifest) in [("empty", false), ("earlier", true)] {
+            let target = parent.path().join(name);
+            fs::create_dir_all(&target).expect("the directory is created");
+            if manifest {
+                fs::write(target.join("manifest.jsonl"), b"").expect("the manifest is written");
+                fs::write(target.join("old.eml"), b"old").expect("the old output is written");
+            }
+            let mut staged = Destination::Directory(target.clone())
+                .stage(Overwrite::Replace)
+                .expect("a replaceable directory stages");
+            fs::write(staged_directory(&mut staged).join("new.eml"), b"new")
+                .expect("the staged directory is filled");
+            drop(staged.commit().expect("the directory is replaced"));
+            assert_eq!(entries(&target), ["new.eml"], "{name} is replaced");
+        }
     }
 
     #[test]

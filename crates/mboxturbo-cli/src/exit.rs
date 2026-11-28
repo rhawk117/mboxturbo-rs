@@ -39,7 +39,7 @@ pub(crate) enum Stage {
 /// | `PositionOutOfRange` (usage) | 64 |
 /// | `CorruptIndex`, `StaleIndex` | 65 |
 /// | `Io` whose source is `NotFound` for the mailbox path itself (mailbox missing) | 66 |
-/// | `TargetExists` | 73 |
+/// | `TargetExists`, `TargetNotReplaceable` | 73 |
 /// | `Io`, any other kind or any other `NotFound`, such as an output or index path | 74 |
 /// | `Cancelled` | 130 |
 ///
@@ -59,7 +59,9 @@ pub(crate) fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
         MboxTurboError::InvalidPredicate { .. } | MboxTurboError::PositionOutOfRange { .. } => {
             USAGE
         },
-        MboxTurboError::TargetExists { .. } => TARGET_EXISTS,
+        MboxTurboError::TargetExists { .. } | MboxTurboError::TargetNotReplaceable { .. } => {
+            TARGET_EXISTS
+        },
         // `MboxTurboError` is `#[non_exhaustive]`: a variant added later is "other" until named
         // above.
         _ => OTHER,
@@ -150,6 +152,15 @@ mod tests {
             path: PathBuf::from("out.csv"),
         };
         assert_eq!(code(&error), 73, "target exists is 73");
+    }
+
+    #[test]
+    fn an_unreplaceable_target_exits_73() {
+        let error = MboxTurboError::TargetNotReplaceable {
+            path: PathBuf::from("out"),
+            reason: "a file where a directory goes",
+        };
+        assert_eq!(code(&error), 73, "an unreplaceable target is 73");
     }
 
     #[test]

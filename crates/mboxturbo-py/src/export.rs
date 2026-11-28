@@ -200,7 +200,10 @@ impl Selection {
     /// Arrow `PyCapsule` interface; ``out`` has ``write(data)`` for a file and is the staging
     /// ``pathlib.Path`` for a directory. Nothing lands at ``path`` unless ``finish`` succeeds.
     /// An exception from the exporter is raised as is, after the staged output is discarded.
-    /// Overwrite, ``progress``, ``cancel`` and Ctrl-C behave as in ``to_parquet``.
+    /// Overwrite, ``progress``, ``cancel`` and Ctrl-C behave as in ``to_parquet``. A directory
+    /// destination is replaced with ``overwrite=True`` only when it is empty or holds a
+    /// ``manifest.jsonl`` written by an earlier export. Any other existing directory, and any
+    /// target of the other kind, raises ``FileExistsError`` and is left unchanged.
     #[pyo3(signature = (exporter, path, *, overwrite = false, progress = None, cancel = None))]
     #[expect(
         clippy::fn_params_excessive_bools,
@@ -232,7 +235,9 @@ impl Selection {
 
     /// Writes the selection to a Parquet file at ``path`` atomically and returns the row count.
     /// An existing file raises ``FileExistsError`` and is left untouched unless ``overwrite`` is
-    /// true. The GIL is released while exporting. ``progress(done, total)`` runs after each
+    /// true. Even then, a directory at ``path`` is not replaced: ``overwrite`` does not replace
+    /// an unrelated directory or a target of the other kind, and ``FileExistsError`` is raised.
+    /// The GIL is released while exporting. ``progress(done, total)`` runs after each
     /// written batch. Ctrl-C, ``cancel``, or a ``progress`` that raises stops the export, leaves
     /// no file and raises ``Cancelled`` caused by the interrupt or the callback's exception.
     #[pyo3(signature = (
