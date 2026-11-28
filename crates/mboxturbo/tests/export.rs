@@ -621,32 +621,25 @@ mod export {
     }
 
     #[test]
-    fn a_parquet_stream_holds_the_same_rows_as_the_pipeline_yields() {
-        let (fixture, expected) = default_columns_fixture();
+    fn a_parquet_stream_destination_is_refused() {
+        let fixture = Fixture::with_messages(MESSAGES);
         let streamed = fixture.output.path().join("streamed.parquet");
-        let summary = fixture
+
+        let refusal = fixture
             .export(Destination::Stream(Box::new(
                 File::create(&streamed).expect("stream file creates"),
             )))
-            .run(Box::new(ParquetExporter::new(Compression::Zstd)))
-            .expect("the parquet stream export succeeds");
+            .run(Box::new(ParquetExporter::new(Compression::Zstd)));
 
-        let (schema, batches) = read_parquet(&streamed);
-        assert_eq!(
-            Some(&schema),
-            expected.first().map(RecordBatch::schema_ref),
-            "the Arrow schema is the pipeline's"
-        );
-        assert_eq!(
-            batches, expected,
-            "a stream carries the same rows as the pipeline yields"
-        );
-        assert_eq!(summary.path, None, "a stream has no path");
-        let written = fs::read(&streamed).expect("streamed file is readable");
-        assert_eq!(
-            summary.bytes,
-            count(written.len()),
-            "the reported bytes are the streamed buffer's length"
+        assert!(
+            matches!(
+                refusal,
+                Err(MboxTurboError::UnsupportedDestination {
+                    kind: DestinationKind::Stream,
+                    target: None,
+                })
+            ),
+            "a stream is refused with its kind and no target"
         );
     }
 

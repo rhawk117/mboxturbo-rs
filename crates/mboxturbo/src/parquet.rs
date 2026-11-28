@@ -1,7 +1,5 @@
 //! The Parquet sink of the export driver.
 
-use std::io;
-
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use parquet::arrow::ArrowWriter;
@@ -22,7 +20,7 @@ const ROW_GROUP_BATCHES: usize = 16;
 
 /// Writes the exported columns as one Parquet file.
 ///
-/// Accepts a file or a stream destination and refuses a directory. The file holds one column
+/// Accepts a file and refuses a directory or a stream. The file holds one column
 /// per selected [`Column`](crate::Column), in order, with the Arrow schema embedded, so it reads
 /// back with the same types the pipeline produced. Dictionary encoding is off and statistics are
 /// kept per column chunk.
@@ -78,7 +76,7 @@ impl ParquetExporter {
 
 impl Exporter for ParquetExporter {
     fn accepts(&self, kind: DestinationKind) -> bool {
-        kind != DestinationKind::Directory
+        kind == DestinationKind::File
     }
 
     fn begin(&mut self, schema: &SchemaRef, staged: &mut Staged) -> Result<(), MboxTurboError> {
@@ -130,15 +128,13 @@ fn parquet_compression(compression: Compression) -> ParquetCompression {
 }
 
 /// A Parquet failure on the destination `staged` writes to: [`MboxTurboError::Parquet`] naming
-/// the file, or [`MboxTurboError::Stream`] for a stream, which has no path to name.
+/// the file, or the refusal of a stream, which this sink does not accept and has no path to name.
 fn parquet_failure(staged: &Staged, source: ParquetError) -> MboxTurboError {
-    match staged.target() {
-        Some(path) => MboxTurboError::Parquet {
+    staged.target().map_or_else(
+        || staged.unsupported(),
+        |path| MboxTurboError::Parquet {
             path: path.to_path_buf(),
             source,
         },
-        None => MboxTurboError::Stream {
-            source: io::Error::other(source),
-        },
-    }
+    )
 }

@@ -8,10 +8,10 @@ use std::{fs, io};
 
 use clap::{Args, ValueEnum};
 use mboxturbo::{
-    CancelToken, Column, Compression, CsvExporter, Destination, EmlExporter, Export, ExportSummary,
-    Exporter, Filter, FormulaEscaping, IndexOrigin, IpcExporter, JsonlExporter, Mailbox,
-    MboxExporter, MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline,
-    Predicate, Progress,
+    CancelToken, Column, Compression, CsvExporter, Destination, DestinationKind, EmlExporter,
+    Export, ExportSummary, Exporter, Filter, FormulaEscaping, IndexOrigin, IpcExporter,
+    JsonlExporter, Mailbox, MboxExporter, MboxTurboError, Narrowed, Narrowing, Overwrite,
+    ParquetExporter, Pipeline, Predicate, Progress,
 };
 
 use crate::dates::Bounds;
@@ -131,11 +131,6 @@ impl Format {
             Self::Mbox => "mbox",
             Self::Parquet => "parquet",
         }
-    }
-
-    /// Whether this format can be written to standard output.
-    const fn streams(self) -> bool {
-        !matches!(self, Self::Eml | Self::Parquet)
     }
 }
 
@@ -449,7 +444,7 @@ fn destination(format: Format, output: &Path) -> Result<Destination, Failure> {
             },
         });
     }
-    if format.streams() {
+    if format.exporter(0).accepts(DestinationKind::Stream) {
         return Ok(Destination::Stream(Box::new(io::stdout())));
     }
     Err(Failure::Usage(format!(
