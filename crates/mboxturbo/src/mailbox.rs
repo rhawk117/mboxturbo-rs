@@ -9,6 +9,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::builder::{BoundaryCheck, IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
+use crate::date_bounds::DateBounds;
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
@@ -244,7 +245,7 @@ impl Mailbox {
     /// never the message bytes.
     #[must_use]
     pub fn date_range(&self, since: Option<i64>, until: Option<i64>) -> DateRange {
-        self.dates_among(0..self.len(), since, until)
+        self.dates_among(0..self.len(), DateBounds::new(since, until))
     }
 
     /// [`Mailbox::date_range`] over `candidates`, which must all be below the mailbox length:
@@ -252,10 +253,8 @@ impl Mailbox {
     pub(crate) fn dates_among(
         &self,
         candidates: impl IntoIterator<Item = usize>,
-        since: Option<i64>,
-        until: Option<i64>,
+        bounds: DateBounds,
     ) -> DateRange {
-        let unbounded = since.is_none() && until.is_none();
         let mut range = DateRange {
             positions: Vec::new(),
             undated: 0,
@@ -264,12 +263,9 @@ impl Mailbox {
             let kept = self.date(position).map_or_else(
                 || {
                     range.undated = range.undated.saturating_add(1);
-                    unbounded
+                    bounds.is_unbounded()
                 },
-                |date| {
-                    since.is_none_or(|bound| bound <= date)
-                        && until.is_none_or(|bound| date < bound)
-                },
+                |date| bounds.admits(date),
             );
             if kept {
                 range.positions.push(position);
