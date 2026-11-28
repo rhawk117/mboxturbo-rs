@@ -58,19 +58,19 @@ impl ParquetExporter {
         }
     }
 
-    /// The same sink with row groups of 16 batches of `batch_size` rows each, so a row group
-    /// closes on a batch boundary.
-    #[must_use]
-    pub fn with_row_group_batches(self, batch_size: usize) -> Self {
-        self.with_row_group_rows(batch_size.saturating_mul(ROW_GROUP_BATCHES))
-    }
-
     /// The same sink with row groups of at most `rows` rows (at least one); the default is
     /// 131072.
     #[must_use]
     pub fn with_row_group_rows(mut self, rows: usize) -> Self {
         self.row_group_rows = rows.max(1);
         self
+    }
+
+    /// The same sink with row groups of 16 batches of `batch_size` rows each, so a row group
+    /// closes on a batch boundary.
+    #[must_use]
+    pub fn with_row_groups_for_batch_size(self, batch_size: usize) -> Self {
+        self.with_row_group_rows(batch_size.saturating_mul(ROW_GROUP_BATCHES))
     }
 }
 

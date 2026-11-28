@@ -649,7 +649,8 @@ mod export {
         let _summary = fixture
             .export(Destination::File(fixture.target()))
             .run(Box::new(
-                ParquetExporter::new(Compression::Uncompressed).with_row_group_batches(BATCH_SIZE),
+                ParquetExporter::new(Compression::Uncompressed)
+                    .with_row_groups_for_batch_size(BATCH_SIZE),
             ))
             .expect("the parquet export succeeds");
 

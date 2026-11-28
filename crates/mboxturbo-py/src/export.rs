@@ -257,7 +257,7 @@ impl Selection {
         cancel: Option<&CancelToken>,
     ) -> PyResult<u64> {
         let codec = parse_compression(compression)?;
-        let sink = ParquetExporter::new(codec).with_row_group_batches(self.batch_size);
+        let sink = ParquetExporter::new(codec).with_row_groups_for_batch_size(self.batch_size);
         let export = prepare(self, Destination::File(path), overwrite_policy(overwrite));
         run_export(py, export, Box::new(sink), progress, cancel).map(|summary| summary.messages)
     }
