@@ -84,96 +84,15 @@ fn write_json(buffer: &mut Vec<u8>, value: &Value) -> Result<(), ArrowError> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::sync::Arc;
 
-    use arrow_array::builder::{
-        ArrayBuilder, BooleanBuilder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder,
-    };
-    use arrow_array::{ArrayRef, RecordBatch};
-    use arrow_schema::{DataType, Field, Fields, Schema};
+    use arrow_array::RecordBatch;
+    use arrow_schema::{Field, Schema};
 
     use super::encode_batch;
+    use crate::encode::fixtures::sets_column;
     use crate::encode::{Binary, is_encodable};
-
-    /// One struct of the `sets` column.
-    struct Set {
-        count: Option<u32>,
-        flag: bool,
-        name: &'static str,
-        tags: &'static [&'static str],
-    }
-
-    /// Appends `set` to `item`.
-    fn append_set(item: &mut StructBuilder, set: &Set) {
-        let Set {
-            count,
-            flag,
-            name,
-            tags,
-        } = *set;
-        item.field_builder::<StringBuilder>(0)
-            .expect("field 0 is a string builder")
-            .append_value(name);
-        item.field_builder::<UInt32Builder>(1)
-            .expect("field 1 is an integer builder")
-            .append_option(count);
-        item.field_builder::<BooleanBuilder>(2)
-            .expect("field 2 is a boolean builder")
-            .append_value(flag);
-        let list = item
-            .field_builder::<ListBuilder<StringBuilder>>(3)
-            .expect("field 3 is a list builder");
-        for tag in tags {
-            list.values().append_value(tag);
-        }
-        list.append(true);
-        item.append(true);
-    }
-
-    /// An empty builder of the `sets` structs.
-    fn set_builder() -> StructBuilder {
-        let tags_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-        let fields = Fields::from(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("count", DataType::UInt32, true),
-            Field::new("flag", DataType::Boolean, false),
-            Field::new("tags", tags_type, true),
-        ]);
-        let builders: Vec<Box<dyn ArrayBuilder>> = vec![
-            Box::new(StringBuilder::new()),
-            Box::new(UInt32Builder::new()),
-            Box::new(BooleanBuilder::new()),
-            Box::new(ListBuilder::new(StringBuilder::new())),
-        ];
-        StructBuilder::new(fields, builders)
-    }
-
-    /// A `List<Struct>` array of one row holding two structs, the second with a null `count`
-    /// and an empty nested `tags` list.
-    pub(crate) fn sets_column() -> ArrayRef {
-        let mut sets = ListBuilder::new(set_builder());
-        append_set(
-            sets.values(),
-            &Set {
-                name: "spf",
-                count: Some(1),
-                flag: true,
-                tags: &["a", "b"],
-            },
-        );
-        append_set(
-            sets.values(),
-            &Set {
-                name: "dkim",
-                count: None,
-                flag: false,
-                tags: &[],
-            },
-        );
-        sets.append(true);
-        Arc::new(sets.finish())
-    }
 
     #[test]
     fn a_list_of_structs_is_an_array_of_objects_with_null_fields_and_nested_lists() {

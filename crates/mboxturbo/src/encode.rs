@@ -164,6 +164,13 @@ pub(crate) fn check_encodable(
         })
 }
 
+/// The index of `column` in `schema`, or `None` when the export did not extract it.
+pub(crate) fn optional_index(schema: &SchemaRef, column: &Column) -> Option<usize> {
+    schema
+        .column_with_name(&column.name())
+        .map(|(index, _field)| index)
+}
+
 /// The index of `column` in `schema`.
 ///
 /// # Errors
@@ -175,22 +182,11 @@ pub(crate) fn column_index(
     column: &Column,
     sink: &'static str,
 ) -> Result<usize, MboxTurboError> {
-    let name = column.name();
-    schema
-        .index_of(&name)
-        .map_err(|_missing| MboxTurboError::UnsupportedColumn {
-            column: name.into_owned(),
-            sink,
-            reason: "the export did not extract it",
-        })
-}
-
-/// The error for a null `raw` or `position` value at `row` of a batch.
-pub(crate) fn null_error(row: usize) -> MboxTurboError {
-    MboxTurboError::Arrow {
-        positions: row..row.saturating_add(1),
-        source: ArrowError::SchemaError("the `raw` and `position` columns must not be null".into()),
-    }
+    optional_index(schema, column).ok_or_else(|| MboxTurboError::UnsupportedColumn {
+        column: column.name().into_owned(),
+        sink,
+        reason: "the export did not extract it",
+    })
 }
 
 /// An encoder failure of `sink` writing to the destination `staged` stands for.
@@ -220,6 +216,96 @@ pub(crate) fn write_stream(staged: &mut Staged, bytes: &[u8]) -> Result<u64, Mbo
     let written = destination.write_all(bytes);
     written.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
     Ok(widen(bytes.len()))
+}
+
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::sync::Arc;
+
+    use arrow_array::ArrayRef;
+    use arrow_array::builder::{
+        ArrayBuilder, BooleanBuilder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder,
+    };
+    use arrow_schema::{DataType, Field, Fields};
+
+    /// One struct of the `sets` column.
+    struct Set {
+        count: Option<u32>,
+        flag: bool,
+        name: &'static str,
+        tags: &'static [&'static str],
+    }
+
+    /// Appends `set` to `item`.
+    fn append_set(item: &mut StructBuilder, set: &Set) {
+        let Set {
+            count,
+            flag,
+            name,
+            tags,
+        } = *set;
+        item.field_builder::<StringBuilder>(0)
+            .expect("field 0 is a string builder")
+            .append_value(name);
+        item.field_builder::<UInt32Builder>(1)
+            .expect("field 1 is an integer builder")
+            .append_option(count);
+        item.field_builder::<BooleanBuilder>(2)
+            .expect("field 2 is a boolean builder")
+            .append_value(flag);
+        let list = item
+            .field_builder::<ListBuilder<StringBuilder>>(3)
+            .expect("field 3 is a list builder");
+        for tag in tags {
+            list.values().append_value(tag);
+        }
+        list.append(true);
+        item.append(true);
+    }
+
+    /// An empty builder of the `sets` structs.
+    fn set_builder() -> StructBuilder {
+        let tags_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let fields = Fields::from(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("count", DataType::UInt32, true),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("tags", tags_type, true),
+        ]);
+        let builders: Vec<Box<dyn ArrayBuilder>> = vec![
+            Box::new(StringBuilder::new()),
+            Box::new(UInt32Builder::new()),
+            Box::new(BooleanBuilder::new()),
+            Box::new(ListBuilder::new(StringBuilder::new())),
+        ];
+        StructBuilder::new(fields, builders)
+    }
+
+    /// A `List<Struct>` array of one row holding two structs, the second with a null `count`
+    /// and an empty nested `tags` list.
+    pub(crate) fn sets_column() -> ArrayRef {
+        let mut sets = ListBuilder::new(set_builder());
+        append_set(
+            sets.values(),
+            &Set {
+                name: "spf",
+                count: Some(1),
+                flag: true,
+                tags: &["a", "b"],
+            },
+        );
+        append_set(
+            sets.values(),
+            &Set {
+                name: "dkim",
+                count: None,
+                flag: false,
+                tags: &[],
+            },
+        );
+        sets.append(true);
+        Arc::new(sets.finish())
+    }
 }
 
 #[cfg(test)]

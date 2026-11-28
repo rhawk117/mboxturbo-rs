@@ -126,8 +126,8 @@ fn push_field(buffer: &mut Vec<u8>, index: usize, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::{FormulaEscaping, cell_text};
+    use crate::encode::fixtures::sets_column;
     use crate::encode::{Binary, is_encodable};
-    use crate::jsonl_sink::tests::sets_column;
 
     #[test]
     fn a_list_of_structs_is_one_compact_json_cell() {

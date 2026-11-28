@@ -12,17 +12,17 @@ use arrow_array::types::{TimestampMicrosecondType, UInt64Type};
 use arrow_array::{
     Array as _, LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{ArrowError, SchemaRef};
 use mail_parser::DateTime;
 use memchr::memmem;
 use serde_json::{Value, json};
 
 use crate::columns::Column;
-use crate::encode::{column_index, null_error};
+use crate::encode::{column_index, optional_index};
 use crate::error::MboxTurboError;
 use crate::export::Exporter;
 use crate::staging::{DestinationKind, Output, Staged};
-use crate::width::widen;
+use crate::width::{narrow, widen};
 
 /// What error messages call this sink.
 const SINK: &str = "EML";
@@ -195,7 +195,7 @@ impl<'batch> Columns<'batch> {
     /// The position and the stored bytes of the message at `row`.
     fn message(&self, row: usize) -> Result<Message<'batch>, MboxTurboError> {
         if self.raws.is_null(row) || self.positions.is_null(row) {
-            return Err(null_error(row));
+            return Err(self.null_error(row));
         }
         Ok((self.positions.value(row), self.raws.value(row)))
     }
@@ -219,13 +219,22 @@ impl<'batch> Columns<'batch> {
                 .as_binary::<i64>(),
         })
     }
-}
 
-/// The index of `column` in `schema`, or `None` when the export did not extract it.
-fn optional_index(schema: &SchemaRef, column: &Column) -> Option<usize> {
-    schema
-        .column_with_name(&column.name())
-        .map(|(index, _field)| index)
+    /// The error for a null `raw` or `position` value at `row`, naming the message's mailbox
+    /// position, or the batch row when the position itself is null.
+    fn null_error(&self, row: usize) -> MboxTurboError {
+        let start = if self.positions.is_null(row) {
+            row
+        } else {
+            narrow(self.positions.value(row)).unwrap_or(row)
+        };
+        MboxTurboError::Arrow {
+            positions: start..start.saturating_add(1),
+            source: ArrowError::SchemaError(
+                "the `raw` and `position` values of a message must not be null".into(),
+            ),
+        }
+    }
 }
 
 /// `micros` since the epoch as an RFC 3339 UTC string, to the second.
@@ -303,4 +312,51 @@ fn write_files(files: &[EmlFile<'_>]) -> Result<u64, MboxTurboError> {
         }
         total
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, LargeBinaryArray, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::Columns;
+    use crate::error::MboxTurboError;
+
+    /// A batch of two messages at mailbox positions 5 and 7, the second with `second_raw`.
+    fn batch(second_raw: Option<&[u8]>, second_position: Option<u64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position", DataType::UInt64, true),
+            Field::new("raw", DataType::LargeBinary, true),
+        ]));
+        let positions: ArrayRef = Arc::new(UInt64Array::from(vec![Some(5), second_position]));
+        let raws: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(&b"From a\n\nbody\n"[..]),
+            second_raw,
+        ]));
+        RecordBatch::try_new(schema, vec![positions, raws]).expect("the batch is valid")
+    }
+
+    #[test]
+    fn a_null_raw_value_names_the_mailbox_position_not_the_batch_row() {
+        let batch = batch(None, Some(7));
+        let columns = Columns::new(&batch).expect("both columns are present");
+        let error = columns.message(1).expect_err("the raw value is null");
+        assert!(
+            matches!(&error, MboxTurboError::Arrow { positions, .. } if *positions == (7..8)),
+            "the position 7, not the row 1, is named: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_null_position_falls_back_to_the_batch_row() {
+        let batch = batch(Some(b"From b\n\nbody\n"), None);
+        let columns = Columns::new(&batch).expect("both columns are present");
+        let error = columns.message(1).expect_err("the position is null");
+        assert!(
+            matches!(&error, MboxTurboError::Arrow { positions, .. } if *positions == (1..2)),
+            "the row is named when the position is unknown: {error:?}"
+        );
+    }
 }
