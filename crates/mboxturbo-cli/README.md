@@ -122,7 +122,7 @@ mboxturbo info [OPTIONS] <MAILBOX>
 
 <!-- Source: ./target/debug/mboxturbo info --help -->
 
-Prints the message count, the earliest and latest dates, and the number of undated messages. It reads the index, so it does not parse the messages. `earliest` and `latest` are left out when no message has a date. Flags: `--index <PATH>`, plus the global flags.
+Prints the message count, the earliest and latest dates, and the number of undated messages. It reads the index, so it does not parse the messages. `earliest` and `latest` are left out when no message has a date. When standard output is a terminal, ESC, DEL and every other control byte below 0x20 except tab, line feed and carriage return are written as visible `\xNN` escapes, so a hostile message cannot drive the terminal. When standard output is a pipe or a file, the bytes are written unchanged. `--raw` writes the exact stored bytes whatever standard output is. Flags: `--index <PATH>`, `--raw`, plus the global flags.
 
 ```console
 $ mboxturbo info mail.mbox
@@ -152,7 +152,7 @@ mboxturbo show [OPTIONS] <MAILBOX> <POSITION>
 
 <!-- Source: ./target/debug/mboxturbo show --help -->
 
-Writes one message's stored bytes to standard output, `From ` separator line included. `<POSITION>` is 0-based. A position at or past the message count exits 64. Flags: `--index <PATH>`, plus the global flags. `--json` cannot be combined with `show`, because standard output carries the message. It exits 64 with one `error` event and no message bytes.
+Writes one message's stored bytes to standard output, `From ` separator line included. `<POSITION>` is 0-based. A position at or past the message count exits 64. When standard output is a terminal, ESC, DEL and every other control byte below 0x20 except tab, line feed and carriage return are written as visible `\xNN` escapes, so a hostile message cannot drive the terminal. When standard output is a pipe or a file, the bytes are written unchanged. `--raw` writes the exact stored bytes whatever standard output is. Flags: `--index <PATH>`, `--raw`, plus the global flags. `--json` cannot be combined with `show`, because standard output carries the message. It exits 64 with one `error` event and no message bytes.
 
 ```console
 $ mboxturbo show mail.mbox 1
