@@ -8,8 +8,8 @@ mod filter {
 
     use arrow_array::cast::AsArray as _;
     use mboxturbo::{
-        Column, Filter, Mailbox, MboxTurboError, Pipeline, Predicate, PredicateFault, Selection,
-        TrustSet, VerdictMethod,
+        CancelToken, Column, Filter, Mailbox, MboxTurboError, Narrowing, Pipeline, Predicate,
+        PredicateFault, Selection, TrustSet, VerdictMethod,
     };
     use proptest::prelude::*;
     use tempfile::TempDir;
@@ -157,23 +157,31 @@ body\n";
             .clone()
     }
 
-    fn positions(fixture: &Fixture, predicate: &Predicate) -> Vec<u64> {
-        Filter::new(predicate)
-            .expect("the predicate is valid")
-            .positions(&fixture.mailbox)
-            .expect("the filter pass reads the mailbox")
+    fn positions(fixture: &Fixture, predicate: &Predicate) -> Vec<usize> {
+        let filter = Filter::new(predicate).expect("the predicate is valid");
+        selected(&fixture.mailbox, &filter)
     }
 
-    fn verdict_positions(predicate: &Predicate, trust: Option<TrustSet>) -> Vec<u64> {
+    fn selected(mailbox: &Mailbox, filter: &Filter) -> Vec<usize> {
+        let narrowed = Narrowing::new()
+            .filter(filter)
+            .select(mailbox, None)
+            .expect("the filter pass reads the mailbox");
+        match narrowed.selection {
+            Selection::Positions(found) => found,
+            Selection::All => (0..mailbox.len()).collect(),
+            other @ (Selection::Ranges(_) | _) => panic!("narrowing yielded {other:?}"),
+        }
+    }
+
+    fn verdict_positions(predicate: &Predicate, trust: Option<TrustSet>) -> Vec<usize> {
         let fixture = Fixture::with(VERDICTS);
         let plain = Filter::new(predicate).expect("the predicate is valid");
         let filter = match trust {
             Some(set) => plain.with_trust(set),
             None => plain,
         };
-        filter
-            .positions(&fixture.mailbox)
-            .expect("the filter pass reads the mailbox")
+        selected(&fixture.mailbox, &filter)
     }
 
     #[test]
@@ -201,12 +209,12 @@ body\n";
         );
         assert_eq!(
             positions(&fixture, &equals("X-Spam-Flag", "yes")),
-            Vec::<u64>::new(),
+            Vec::<usize>::new(),
             "letter case in the value matters"
         );
         assert_eq!(
             positions(&fixture, &equals("Subject", "Invoice 2024")),
-            Vec::<u64>::new(),
+            Vec::<usize>::new(),
             "equality is whole-value"
         );
     }
@@ -226,7 +234,7 @@ body\n";
         );
         assert_eq!(
             positions(&fixture, &starts_with("subject", "voice")),
-            Vec::<u64>::new(),
+            Vec::<usize>::new(),
             "a prefix is not a substring"
         );
     }
@@ -294,7 +302,7 @@ body\n";
                 &verdict(VerdictMethod::Dmarc, "pass"),
                 Some(trust_mx_relay())
             ),
-            Vec::<u64>::new(),
+            Vec::<usize>::new(),
             "the forged dmarc=pass above the trusted dmarc=fail does not match"
         );
         assert_eq!(
@@ -323,7 +331,7 @@ body\n";
             for word in ["pass", "fail", "softfail"] {
                 assert_eq!(
                     verdict_positions(&verdict(method, word), None),
-                    Vec::<u64>::new(),
+                    Vec::<usize>::new(),
                     "{method:?}={word} matches nothing without trust"
                 );
             }
@@ -335,7 +343,7 @@ body\n";
         let predicate = verdict(VerdictMethod::Dmarc, "pass");
         assert_eq!(
             verdict_positions(&predicate, Some(trust_mx_relay())),
-            Vec::<u64>::new(),
+            Vec::<usize>::new(),
             "an id-less header is untrusted by default"
         );
         let idless = trust_mx_relay().trust_idless_inside(true).clone();
@@ -350,13 +358,9 @@ body\n";
     fn filtered_positions_select_exactly_those_messages() {
         let fixture = Fixture::with(MESSAGES);
         let found = positions(&fixture, &exists("x-spam-flag"));
-        let listed = found
-            .iter()
-            .map(|&position| usize::try_from(position).expect("a position fits usize"))
-            .collect();
         let pipeline = Arc::new(Pipeline::new(vec![Column::Subject], 2));
         let subjects: Vec<String> = pipeline
-            .select(&fixture.mailbox, Selection::Positions(listed))
+            .select(&fixture.mailbox, Selection::Positions(found))
             .expect("every filtered position is in range")
             .flat_map(|result| {
                 let assembled = result.expect("the batch is assembled");
@@ -380,9 +384,7 @@ body\n";
         let fixture = Fixture::with(VERDICTS);
         let filter = Filter::new(&contains("subject", "forged")).expect("the predicate is valid");
         assert_eq!(
-            filter
-                .positions(&fixture.mailbox)
-                .expect("the filter pass reads the mailbox"),
+            selected(&fixture.mailbox, &filter),
             [0],
             "the forged message is found by its subject"
         );
@@ -399,13 +401,71 @@ body\n";
         let filter = Filter::new(&verdict(VerdictMethod::Dmarc, "pass"))
             .expect("the predicate is valid")
             .with_trust(trust_mx_relay());
-        let _found = filter
-            .positions(&fixture.mailbox)
-            .expect("the filter pass reads the mailbox");
+        let _found = selected(&fixture.mailbox, &filter);
         assert_eq!(
             filter.headers_collected(),
             6,
             "two of each of those headers across the three messages, no Subject"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_the_scan_and_collects_no_headers() {
+        let fixture = Fixture::with(VERDICTS);
+        let filter = Filter::new(&contains("subject", "forged")).expect("the predicate is valid");
+        let token = CancelToken::new();
+        token.cancel();
+        let error = Narrowing::new()
+            .filter(&filter)
+            .select(&fixture.mailbox, Some(&token))
+            .expect_err("the token is cancelled before the scan");
+        assert!(
+            matches!(
+                error,
+                MboxTurboError::Cancelled {
+                    target: None,
+                    written: 0
+                }
+            ),
+            "cancellation names no target and nothing written"
+        );
+        assert_eq!(filter.headers_collected(), 0, "no message was read");
+    }
+
+    #[test]
+    fn candidate_positions_limit_the_headers_collected() {
+        let fixture = Fixture::with(VERDICTS);
+        let filter = Filter::new(&contains("subject", "forged")).expect("the predicate is valid");
+        let narrowed = Narrowing::new()
+            .positions(vec![0])
+            .filter(&filter)
+            .select(&fixture.mailbox, None)
+            .expect("position 0 is in range");
+        assert_eq!(narrowed.count, 1, "message 0 matches");
+        assert_eq!(
+            filter.headers_collected(),
+            1,
+            "one Subject from the one candidate"
+        );
+    }
+
+    #[test]
+    fn out_of_range_positions_are_refused_before_the_date_step() {
+        let fixture = Fixture::with(VERDICTS);
+        let error = Narrowing::new()
+            .positions(vec![1, 3, 9])
+            .dates(Some(0), None)
+            .select(&fixture.mailbox, None)
+            .expect_err("position 3 is past a mailbox of 3");
+        assert!(
+            matches!(
+                error,
+                MboxTurboError::PositionOutOfRange {
+                    position: 3,
+                    len: 3
+                }
+            ),
+            "the first out-of-range position in the order given is named"
         );
     }
 

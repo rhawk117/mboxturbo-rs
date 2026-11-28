@@ -62,7 +62,7 @@
     },
     {
       "title": "summary",
-      "description": "The export finished; the last line of a successful run. excluded_undated is present only when --since or --until was given: the number of messages with no index date, which the bounds exclude.",
+      "description": "The export finished; the last line of a successful run. excluded_undated is present only when --since or --until was given: the undated messages the bounds excluded from the --select positions, or from the whole mailbox without --select.",
       "type": "object",
       "required": ["v", "event", "messages", "bytes", "path", "elapsed_ms"],
       "additionalProperties": false,

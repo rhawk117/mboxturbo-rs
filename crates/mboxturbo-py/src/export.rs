@@ -18,7 +18,7 @@ use std::time::Duration;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use mboxturbo::{
     Column, Compression, Destination, DestinationKind, Export, ExportSummary, Exporter, Filter,
-    MboxTurboError, Overwrite, ParquetExporter, Pipeline, Progress,
+    MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline, Progress,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -77,17 +77,6 @@ pub(crate) struct Filters {
     until: Option<i64>,
 }
 
-/// The rows the filters keep, and the undated messages the date range dropped.
-#[derive(Debug)]
-struct Rows {
-    /// The undated messages the date range dropped.
-    excluded_undated: usize,
-    /// How many rows `selection` visits.
-    messages: usize,
-    /// The rows to visit.
-    selection: mboxturbo::Selection,
-}
-
 /// Chosen columns over a mailbox. Any Arrow consumer reads it directly (``pyarrow.table``,
 /// ``polars.DataFrame``, ``DuckDB``), and ``to_parquet`` writes it to a file. Each read extracts
 /// afresh, in parallel, parsing only what the columns need.
@@ -96,7 +85,7 @@ struct Rows {
 pub(crate) struct Selection {
     /// Rows per batch; a Parquet row group holds sixteen batches.
     batch_size: usize,
-    /// The undated messages the date range dropped.
+    /// The undated messages the bounds excluded from the candidates.
     excluded_undated: usize,
     /// The mapping the columns are extracted from.
     mailbox: Arc<mboxturbo::Mailbox>,
@@ -111,6 +100,20 @@ pub(crate) struct Selection {
 }
 
 impl Filters {
+    /// The filter for the predicate given, decided with this trust set; `None` without one.
+    fn built_filter(&self) -> Result<Option<Filter>, Box<MboxTurboError>> {
+        let Some(predicate) = &self.predicate else {
+            return Ok(None);
+        };
+        let filter = Filter::new(predicate)?;
+        Ok(Some(
+            self.trust
+                .clone()
+                .into_iter()
+                .fold(filter, Filter::with_trust),
+        ))
+    }
+
     /// Converts the Python arguments: `TypeError` for a naive `since` or `until`.
     pub(crate) fn from_python(
         py: Python<'_>,
@@ -133,60 +136,21 @@ impl Filters {
         })
     }
 
-    /// The positions whose messages satisfy `predicate`, decided with this trust set.
-    fn matching(
-        &self,
-        predicate: &mboxturbo::Predicate,
-        mailbox: &Arc<mboxturbo::Mailbox>,
-    ) -> Result<Vec<usize>, Box<MboxTurboError>> {
-        let filter = self
-            .trust
-            .clone()
-            .into_iter()
-            .fold(Filter::new(predicate)?, Filter::with_trust);
-        filter
-            .positions(mailbox)?
-            .into_iter()
-            .map(|position| {
-                usize::try_from(position).map_err(|_overflow| {
-                    Box::new(MboxTurboError::PositionOutOfRange {
-                        position: usize::MAX,
-                        len: mailbox.len(),
-                    })
-                })
-            })
-            .collect()
-    }
-
     /// The rows kept by every filter given, ascending and without repeats, or every row when
     /// none is given.
-    fn rows(&self, mailbox: &Arc<mboxturbo::Mailbox>) -> Result<Rows, Box<MboxTurboError>> {
-        let mut kept = self
-            .positions
-            .as_deref()
-            .map(|positions| checked_positions(positions, mailbox.len()))
-            .transpose()?;
-        let mut excluded_undated = 0;
-        if self.since.is_some() || self.until.is_some() {
-            let range = mailbox.date_range(self.since, self.until);
-            excluded_undated = range.undated;
-            kept = Some(narrow(kept, range.positions));
+    fn pick(
+        &self,
+        mailbox: &mboxturbo::Mailbox,
+        filter: Option<&Filter>,
+    ) -> Result<Narrowed, Box<MboxTurboError>> {
+        let mut narrowing = Narrowing::new().dates(self.since, self.until);
+        if let Some(positions) = &self.positions {
+            narrowing = narrowing.positions(positions.clone());
         }
-        if let Some(predicate) = &self.predicate {
-            kept = Some(narrow(kept, self.matching(predicate, mailbox)?));
+        if let Some(found) = filter {
+            narrowing = narrowing.filter(found);
         }
-        let (selection, messages) = kept.map_or_else(
-            || (mboxturbo::Selection::All, mailbox.len()),
-            |positions| {
-                let messages = positions.len();
-                (mboxturbo::Selection::Positions(positions), messages)
-            },
-        );
-        Ok(Rows {
-            excluded_undated,
-            messages,
-            selection,
-        })
+        Ok(narrowing.select(mailbox, None)?)
     }
 }
 
@@ -223,7 +187,8 @@ impl Selection {
         self.names.clone()
     }
 
-    /// The undated messages the date range dropped; 0 without ``since`` or ``until``.
+    /// The undated messages the bounds excluded from the ``positions`` given, or from the whole
+    /// mailbox without ``positions``; 0 without ``since`` or ``until``.
     #[getter]
     const fn excluded_undated(&self) -> usize {
         self.excluded_undated
@@ -444,8 +409,11 @@ pub(crate) fn select_columns(
         .iter()
         .map(|column| column.name().into_owned())
         .collect();
+    let filter = filters
+        .built_filter()
+        .map_err(|error| into_py_err(py, *error))?;
     let rows = py
-        .detach(|| filters.rows(&mailbox))
+        .detach(|| filters.pick(&mailbox, filter.as_ref()))
         .map_err(|error| into_py_err(py, *error))?;
     let extraction = filters
         .trust
@@ -454,38 +422,13 @@ pub(crate) fn select_columns(
         .fold(Pipeline::new(columns, batch_size), Pipeline::with_trust);
     Ok(Selection {
         batch_size,
-        excluded_undated: rows.excluded_undated,
+        excluded_undated: rows.excluded_undated.unwrap_or(0),
         mailbox,
-        messages: rows.messages,
+        messages: rows.count,
         names,
         pipeline: Arc::new(extraction),
         rows: rows.selection,
     })
-}
-
-/// `positions` sorted without repeats, or the core's out-of-range error for the first position
-/// at or past `len`.
-fn checked_positions(positions: &[usize], len: usize) -> Result<Vec<usize>, Box<MboxTurboError>> {
-    if let Some(&position) = positions.iter().find(|&&position| position >= len) {
-        return Err(Box::new(MboxTurboError::PositionOutOfRange {
-            position,
-            len,
-        }));
-    }
-    let mut sorted = positions.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    Ok(sorted)
-}
-
-/// The ascending positions that both `kept` and `next` hold; `next` alone when nothing was
-/// kept yet.
-fn narrow(kept: Option<Vec<usize>>, next: Vec<usize>) -> Vec<usize> {
-    let Some(mut positions) = kept else {
-        return next;
-    };
-    positions.retain(|position| next.binary_search(position).is_ok());
-    positions
 }
 
 /// The columns `names` name, or `ValueError` listing the known names for the first unknown one.

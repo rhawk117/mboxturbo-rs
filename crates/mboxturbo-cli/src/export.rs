@@ -11,8 +11,8 @@ use clap::{Args, ValueEnum};
 use mboxturbo::{
     CancelToken, Column, Compression, CsvExporter, Destination, EmlExporter, Export, ExportSummary,
     Exporter, Filter, FormulaEscaping, IndexOrigin, IndexPolicy, IpcExporter, JsonlExporter,
-    Mailbox, MailboxBuilder, MboxExporter, MboxTurboError, Overwrite, ParquetExporter, Pipeline,
-    Predicate, Progress, Selection,
+    Mailbox, MailboxBuilder, MboxExporter, MboxTurboError, Narrowed, Narrowing, Overwrite,
+    ParquetExporter, Pipeline, Predicate, Progress,
 };
 
 use crate::dates::{Bounds, DateError};
@@ -208,24 +208,14 @@ impl Format {
     }
 }
 
-/// What narrows an export beyond the whole mailbox, parsed before the mailbox is opened.
-struct Narrowing {
+/// What limits an export beyond the whole mailbox, parsed before the mailbox is opened.
+struct Restrictions {
     /// The `--since` and `--until` bounds.
     bounds: Bounds,
     /// The `--where` or `--where-file` filter.
     filter: Option<Filter>,
     /// The `--select` ranges.
     ranges: Vec<Range<usize>>,
-}
-
-/// The messages an export writes and how many there are.
-struct Selected {
-    /// How many messages `selection` holds.
-    count: usize,
-    /// What the library is asked to write.
-    selection: Selection,
-    /// How many undated messages the date bounds excluded; `None` when no bound was given.
-    undated: Option<usize>,
 }
 
 /// What one export reports besides the library's own progress and summary, and how.
@@ -332,12 +322,12 @@ pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Resu
     let bounds = Bounds::parse(args.limits.since.as_deref(), args.limits.until.as_deref())?;
     let filter = filter(args)?;
     let mailbox = Arc::new(open(&args.mailbox, args.index.as_deref())?);
-    let narrowing = Narrowing {
+    let restrictions = Restrictions {
         bounds,
         filter,
         ranges,
     };
-    let selected = selection(args, narrowing, &mailbox)?;
+    let selected = kept(args, restrictions, &mailbox)?;
     let pipeline = Arc::new(Pipeline::new(columns, BATCH_SIZE));
     let exporter = args.format.exporter(mailbox.len());
     let origin = mailbox.index_origin();
@@ -350,7 +340,7 @@ pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Resu
         feedback,
         origin,
         report,
-        undated: selected.undated,
+        undated: selected.excluded_undated,
     };
     progress::note_origin(feedback, origin).map_err(stderr_failure)?;
     run_export(export, exporter, &reported)
@@ -583,60 +573,29 @@ fn is_missing(error: &MboxTurboError, mailbox: &Path) -> bool {
 }
 
 /// The messages to export: those `args` select by position, or every message, that also fall
-/// inside the bounds and satisfy the filter of `narrowing`.
+/// inside the bounds and satisfy the filter of `restrictions`.
 ///
 /// Positions come out ascending and without repeats whatever order `--select` lists them in, so
 /// the export keeps mailbox order.
-fn selection(
+fn kept(
     args: &ExportArgs,
-    narrowing: Narrowing,
-    mailbox: &Arc<Mailbox>,
-) -> Result<Selected, Failure> {
-    let mut kept = chosen_positions(args, narrowing.ranges, mailbox)?;
-    let mut undated = None;
-    if !narrowing.bounds.is_open() {
-        let dated = mailbox.date_range(narrowing.bounds.since, narrowing.bounds.until);
-        undated = Some(dated.undated);
-        kept = Some(narrow(kept, dated.positions));
+    restrictions: Restrictions,
+    mailbox: &Mailbox,
+) -> Result<Narrowed, Failure> {
+    let bounds = restrictions.bounds;
+    let mut narrowing = Narrowing::new();
+    if !bounds.is_open() {
+        narrowing = narrowing.dates(bounds.since, bounds.until);
     }
-    if let Some(found) = narrowing.filter {
-        let matching = found
-            .positions(mailbox)
-            .map_err(|error| Failure::after_open(Box::new(error)))?;
-        kept = Some(narrow_to(kept, &matching, mailbox.len()));
+    if let Some(positions) = chosen_positions(args, restrictions.ranges, mailbox)? {
+        narrowing = narrowing.positions(positions);
     }
-    Ok(kept.map_or_else(
-        || Selected {
-            count: mailbox.len(),
-            selection: Selection::All,
-            undated,
-        },
-        |positions| Selected {
-            count: positions.len(),
-            selection: Selection::Positions(positions),
-            undated,
-        },
-    ))
-}
-
-/// `positions` limited to those in `kept`; `positions` itself when `kept` is `None`.
-fn narrow(kept: Option<Vec<usize>>, mut positions: Vec<usize>) -> Vec<usize> {
-    if let Some(picked) = kept {
-        positions.retain(|position| picked.binary_search(position).is_ok());
+    if let Some(filter) = &restrictions.filter {
+        narrowing = narrowing.filter(filter);
     }
-    positions
-}
-
-/// The ascending `matching` positions limited to those in `kept`; every message position that
-/// matches when `kept` is `None`.
-fn narrow_to(kept: Option<Vec<usize>>, matching: &[u64], len: usize) -> Vec<usize> {
-    let wide = |position: &usize| {
-        u64::try_from(*position).is_ok_and(|value| matching.binary_search(&value).is_ok())
-    };
-    kept.unwrap_or_else(|| (0..len).collect())
-        .into_iter()
-        .filter(wide)
-        .collect()
+    narrowing
+        .select(mailbox, None)
+        .map_err(|error| Failure::after_open(Box::new(error)))
 }
 
 /// The filter that `--where` or `--where-file` asks for; `None` when the command line has

@@ -173,19 +173,38 @@ impl Mailbox {
     /// never the message bytes.
     #[must_use]
     pub fn date_range(&self, since: Option<i64>, until: Option<i64>) -> DateRange {
+        self.dates_among(0..self.len(), since, until)
+    }
+
+    /// [`Mailbox::date_range`] over `candidates`, which must all be below the mailbox length:
+    /// the candidates inside the bounds, in the order given, and how many of them are undated.
+    pub(crate) fn dates_among(
+        &self,
+        candidates: impl IntoIterator<Item = usize>,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> DateRange {
         let unbounded = since.is_none() && until.is_none();
-        let positions = (0..self.len())
-            .filter(|&position| {
-                self.date(position).map_or(unbounded, |date| {
+        let mut range = DateRange {
+            positions: Vec::new(),
+            undated: 0,
+        };
+        for position in candidates {
+            let kept = self.date(position).map_or_else(
+                || {
+                    range.undated = range.undated.saturating_add(1);
+                    unbounded
+                },
+                |date| {
                     since.is_none_or(|bound| bound <= date)
                         && until.is_none_or(|bound| date < bound)
-                })
-            })
-            .collect();
-        let undated = (0..self.len())
-            .filter(|&position| self.date(position).is_none())
-            .count();
-        DateRange { positions, undated }
+                },
+            );
+            if kept {
+                range.positions.push(position);
+            }
+        }
+        range
     }
 
     /// The message index.

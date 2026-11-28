@@ -194,7 +194,7 @@ exported 2 messages, 63 bytes to - in 0.0s
 
 The bounds read the date in the index, so they do not parse the messages. A message with no `Date:` header, or one that does not parse, has no date and is excluded whenever a bound is given. The bounds intersect with `--select` and `--where`.
 
-The summary line on standard error ends with the count of excluded undated messages, and the `summary` event carries it as `excluded_undated`. Neither appears when no bound is given.
+The summary line on standard error ends with the count of excluded undated messages, and the `summary` event carries it as `excluded_undated`. The count is the undated messages the bounds excluded from the `--select` positions, or from the whole mailbox without `--select`. Neither appears when no bound is given.
 
 ```console
 $ mboxturbo export mail.mbox --format jsonl --since 2024-01-01 --columns position -o -

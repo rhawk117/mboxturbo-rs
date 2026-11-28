@@ -51,7 +51,7 @@ pub use csv_sink::{CsvExporter, FormulaEscaping};
 pub use eml_sink::EmlExporter;
 pub use error::{Corruption, MboxTurboError, PredicateFault};
 pub use export::{CancelToken, Export, Exporter, Progress};
-pub use filter::Filter;
+pub use filter::{Filter, Narrowed, Narrowing};
 pub use fingerprint::Fingerprint;
 pub use index::{BlockSize, Index, IndexBytes};
 pub use ipc_sink::IpcExporter;

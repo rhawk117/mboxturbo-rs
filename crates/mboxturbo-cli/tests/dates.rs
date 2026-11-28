@@ -215,6 +215,18 @@ mod dates {
     }
 
     #[test]
+    fn the_summary_event_counts_only_the_undated_messages_among_the_selected_positions() {
+        let fixture = Fixture::new();
+        let event =
+            summary(&fixture.export(&["--select", "0..4", "--since", "2024-01-01", "--json"]));
+        assert_eq!(
+            event["excluded_undated"].as_u64(),
+            Some(1),
+            "only position 3 is undated inside 0..4: {event}"
+        );
+    }
+
+    #[test]
     fn the_summary_event_has_no_count_without_a_bound() {
         let fixture = Fixture::new();
         let event = summary(&fixture.export(&["--json"]));

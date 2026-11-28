@@ -97,7 +97,8 @@ pub(crate) struct Summary<'run> {
     pub bytes: u64,
     /// Wall-clock time the export took.
     pub elapsed: Duration,
-    /// Undated messages the date bounds excluded; `None` when no bound was given.
+    /// The undated messages the bounds excluded from the `--select` positions, or from the whole
+    /// mailbox without `--select`; `None` when no bound was given.
     pub excluded_undated: Option<usize>,
     /// Messages written.
     pub messages: u64,
