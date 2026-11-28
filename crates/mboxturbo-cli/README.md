@@ -412,4 +412,4 @@ A second signal exits at once with that signal's code. It does not wait for the 
 
 On Windows, Ctrl-C and Ctrl-Break both exit 130. SIGTERM is not delivered from console events.
 
-<!-- Source: crates/mboxturbo-cli/tests/signals.rs (sigint_cancels_an_export_and_exits_130, sigterm_cancels_an_export_and_exits_143, sighup_cancels_an_export_and_exits_129, a_text_run_prints_one_interrupted_line_and_leaves_nothing, a_second_signal_ends_a_stuck_export_at_once) and crates/mboxturbo-cli/src/signals.rs. -->
+<!-- Source: crates/mboxturbo-cli/tests/signals.rs (sigint_cancels_an_export_and_exits_130, sigterm_cancels_an_export_and_exits_143, sighup_cancels_an_export_and_exits_129, a_text_run_prints_one_interrupted_line_and_leaves_nothing, a_second_signal_ends_a_stuck_export_at_once), crates/mboxturbo-cli/tests/console_signals.rs (ctrl_break_cancels_an_export_and_exits_130, Windows only) and crates/mboxturbo-cli/src/signals.rs. -->

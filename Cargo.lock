@@ -767,6 +767,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

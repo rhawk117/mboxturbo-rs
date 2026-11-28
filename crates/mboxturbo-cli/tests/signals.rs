@@ -18,8 +18,9 @@ mod signals {
     const LONG_MAILBOX: usize = 200_000;
     /// Enough csv text that standard output fills the pipe buffer when nobody reads it.
     const WIDE_MAILBOX: usize = 20_000;
-    /// Long enough for the CLI's signal watcher, which polls every 20 ms, to cancel the run.
-    const SETTLE: Duration = Duration::from_millis(250);
+    /// Every position of the mailbox, so the date step outlasts the signal watcher's 20 ms poll
+    /// and a cancel that arrives during it is still found.
+    const SELECT_ALL: &str = "0..199999\n";
     /// How long the tests wait for something that should happen at once.
     const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -86,7 +87,6 @@ mod signals {
                 .open(&self.fifo)
                 .expect("the FIFO is opened once the CLI reads it");
             send(&self.child, signal);
-            thread::sleep(SETTLE);
             writer
                 .write_all(contents.as_bytes())
                 .expect("the FIFO takes the text");
@@ -94,12 +94,7 @@ mod signals {
 
         /// Starts the export; it blocks reading the FIFO.
         fn start(fixture: &Fixture, flag: &str, extra: &[&str]) -> Self {
-            let fifo = fixture.dir.path().join("fifo");
-            let made = Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .expect("the mkfifo command runs so the test can control when the CLI reads");
-            assert!(made.success(), "the FIFO is created");
+            let fifo = make_fifo(fixture);
             let target = fixture.target();
             let target_text = target.to_str().expect("the fixture path is UTF-8");
             let fifo_text = fifo.to_str().expect("the fixture path is UTF-8");
@@ -121,6 +116,17 @@ mod signals {
                 fifo,
             }
         }
+    }
+
+    /// Creates the FIFO the CLI reads, so the test controls when its input arrives.
+    fn make_fifo(fixture: &Fixture) -> PathBuf {
+        let fifo = fixture.dir.path().join("fifo");
+        let made = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("the mkfifo command runs so the test can control when the CLI reads");
+        assert!(made.success(), "the FIFO is created");
+        fifo
     }
 
     /// Sends `signal` (a `kill -s` name) to `child`.
@@ -402,7 +408,58 @@ mod signals {
             "--select-file",
             &["--since", "2024-01-01"],
             "INT",
-            "0..10\n",
+            SELECT_ALL,
+        );
+    }
+
+    /// Interrupts a text run that writes `format` to `output` while it scans a `--since`
+    /// selection, and returns what it printed on standard error.
+    fn interrupted_scan_message(fixture: &Fixture, output: &str, format: &str) -> String {
+        let fifo = make_fifo(fixture);
+        let fifo_text = fifo.to_str().expect("the fixture path is UTF-8");
+        let mut child = fixture.spawn(&[
+            "--select-file",
+            fifo_text,
+            "--since",
+            "2024-01-01",
+            "-o",
+            output,
+            "--format",
+            format,
+        ]);
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .expect("the FIFO is opened once the CLI reads it");
+        send(&child, "INT");
+        writer
+            .write_all(SELECT_ALL.as_bytes())
+            .expect("the FIFO takes the selection");
+        drop(writer);
+        let stderr = read_stderr(&mut child);
+        assert_eq!(exit_code(&mut child), 130_i32, "SIGINT exits 130");
+        stderr
+    }
+
+    #[test]
+    fn a_scan_interruption_names_the_output_file() {
+        let fixture = Fixture::new(LONG_MAILBOX);
+        let target = fixture.target();
+        let target_text = target.to_str().expect("the fixture path is UTF-8");
+        let stderr = interrupted_scan_message(&fixture, target_text, "parquet");
+        assert!(
+            stderr.contains(&format!("export to {target_text} cancelled after")),
+            "the message names the -o target, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_scan_interruption_names_a_stream_for_dash() {
+        let fixture = Fixture::new(LONG_MAILBOX);
+        let stderr = interrupted_scan_message(&fixture, "-", "csv");
+        assert!(
+            stderr.contains("export to a stream cancelled after"),
+            "the message names a stream for -o -, got: {stderr}"
         );
     }
 }

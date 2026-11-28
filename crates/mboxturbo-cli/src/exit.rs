@@ -24,7 +24,8 @@ const INTERRUPTED: u8 = 130;
 pub(crate) enum Stage {
     /// The mailbox itself is missing: the only stage whose `NotFound` is exit 66.
     OpeningMailbox,
-    /// Everything except opening the mailbox, such as parsing arguments or writing the export.
+    /// Everything except a missing mailbox: parsing arguments, any other failure to open the
+    /// mailbox, and writing the export.
     Other,
 }
 
