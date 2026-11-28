@@ -252,7 +252,7 @@ jobs:
 
   workflow-narrator:
     name: 🔉 Workflow Narrator
-    needs: [labeler, rust-checks, python-checks, cli-install, cli-tests]
+    needs: [labeler, prek, rust-checks, python-checks, cli-install, cli-tests]
     if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
