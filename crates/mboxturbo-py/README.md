@@ -10,7 +10,7 @@ from mboxturbo import Mailbox
 with Mailbox('inbox.mbox') as mailbox:
     print(len(mailbox), mailbox[-1].subject)
     for message in mailbox:
-        hops = message.get_all('Received')
+        print(message.get_all('Received'))
 ```
 
 Without `index=`, opening a mailbox saves its index beside it as `<mailbox path>.mbxidx` and reuses it while it matches. The command-line exporter, installed with `pip install "mboxturbo[cli]"`, uses the same sidecar.

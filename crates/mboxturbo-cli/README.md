@@ -37,9 +37,9 @@ subprocess.run([binary, "info", "mail.mbox"], check=True)
 
 ## Index sidecar
 
-`export`, `info` and `show` each create an index file named `<mailbox>.mbxidx` beside the mailbox (`mail.mbox` gets `mail.mbox.mbxidx`), even a read-only command such as `info`, unless `--index <PATH>` places it elsewhere. An existing sidecar is reused while it matches the mailbox. It is trusted only when it is a regular file owned by the mailbox's owner; a symlink, FIFO, directory, socket or foreign-owned file is never opened and is replaced by a rebuilt index. A sidecar that is stale or damaged is rebuilt. When the mailbox's directory cannot be written, nothing is left behind and the index is held in memory for that run. With `--index <PATH>`, a failed write of that file is an error instead.
+`export`, `info` and `show` each create an index file named `<mailbox>.mbxidx` beside the mailbox (`mail.mbox` gets `mail.mbox.mbxidx`), even a read-only command such as `info`, unless `--index <PATH>` places it elsewhere. An existing sidecar is reused while it matches the mailbox. It is trusted only when it is a regular file owned by the same user as the mailbox file; a symlink, FIFO, directory or socket is refused without being opened, and a regular file owned by someone else is refused once its owner is checked. A refused sidecar is not used and is replaced by a rebuilt index. A sidecar that is stale or damaged is rebuilt. When the mailbox's directory cannot be written, nothing is left behind and the index is held in memory for that run. With `--index <PATH>`, a failed write of that file is an error instead.
 
-<!-- Source: crates/mboxturbo-cli/src/open.rs:14-18 (Sidecar by default, Path with --index), crates/mboxturbo/src/builder.rs:10-37 and 183-200 (name, trust rule, rebuild, in-memory fallback), crates/mboxturbo/src/index/trust.rs:20-36 and 121-137 (refusals), and crates/mboxturbo-cli/src/{export,info,show}.rs (all call open). -->
+<!-- Source: crates/mboxturbo-cli/src/open.rs:14-18 (Sidecar by default, Path with --index), crates/mboxturbo/src/builder.rs:10-37 and 183-200 (name, trust rule, rebuild, in-memory fallback), crates/mboxturbo/src/index/trust.rs:20-36, 136, 163-165 and 177-187 (refusals, owner rule), and crates/mboxturbo-cli/src/{export,info,show}.rs (all call open). -->
 
 ## Commands and flags
 
