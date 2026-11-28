@@ -10,8 +10,7 @@ use arrow_array::builder::{
 use arrow_array::{Array as _, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, DataType, Fields, TimeUnit};
 use mboxturbo_headers::{
-    Hop, MsAntispam, ReceivedSpf, Tls, TrustSet, parse_ms_antispam, parse_received_hops,
-    parse_received_spf,
+    Hop, MsAntispam, ReceivedSpf, Tls, parse_ms_antispam, parse_received_hops, parse_received_spf,
 };
 
 use super::{
@@ -19,6 +18,7 @@ use super::{
     struct_item, struct_list_field, with_issues,
 };
 use crate::fields::Mail;
+use crate::pipeline::{ColumnBuilder, Record};
 use crate::verdict::RECEIVED;
 use crate::width::widen;
 
@@ -258,9 +258,22 @@ pub(crate) struct ReceivedHopsColumn {
 }
 
 impl ReceivedHopsColumn {
+    /// An empty column.
+    pub(crate) fn new() -> Self {
+        Self {
+            hops: HopRows::new(),
+            issues: IssueLists::new(),
+            shape: Shape::new(),
+        }
+    }
+}
+
+impl ColumnBuilder for ReceivedHopsColumn {
     /// Appends the hop chain of `mail`, parsed from the raw bytes of every `Received` header in
     /// header order; an unparsed message appends an empty list of each.
-    pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>, trust: Option<&TrustSet>) {
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail();
+        let trust = record.trust();
         let headers: Vec<&[u8]> = mail
             .into_iter()
             .flat_map(|parsed| raw_values(parsed, RECEIVED))
@@ -280,7 +293,7 @@ impl ReceivedHopsColumn {
     ///
     /// The Arrow error when the nested arrays do not fit [`hop_fields`] or
     /// [`received_hops_fields`].
-    pub(crate) fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
         let values = StructArray::try_new(hop_fields(), self.hops.finish()?, None)?;
         let hops = self
             .shape
@@ -290,15 +303,6 @@ impl ReceivedHopsColumn {
             vec![hops, self.issues.finish()?],
             None,
         )?))
-    }
-
-    /// An empty column.
-    pub(crate) fn new() -> Self {
-        Self {
-            hops: HopRows::new(),
-            issues: IssueLists::new(),
-            shape: Shape::new(),
-        }
     }
 }
 
@@ -320,40 +324,6 @@ pub(crate) struct ReceivedSpfColumn {
 }
 
 impl ReceivedSpfColumn {
-    /// Appends the list of every `Received-SPF` header of `mail`, parsed from its raw bytes in
-    /// header order; an unparsed message appends an empty list.
-    pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>) {
-        let mut len = 0_usize;
-        for value in mail
-            .into_iter()
-            .flat_map(|parsed| raw_values(parsed, RECEIVED_SPF))
-        {
-            let (spf, issues) = parse_received_spf(value).into_parts();
-            self.push_header(&spf);
-            self.issues.push(issues.iter());
-            len = len.saturating_add(1);
-        }
-        self.shape.push_list(len);
-    }
-
-    /// The column, as an Arrow array with one list per message appended.
-    ///
-    /// # Errors
-    ///
-    /// The Arrow error when the nested arrays do not fit [`received_spf_fields`].
-    pub(crate) fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(self.result.finish()),
-            Arc::new(self.client_ip.finish()),
-            Arc::new(self.comment.finish()),
-            self.pairs.finish()?,
-            self.issues.finish()?,
-        ];
-        let values = StructArray::try_new(received_spf_fields(), columns, None)?;
-        self.shape
-            .wrap(struct_item(received_spf_fields()), Arc::new(values))
-    }
-
     /// An empty column.
     pub(crate) fn new() -> Self {
         Self {
@@ -380,6 +350,43 @@ impl ReceivedSpfColumn {
     }
 }
 
+impl ColumnBuilder for ReceivedSpfColumn {
+    /// Appends the list of every `Received-SPF` header of `mail`, parsed from its raw bytes in
+    /// header order; an unparsed message appends an empty list.
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail();
+        let mut len = 0_usize;
+        for value in mail
+            .into_iter()
+            .flat_map(|parsed| raw_values(parsed, RECEIVED_SPF))
+        {
+            let (spf, issues) = parse_received_spf(value).into_parts();
+            self.push_header(&spf);
+            self.issues.push(issues.iter());
+            len = len.saturating_add(1);
+        }
+        self.shape.push_list(len);
+    }
+
+    /// The column, as an Arrow array with one list per message appended.
+    ///
+    /// # Errors
+    ///
+    /// The Arrow error when the nested arrays do not fit [`received_spf_fields`].
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.result.finish()),
+            Arc::new(self.client_ip.finish()),
+            Arc::new(self.comment.finish()),
+            self.pairs.finish()?,
+            self.issues.finish()?,
+        ];
+        let values = StructArray::try_new(received_spf_fields(), columns, None)?;
+        self.shape
+            .wrap(struct_item(received_spf_fields()), Arc::new(values))
+    }
+}
+
 /// Builder of the `microsoft_antispam` column.
 #[derive(Debug)]
 pub(crate) struct MicrosoftAntispamColumn {
@@ -402,44 +409,6 @@ pub(crate) struct MicrosoftAntispamColumn {
 }
 
 impl MicrosoftAntispamColumn {
-    /// Appends the list of every Microsoft antispam header of `mail`, parsed from its raw bytes
-    /// in header order; an unparsed message appends an empty list.
-    pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>) {
-        let mut len = 0_usize;
-        for (name, value) in mail.into_iter().flat_map(ms_antispam_headers) {
-            let (antispam, issues) = parse_ms_antispam(value).into_parts();
-            self.header.append_value(name);
-            self.push_header(&antispam);
-            self.issues.push(issues.iter());
-            len = len.saturating_add(1);
-        }
-        self.shape.push_list(len);
-    }
-
-    /// The column, as an Arrow array with one list per message appended.
-    ///
-    /// # Errors
-    ///
-    /// The Arrow error when the nested arrays do not fit [`microsoft_antispam_fields`].
-    pub(crate) fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(self.header.finish()),
-            Arc::new(self.scl.finish()),
-            Arc::new(self.bcl.finish()),
-            Arc::new(self.client_ip.finish()),
-        ];
-        columns.extend(
-            self.text
-                .iter_mut()
-                .map(|builder| -> ArrayRef { Arc::new(builder.finish()) }),
-        );
-        columns.push(self.entries.finish()?);
-        columns.push(self.issues.finish()?);
-        let values = StructArray::try_new(microsoft_antispam_fields(), columns, None)?;
-        self.shape
-            .wrap(struct_item(microsoft_antispam_fields()), Arc::new(values))
-    }
-
     /// An empty column.
     pub(crate) fn new() -> Self {
         Self {
@@ -469,6 +438,47 @@ impl MicrosoftAntispamColumn {
                 .iter()
                 .map(|entry| (entry.key.as_ref(), entry.value.as_ref(), entry.offset)),
         );
+    }
+}
+
+impl ColumnBuilder for MicrosoftAntispamColumn {
+    /// Appends the list of every Microsoft antispam header of `mail`, parsed from its raw bytes
+    /// in header order; an unparsed message appends an empty list.
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail();
+        let mut len = 0_usize;
+        for (name, value) in mail.into_iter().flat_map(ms_antispam_headers) {
+            let (antispam, issues) = parse_ms_antispam(value).into_parts();
+            self.header.append_value(name);
+            self.push_header(&antispam);
+            self.issues.push(issues.iter());
+            len = len.saturating_add(1);
+        }
+        self.shape.push_list(len);
+    }
+
+    /// The column, as an Arrow array with one list per message appended.
+    ///
+    /// # Errors
+    ///
+    /// The Arrow error when the nested arrays do not fit [`microsoft_antispam_fields`].
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(self.header.finish()),
+            Arc::new(self.scl.finish()),
+            Arc::new(self.bcl.finish()),
+            Arc::new(self.client_ip.finish()),
+        ];
+        columns.extend(
+            self.text
+                .iter_mut()
+                .map(|builder| -> ArrayRef { Arc::new(builder.finish()) }),
+        );
+        columns.push(self.entries.finish()?);
+        columns.push(self.issues.finish()?);
+        let values = StructArray::try_new(microsoft_antispam_fields(), columns, None)?;
+        self.shape
+            .wrap(struct_item(microsoft_antispam_fields()), Arc::new(values))
     }
 }
 

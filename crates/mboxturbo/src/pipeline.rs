@@ -4,7 +4,6 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
-#[cfg(test)]
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -86,7 +85,7 @@ trait Probe: Debug + Send + Sync {
 }
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
-struct Record<'mail> {
+pub(crate) struct Record<'mail> {
     /// The `Date` header, read from `raw` on first use so two date columns share one read.
     date: OnceCell<Option<Timestamp>>,
     /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
@@ -102,10 +101,20 @@ struct Record<'mail> {
     trust: Option<&'mail TrustSet>,
 }
 
-impl Record<'_> {
+impl<'mail> Record<'mail> {
     /// The message's `Date` header, read from the raw bytes at most once.
     fn date(&self) -> Option<Timestamp> {
         *self.date.get_or_init(|| fields::date(self.raw))
+    }
+
+    /// The parsed message, or `None` when no column needs parsing or the parser rejected it.
+    pub(crate) const fn mail(&self) -> Option<&'mail Mail<'mail>> {
+        self.mail
+    }
+
+    /// The trust set of the pipeline, if it has one.
+    pub(crate) const fn trust(&self) -> Option<&'mail TrustSet> {
+        self.trust
     }
 }
 
@@ -152,10 +161,10 @@ impl Pipeline {
         runs: &[Range<usize>],
     ) -> Result<RecordBatch, MboxTurboError> {
         let rows = runs.iter().map(Range::len).fold(0, usize::saturating_add);
-        let mut slots: Vec<Slot> = self
+        let mut builders: Vec<Box<dyn ColumnBuilder>> = self
             .columns
             .iter()
-            .map(|column| Slot::new(column, rows))
+            .map(|column| column_builder(column, rows))
             .collect();
         for (position, span, raw) in runs.iter().flat_map(|run| mailbox.rows(run.clone())) {
             let parsed = self.parse(raw);
@@ -167,13 +176,13 @@ impl Pipeline {
                 mail: parsed.as_ref(),
                 trust: self.trust.as_deref(),
             };
-            for slot in &mut slots {
-                slot.append(&record);
+            for builder in &mut builders {
+                builder.append(&record);
             }
         }
-        let batch = slots
+        let batch = builders
             .iter_mut()
-            .map(Slot::finish)
+            .map(|builder| builder.finish())
             .collect::<Result<Vec<ArrayRef>, ArrowError>>()
             .and_then(|arrays| RecordBatch::try_new(self.schema(), arrays));
         batch.map_err(|source| MboxTurboError::Arrow {
@@ -318,110 +327,235 @@ impl RecordBatchReader for BatchReader {
     }
 }
 
-/// Typed column builder for one selected column; each message appends exactly one entry per slot.
-#[derive(Debug)]
-enum Slot {
-    /// Email addresses of one address header; an absent header gives an empty list.
-    Addresses(AddressHeader, ListBuilder<StringBuilder>),
-    /// ARC sets parsed from the ARC headers.
-    ArcSets(Box<ArcSetsColumn>),
-    /// One of the attachment list columns.
-    Attachments(AttachmentSlot),
-    /// Parsed `Authentication-Results` headers.
-    AuthResults(Box<AuthResultsColumn>),
-    /// Date as UTC microseconds, null when absent or invalid.
-    Date(TimestampMicrosecondBuilder),
-    /// Minutes east of UTC from the Date header, null when absent or invalid.
-    DateOffset(Int32Builder),
-    /// Parsed `DKIM-Signature` headers.
-    DkimSignatures(Box<DkimSignaturesColumn>),
-    /// First value of the named header (matched in any case), null when absent.
-    FirstHeaderValue(String, StringBuilder),
-    /// Every value of the named header (matched in any case); empty list when absent.
-    HeaderValues(String, ListBuilder<StringBuilder>),
-    /// HTML bodies joined by newlines, null when the message is unparsed.
-    Html(StringBuilder),
-    /// First Message-ID, null when absent.
-    MessageId(StringBuilder),
-    /// Parsed `X-Forefront-Antispam-Report` and `X-Microsoft-Antispam` headers.
-    MicrosoftAntispam(Box<MicrosoftAntispamColumn>),
-    /// Byte offset of the message start.
-    Offset(UInt64Builder),
-    /// Message index.
-    Position(UInt64Builder),
-    /// The message's stored bytes, separator line included.
-    Raw(LargeBinaryBuilder),
-    /// Parsed `Received` chain.
-    ReceivedHops(Box<ReceivedHopsColumn>),
-    /// Parsed `Received-SPF` headers.
-    ReceivedSpfParsed(Box<ReceivedSpfColumn>),
-    /// Message length in bytes.
-    Size(UInt64Builder),
-    /// Decoded subject, null when absent.
-    Subject(StringBuilder),
-    /// Plain-text bodies joined by newlines, null when the message is unparsed.
-    Text(StringBuilder),
-    /// The result word of one method from the newest trusted `Authentication-Results`.
-    Verdict(VerdictColumn),
+/// Typed builder for one selected column; each message appends exactly one entry per builder.
+pub(crate) trait ColumnBuilder: Debug + Send {
+    /// Appends this column's value for `record`; absent or unparsed data becomes null or an empty
+    /// list, never an error.
+    fn append(&mut self, record: &Record<'_>);
+
+    /// Finishes the builder into an Arrow array and resets it for reuse.
+    ///
+    /// # Errors
+    ///
+    /// The Arrow error when a structured column's nested arrays do not fit its layout.
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError>;
 }
 
-/// Builder for one per-attachment list column; each message contributes one list, which is
-/// empty when it has no attachments.
+/// Reads a text value of a parsed message: a decoded header or a joined body.
+type MailText = for<'any> fn(&'any Mail<'_>) -> Option<Cow<'any, str>>;
+
+/// Reads an unsigned number from the position, span or size of a record.
+type RecordNumber = fn(&Record<'_>) -> u64;
+
+/// A column holding one unsigned number per message, taken from where it sits in the mailbox.
 #[derive(Debug)]
-enum AttachmentSlot {
-    /// Attachment file names; a nameless attachment is null.
-    Names(ListBuilder<StringBuilder>),
-    /// Lowercase hex SHA-256 of each decoded attachment.
-    Sha256(ListBuilder<StringBuilder>),
-    /// Decoded attachment sizes in bytes.
-    Sizes(ListBuilder<UInt64Builder>),
-    /// Attachment content types.
-    Types(ListBuilder<StringBuilder>),
+struct NumberBuilder {
+    /// The Arrow builder.
+    builder: UInt64Builder,
+    /// Reads the number out of a record.
+    read: RecordNumber,
 }
 
-impl AttachmentSlot {
-    /// Appends this message's attachment list; an unparsed message (`None`) appends an empty list.
-    fn append(&mut self, mail: Option<&Mail<'_>>) {
-        let attachments = mail.into_iter().flat_map(fields::attachments);
-        match self {
-            Self::Names(builder) => {
-                builder
-                    .values()
-                    .extend(attachments.map(|attachment| attachment.filename));
-                builder.append(true);
-            },
-            Self::Types(builder) => {
-                builder
-                    .values()
-                    .extend(attachments.map(|attachment| attachment.content_type()));
-                builder.append(true);
-            },
-            Self::Sizes(builder) => {
-                let sizes = attachments.map(|attachment| Some(widen(attachment.data.len())));
-                builder.values().extend(sizes);
-                builder.append(true);
-            },
-            Self::Sha256(builder) => {
-                let digests = attachments.map(|attachment| Some(sha256_hex(&attachment.data)));
-                builder.values().extend(digests);
-                builder.append(true);
-            },
-        }
+impl ColumnBuilder for NumberBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        self.builder.append_value((self.read)(record));
     }
 
-    /// Finishes the builder into an Arrow list array and resets it for reuse.
-    fn finish(&mut self) -> ArrayRef {
-        match self {
-            Self::Names(builder) | Self::Types(builder) | Self::Sha256(builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Sizes(builder) => Arc::new(builder.finish()),
-        }
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.builder.finish()))
+    }
+}
+
+/// The message's stored bytes, separator line included.
+#[derive(Debug)]
+struct RawBuilder(LargeBinaryBuilder);
+
+impl ColumnBuilder for RawBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        self.0.append_value(record.raw);
     }
 
-    /// Empty builder for the per-message list of attachment sizes.
-    fn sizes() -> Self {
-        Self::Sizes(ListBuilder::new(UInt64Builder::new()))
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+/// Email addresses of one address header; an absent header gives an empty list.
+#[derive(Debug)]
+struct AddressesBuilder {
+    /// The Arrow builder.
+    builder: ListBuilder<StringBuilder>,
+    /// The header read.
+    header: AddressHeader,
+}
+
+impl ColumnBuilder for AddressesBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        append_addresses(&mut self.builder, self.header, record.mail);
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.builder.finish()))
+    }
+}
+
+/// A nullable text column read from the parsed message; null when the message is unparsed or the
+/// value is absent.
+#[derive(Debug)]
+struct TextBuilder {
+    /// The Arrow builder.
+    builder: StringBuilder,
+    /// Reads the value out of the parsed message.
+    read: MailText,
+}
+
+impl ColumnBuilder for TextBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        self.builder
+            .append_option(record.mail.and_then(|mail| (self.read)(mail)));
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.builder.finish()))
+    }
+}
+
+/// Date as UTC microseconds, null when absent or invalid.
+#[derive(Debug)]
+struct DateBuilder(TimestampMicrosecondBuilder);
+
+impl ColumnBuilder for DateBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        self.0
+            .append_option(record.date().map(|found| micros(found.unix_seconds)));
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+/// Minutes east of UTC from the Date header, null when absent or invalid.
+#[derive(Debug)]
+struct DateOffsetBuilder(Int32Builder);
+
+impl ColumnBuilder for DateOffsetBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        self.0
+            .append_option(record.date().map(|found| found.offset_minutes));
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+/// Every value of the named header (matched in any case); empty list when absent.
+#[derive(Debug)]
+struct HeaderValuesBuilder {
+    /// The Arrow builder.
+    builder: ListBuilder<StringBuilder>,
+    /// The header name, stored once.
+    name: String,
+}
+
+impl ColumnBuilder for HeaderValuesBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        append_header_values(&mut self.builder, &self.name, record.mail);
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.builder.finish()))
+    }
+}
+
+/// First value of the named header (matched in any case), null when absent.
+#[derive(Debug)]
+struct FirstHeaderValueBuilder {
+    /// The Arrow builder.
+    builder: StringBuilder,
+    /// The header name, stored once.
+    name: String,
+}
+
+impl ColumnBuilder for FirstHeaderValueBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        self.builder
+            .append_option(first_header_value(&self.name, record.mail));
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.builder.finish()))
+    }
+}
+
+/// Attachment file names; a nameless attachment is null.
+#[derive(Debug)]
+struct AttachmentNamesBuilder(ListBuilder<StringBuilder>);
+
+impl ColumnBuilder for AttachmentNamesBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        let attachments = record.mail.into_iter().flat_map(fields::attachments);
+        self.0
+            .values()
+            .extend(attachments.map(|attachment| attachment.filename));
+        self.0.append(true);
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+/// Attachment content types.
+#[derive(Debug)]
+struct AttachmentTypesBuilder(ListBuilder<StringBuilder>);
+
+impl ColumnBuilder for AttachmentTypesBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        let attachments = record.mail.into_iter().flat_map(fields::attachments);
+        self.0
+            .values()
+            .extend(attachments.map(|attachment| attachment.content_type()));
+        self.0.append(true);
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+/// Decoded attachment sizes in bytes.
+#[derive(Debug)]
+struct AttachmentSizesBuilder(ListBuilder<UInt64Builder>);
+
+impl ColumnBuilder for AttachmentSizesBuilder {
+    fn append(&mut self, record: &Record<'_>) {
+        let attachments = record.mail.into_iter().flat_map(fields::attachments);
+        let sizes = attachments.map(|attachment| Some(widen(attachment.data.len())));
+        self.0.values().extend(sizes);
+        self.0.append(true);
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+/// Lowercase hex SHA-256 of each decoded attachment.
+#[derive(Debug)]
+struct AttachmentSha256Builder(ListBuilder<StringBuilder>);
+
+impl ColumnBuilder for AttachmentSha256Builder {
+    fn append(&mut self, record: &Record<'_>) {
+        let attachments = record.mail.into_iter().flat_map(fields::attachments);
+        let digests = attachments.map(|attachment| Some(sha256_hex(&attachment.data)));
+        self.0.values().extend(digests);
+        self.0.append(true);
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.0.finish()))
     }
 }
 
@@ -450,133 +584,82 @@ impl AddressHeader {
     }
 }
 
-impl Slot {
-    /// Appends this slot's value for `record`; absent or unparsed data becomes null or an empty
-    /// list, never an error.
-    fn append(&mut self, record: &Record<'_>) {
-        let mail = record.mail;
-        match self {
-            Self::Position(builder) => builder.append_value(widen(record.position)),
-            Self::Offset(builder) => builder.append_value(widen(record.span.start)),
-            Self::Size(builder) => builder.append_value(widen(record.span.len())),
-            Self::Raw(builder) => builder.append_value(record.raw),
-            Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
-            Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
-            Self::Date(builder) => {
-                builder.append_option(record.date().map(|found| micros(found.unix_seconds)));
-            },
-            Self::DateOffset(builder) => {
-                builder.append_option(record.date().map(|found| found.offset_minutes));
-            },
-            Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
-            Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
-            Self::FirstHeaderValue(name, builder) => {
-                builder.append_option(first_header_value(name, mail));
-            },
-            Self::Text(builder) => builder.append_option(mail.map(text_body)),
-            Self::Html(builder) => builder.append_option(mail.map(html_body)),
-            Self::Attachments(slot) => slot.append(mail),
-            Self::AuthResults(column) => column.append(mail, record.trust),
-            Self::ArcSets(column) => column.append(mail, record.trust),
-            Self::DkimSignatures(column) => column.append(mail),
-            Self::ReceivedHops(column) => column.append(mail, record.trust),
-            Self::ReceivedSpfParsed(column) => column.append(mail),
-            Self::MicrosoftAntispam(column) => column.append(mail),
-            Self::Verdict(column) => column.append(mail, record.trust),
-        }
-    }
+/// Boxes `builder` as a [`ColumnBuilder`].
+fn boxed(builder: impl ColumnBuilder + 'static) -> Box<dyn ColumnBuilder> {
+    Box::new(builder)
+}
 
-    /// Finishes the builder into an Arrow array and resets it for reuse.
-    ///
-    /// # Errors
-    ///
-    /// The Arrow error when a structured column's nested arrays do not fit its layout.
-    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
-        let array: ArrayRef = match self {
-            Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Raw(builder) => Arc::new(builder.finish()),
-            Self::Addresses(_, builder) | Self::HeaderValues(_, builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Subject(builder)
-            | Self::MessageId(builder)
-            | Self::FirstHeaderValue(_, builder)
-            | Self::Text(builder)
-            | Self::Html(builder) => Arc::new(builder.finish()),
-            Self::Date(builder) => Arc::new(builder.finish()),
-            Self::DateOffset(builder) => Arc::new(builder.finish()),
-            Self::Attachments(slot) => slot.finish(),
-            Self::ArcSets(column) => column.finish()?,
-            Self::AuthResults(column) => column.finish()?,
-            Self::DkimSignatures(column) => column.finish()?,
-            Self::ReceivedHops(column) => column.finish()?,
-            Self::ReceivedSpfParsed(column) => column.finish()?,
-            Self::MicrosoftAntispam(column) => column.finish()?,
-            Self::Verdict(column) => column.finish(),
-        };
-        Ok(array)
-    }
-
-    /// A slot keeping only the first value of the header `name` (matched in any case).
-    fn first_header_value(name: &str) -> Self {
-        Self::FirstHeaderValue(name.to_owned(), StringBuilder::new())
-    }
-
-    /// A slot keeping every value of the header `name` (matched in any case) as a list.
-    fn header_values(name: &str) -> Self {
-        Self::HeaderValues(name.to_owned(), text_list())
-    }
-
-    /// Builds the slot matching `column`, preallocating `rows` entries where the builder
-    /// supports it.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
-    )]
-    fn new(column: &Column, rows: usize) -> Self {
-        let addresses = |header| Self::Addresses(header, text_list());
-        match column {
-            Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
-            Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
-            Column::Size => Self::Size(UInt64Builder::with_capacity(rows)),
-            Column::Raw => Self::Raw(LargeBinaryBuilder::new()),
-            Column::From => addresses(AddressHeader::From),
-            Column::To => addresses(AddressHeader::To),
-            Column::Cc => addresses(AddressHeader::Cc),
-            Column::ReplyTo => addresses(AddressHeader::ReplyTo),
-            Column::Subject => Self::Subject(StringBuilder::new()),
-            Column::Date => Self::Date(utc_timestamps(rows)),
-            Column::DateOffsetMinutes => Self::DateOffset(Int32Builder::with_capacity(rows)),
-            Column::MessageId => Self::MessageId(StringBuilder::new()),
-            Column::Received => Self::header_values("received"),
-            Column::AuthenticationResults => Self::header_values("authentication-results"),
-            Column::ReceivedSpf => Self::header_values("received-spf"),
-            Column::DkimSignature => Self::header_values("dkim-signature"),
-            Column::ReturnPath => Self::first_header_value("return-path"),
-            Column::Text => Self::Text(StringBuilder::new()),
-            Column::Html => Self::Html(StringBuilder::new()),
-            Column::AttachmentNames => Self::Attachments(AttachmentSlot::Names(text_list())),
-            Column::AttachmentTypes => Self::Attachments(AttachmentSlot::Types(text_list())),
-            Column::AttachmentSizes => Self::Attachments(AttachmentSlot::sizes()),
-            Column::AttachmentSha256 => Self::Attachments(AttachmentSlot::Sha256(text_list())),
-            Column::Header(name) => Self::header_values(name),
-            Column::AuthResults => Self::AuthResults(Box::new(AuthResultsColumn::new())),
-            Column::ArcSets => Self::ArcSets(Box::new(ArcSetsColumn::new())),
-            Column::DkimSignatures => Self::DkimSignatures(Box::new(DkimSignaturesColumn::new())),
-            Column::ReceivedHops => Self::ReceivedHops(Box::new(ReceivedHopsColumn::new())),
-            Column::ReceivedSpfParsed => {
-                Self::ReceivedSpfParsed(Box::new(ReceivedSpfColumn::new()))
-            },
-            Column::MicrosoftAntispam => {
-                Self::MicrosoftAntispam(Box::new(MicrosoftAntispamColumn::new()))
-            },
-            Column::VerdictDmarc => Self::Verdict(VerdictColumn::new(AuthMethod::Dmarc)),
-            Column::VerdictSpf => Self::Verdict(VerdictColumn::new(AuthMethod::Spf)),
-            Column::VerdictDkim => Self::Verdict(VerdictColumn::new(AuthMethod::Dkim)),
-            Column::VerdictCompauth => Self::Verdict(VerdictColumn::new(AuthMethod::CompAuth)),
-        }
+/// The builder of `column`, preallocating `rows` entries where the builder supports it. The only
+/// place that switches on the column.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
+)]
+fn column_builder(column: &Column, rows: usize) -> Box<dyn ColumnBuilder> {
+    let number = |read| {
+        boxed(NumberBuilder {
+            builder: UInt64Builder::with_capacity(rows),
+            read,
+        })
+    };
+    let addresses = |header| {
+        boxed(AddressesBuilder {
+            builder: text_list(),
+            header,
+        })
+    };
+    let text = |read| {
+        boxed(TextBuilder {
+            builder: StringBuilder::new(),
+            read,
+        })
+    };
+    let header_values = |name: &str| {
+        boxed(HeaderValuesBuilder {
+            builder: text_list(),
+            name: name.to_owned(),
+        })
+    };
+    match column {
+        Column::Position => number(|record| widen(record.position)),
+        Column::Offset => number(|record| widen(record.span.start)),
+        Column::Size => number(|record| widen(record.span.len())),
+        Column::Raw => boxed(RawBuilder(LargeBinaryBuilder::new())),
+        Column::From => addresses(AddressHeader::From),
+        Column::To => addresses(AddressHeader::To),
+        Column::Cc => addresses(AddressHeader::Cc),
+        Column::ReplyTo => addresses(AddressHeader::ReplyTo),
+        Column::Subject => text(|mail| mail.subject().map(Cow::Borrowed)),
+        Column::Date => boxed(DateBuilder(utc_timestamps(rows))),
+        Column::DateOffsetMinutes => boxed(DateOffsetBuilder(Int32Builder::with_capacity(rows))),
+        Column::MessageId => text(|mail| mail.message_id().map(Cow::Borrowed)),
+        Column::Received => header_values("received"),
+        Column::AuthenticationResults => header_values("authentication-results"),
+        Column::ReceivedSpf => header_values("received-spf"),
+        Column::DkimSignature => header_values("dkim-signature"),
+        Column::ReturnPath => boxed(FirstHeaderValueBuilder {
+            builder: StringBuilder::new(),
+            name: "return-path".to_owned(),
+        }),
+        Column::Text => text(|mail| Some(Cow::Owned(text_body(mail)))),
+        Column::Html => text(|mail| Some(Cow::Owned(html_body(mail)))),
+        Column::AttachmentNames => boxed(AttachmentNamesBuilder(text_list())),
+        Column::AttachmentTypes => boxed(AttachmentTypesBuilder(text_list())),
+        Column::AttachmentSizes => boxed(AttachmentSizesBuilder(ListBuilder::new(
+            UInt64Builder::new(),
+        ))),
+        Column::AttachmentSha256 => boxed(AttachmentSha256Builder(text_list())),
+        Column::Header(name) => header_values(name),
+        Column::AuthResults => boxed(AuthResultsColumn::new()),
+        Column::ArcSets => boxed(ArcSetsColumn::new()),
+        Column::DkimSignatures => boxed(DkimSignaturesColumn::new()),
+        Column::ReceivedHops => boxed(ReceivedHopsColumn::new()),
+        Column::ReceivedSpfParsed => boxed(ReceivedSpfColumn::new()),
+        Column::MicrosoftAntispam => boxed(MicrosoftAntispamColumn::new()),
+        Column::VerdictDmarc => boxed(VerdictColumn::new(AuthMethod::Dmarc)),
+        Column::VerdictSpf => boxed(VerdictColumn::new(AuthMethod::Spf)),
+        Column::VerdictDkim => boxed(VerdictColumn::new(AuthMethod::Dkim)),
+        Column::VerdictCompauth => boxed(VerdictColumn::new(AuthMethod::CompAuth)),
     }
 }
 
@@ -693,6 +776,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::cell::OnceCell;
     use std::io::{Write as _, sink};
     use std::iter;
     use std::ops::Range;
@@ -703,15 +787,16 @@ mod tests {
 
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray as _;
-    use arrow_array::{Array as _, ListArray, RecordBatch};
+    use arrow_array::types::{TimestampMicrosecondType, UInt64Type};
+    use arrow_array::{Array as _, ArrayRef, ListArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use mail_parser::{HeaderForm, HeaderName, MessageParser};
     use tempfile::NamedTempFile;
 
     use super::{
-        AddressHeader, AttachmentSlot, Depth, Pipeline, Probe, Slot, append_addresses,
-        append_header_values, depth_for, first_header_value, header_form, html_body, joined,
-        micros, text_body, utc_timestamps,
+        AddressHeader, Depth, Pipeline, Probe, Record, append_addresses, append_header_values,
+        column_builder, depth_for, first_header_value, header_form, html_body, joined, micros,
+        text_body,
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
@@ -731,6 +816,14 @@ Date: Thu, 01 Jan 1970 00:00:10 +0130\r\n\
 Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
 --b\r\nContent-Type: text/plain\r\n\r\nplain part\r\n--b\r\nContent-Type: text/html\r\n\r\n\
 <p>html part</p>\r\n--b--\r\n";
+
+    const HEADERS: &[u8] = b"DKIM-Signature: sig\r\nReturn-Path: <one@example.org>\r\n\
+Return-Path: <two@example.org>\r\nReceived: first\r\nReceived: second\r\nX-A: a\r\n\r\nbody\r\n";
+
+    const ATTACHED: &[u8] = b"Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n--b\r\n\
+Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=a.bin\r\n\r\n\
+12345\r\n--b--\r\n";
 
     /// Holds the extraction job whose first message is `held_start` until the test releases it.
     #[derive(Debug)]
@@ -1001,68 +1094,93 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert_eq!(joined(iter::empty()), "", "no parts give an empty string");
     }
 
+    /// Builds `column`, appends the one message `raw` (parsed) and finishes it.
+    fn built(column: &Column, raw: &[u8]) -> ArrayRef {
+        let mail = parse(raw);
+        let record = Record {
+            date: OnceCell::new(),
+            mail: Some(&mail),
+            position: 0,
+            raw,
+            span: 0..raw.len(),
+            trust: None,
+        };
+        let mut builder = column_builder(column, 1);
+        builder.append(&record);
+        builder.finish().expect("fixture column finishes")
+    }
+
     #[test]
     fn date_slots_are_built_in_utc() {
-        let array = utc_timestamps(1).finish();
+        let array = built(&Column::Date, MULTIPART);
         assert_eq!(
             array.data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             "timestamps carry the UTC zone"
         );
-    }
-
-    fn header_slot_name(column: &Column) -> Option<String> {
-        if let Slot::HeaderValues(name, _) | Slot::FirstHeaderValue(name, _) = Slot::new(column, 0)
-        {
-            Some(name)
-        } else {
-            None
-        }
+        assert_eq!(
+            array.as_primitive::<TimestampMicrosecondType>().value(0),
+            -5_390_000_000,
+            "the built date column holds the UTC microseconds of the Date header"
+        );
     }
 
     #[test]
     fn header_columns_get_slots_named_by_their_lowercase_header() {
-        let named = |column| header_slot_name(&column);
+        let list = |column| list_cells(built(&column, HEADERS).as_list::<i32>(), 0);
         assert_eq!(
-            named(Column::DkimSignature).as_deref(),
-            Some("dkim-signature"),
-            "DKIM-Signature becomes a lowercase list slot"
+            list(Column::DkimSignature),
+            ["sig"],
+            "DKIM-Signature is read from its mixed-case header"
         );
         assert_eq!(
-            named(Column::ReturnPath).as_deref(),
-            Some("return-path"),
-            "Return-Path becomes a lowercase single-value slot"
+            list(Column::Header("x-a".to_owned())),
+            ["a"],
+            "a custom header is read under the name the caller gave"
         );
         assert_eq!(
-            named(Column::Header("x-a".to_owned())).as_deref(),
-            Some("x-a"),
-            "a custom header keeps the name the caller gave"
+            built(&Column::ReturnPath, HEADERS)
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some("<one@example.org>")],
+            "Return-Path is read from its header as one string"
         );
     }
 
     #[test]
     fn return_path_keeps_only_the_first_value_while_received_keeps_all() {
-        assert!(
-            matches!(
-                Slot::new(&Column::ReturnPath, 0),
-                Slot::FirstHeaderValue(..)
-            ),
-            "return-path is a single-value slot"
+        let return_path = built(&Column::ReturnPath, HEADERS);
+        assert_eq!(
+            return_path.data_type(),
+            &DataType::Utf8,
+            "return-path is a single-value column"
         );
-        assert!(
-            matches!(Slot::new(&Column::Received, 0), Slot::HeaderValues(..)),
-            "received is a list slot"
+        assert_eq!(
+            return_path.as_string::<i32>().value(0),
+            "<one@example.org>",
+            "the second Return-Path is dropped"
+        );
+        assert_eq!(
+            list_cells(built(&Column::Received, HEADERS).as_list::<i32>(), 0),
+            ["first", "second"],
+            "received is a list holding every value"
         );
     }
 
     #[test]
     fn the_attachment_sizes_column_gets_a_size_list_slot() {
-        assert!(
-            matches!(
-                Slot::new(&Column::AttachmentSizes, 0),
-                Slot::Attachments(AttachmentSlot::Sizes(_))
-            ),
+        let array = built(&Column::AttachmentSizes, ATTACHED);
+        assert_eq!(
+            array.data_type(),
+            &DataType::List(Arc::new(Field::new_list_field(DataType::UInt64, true))),
             "sizes are numeric lists"
+        );
+        let sizes = array.as_list::<i32>().value(0);
+        assert_eq!(
+            sizes.as_primitive::<UInt64Type>().values().to_vec(),
+            [5_u64],
+            "the attachment holds five decoded bytes"
         );
     }
 
