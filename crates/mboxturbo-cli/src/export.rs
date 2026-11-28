@@ -8,19 +8,18 @@ use std::{fs, io};
 
 use clap::{Args, ValueEnum};
 use mboxturbo::{
-    CancelToken, Column, Compression, CsvExporter, Destination, EmlExporter, Export, ExportSummary,
-    Exporter, Filter, FormulaEscaping, IndexOrigin, IpcExporter, JsonlExporter, Mailbox,
-    MboxExporter, MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline,
-    Predicate, Progress,
+    CancelToken, Column, Compression, CsvExporter, DateBounds, Destination, DestinationKind,
+    EmlExporter, Export, ExportSummary, Exporter, Filter, FormulaEscaping, IndexOrigin,
+    IpcExporter, JsonlExporter, Mailbox, MboxExporter, MboxTurboError, Narrowed, Narrowing,
+    Overwrite, ParquetExporter, Pipeline, Predicate, Progress,
 };
 
-use crate::dates::Bounds;
 use crate::events::{self, Counts, File, Report, Start, Summary, Throttle};
 use crate::failure::{Failure, signal_failure, stderr_failure, stdout_failure};
 use crate::open::open;
 use crate::progress::{self, Bar, Feedback};
-use crate::select;
 use crate::signals::Interrupts;
+use crate::{dates, select};
 
 /// Messages per batch: the unit the pipeline extracts and a sink writes at a time.
 const BATCH_SIZE: usize = 4096;
@@ -132,17 +131,12 @@ impl Format {
             Self::Parquet => "parquet",
         }
     }
-
-    /// Whether this format can be written to standard output.
-    const fn streams(self) -> bool {
-        !matches!(self, Self::Eml | Self::Parquet)
-    }
 }
 
 /// What limits an export beyond the whole mailbox, parsed before the mailbox is opened.
 struct Restrictions {
     /// The `--since` and `--until` bounds.
-    bounds: Bounds,
+    bounds: DateBounds,
     /// The `--where` or `--where-file` filter.
     filter: Option<Filter>,
     /// The `--select` ranges.
@@ -290,7 +284,7 @@ pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Resu
 fn restrictions(args: &ExportArgs) -> Result<Restrictions, Failure> {
     Ok(Restrictions {
         ranges: select::parse_all(&args.select)?,
-        bounds: Bounds::parse(args.limits.since.as_deref(), args.limits.until.as_deref())?,
+        bounds: dates::bounds(args.limits.since.as_deref(), args.limits.until.as_deref())?,
         filter: filter(args)?,
     })
 }
@@ -414,7 +408,7 @@ fn columns(format: Format, requested: Option<&[String]>) -> Result<Vec<Column>, 
             Column::MessageId,
             Column::Date,
         ]),
-        Format::Mbox => Some(vec![Column::Raw]),
+        Format::Mbox => Some(vec![Column::Raw, Column::Position]),
         Format::Arrow | Format::Csv | Format::Jsonl | Format::Parquet => None,
     };
     if let Some(fixed) = whole {
@@ -429,13 +423,7 @@ fn columns(format: Format, requested: Option<&[String]>) -> Result<Vec<Column>, 
     let Some(names) = requested else {
         return Ok(Column::defaults());
     };
-    names
-        .iter()
-        .map(|name| {
-            Column::from_name(name)
-                .ok_or_else(|| Failure::Usage(format!("unknown column `{name}`")))
-        })
-        .collect()
+    Column::parse_all(names).map_err(|error| Failure::Usage(error.to_string()))
 }
 
 /// Where the output goes: standard output for `-`, otherwise a directory for eml and a file for
@@ -449,7 +437,7 @@ fn destination(format: Format, output: &Path) -> Result<Destination, Failure> {
             },
         });
     }
-    if format.streams() {
+    if format.exporter(0).accepts(DestinationKind::Stream) {
         return Ok(Destination::Stream(Box::new(io::stdout())));
     }
     Err(Failure::Usage(format!(
@@ -471,8 +459,8 @@ fn kept(
 ) -> Result<Narrowed, Failure> {
     let bounds = restrictions.bounds;
     let mut narrowing = Narrowing::new();
-    if !bounds.is_open() {
-        narrowing = narrowing.dates(bounds.since, bounds.until);
+    if !bounds.is_unbounded() {
+        narrowing = narrowing.dates(bounds);
     }
     if let Some(positions) = chosen_positions(args, restrictions.ranges, mailbox)? {
         narrowing = narrowing.positions(positions);
@@ -572,8 +560,8 @@ mod tests {
         args: ExportArgs,
     }
 
-    /// The message `scan_failure` gives a cancelled scan of an export written to `output`.
-    fn cancelled_message(output: &str) -> String {
+    /// What `scan_failure` gives a cancelled scan of an export written to `output`.
+    fn cancelled_failure(output: &str) -> Failure {
         let line = Line::try_parse_from(["export", "mail.mbox", "--format", "csv", "-o", output])
             .expect("the export arguments parse");
         let cancel = CancelToken::new();
@@ -583,24 +571,34 @@ mod tests {
             target: None,
             written: 0,
         };
-        scan_failure(error, &line.args, &watch).to_string()
+        scan_failure(error, &line.args, &watch)
     }
 
     #[test]
     fn a_cancelled_scan_names_the_output_path() {
-        let message = cancelled_message("out/mail.csv");
+        let failure = cancelled_failure("out/mail.csv");
+        let Failure::Core { error, .. } = failure else {
+            panic!("a cancelled scan is a library failure, got {failure:?}");
+        };
         assert!(
-            message.contains("export to out/mail.csv cancelled after"),
-            "the message names the -o target, got: {message}"
+            matches!(
+                &*error,
+                MboxTurboError::Cancelled { target: Some(target), .. }
+                    if target == Path::new("out/mail.csv")
+            ),
+            "the error names the -o target, got: {error:?}"
         );
     }
 
     #[test]
     fn a_cancelled_scan_names_a_stream_for_dash() {
-        let message = cancelled_message("-");
+        let failure = cancelled_failure("-");
+        let Failure::Core { error, .. } = failure else {
+            panic!("a cancelled scan is a library failure, got {failure:?}");
+        };
         assert!(
-            message.contains("export to a stream cancelled after"),
-            "the message names a stream for -o -, got: {message}"
+            matches!(&*error, MboxTurboError::Cancelled { target: None, .. }),
+            "the error names no target for -o -, got: {error:?}"
         );
     }
 }

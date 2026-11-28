@@ -2,12 +2,14 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+#[cfg(feature = "test-probes")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mboxturbo_headers::{AuthMethod, TrustSet};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 
+use crate::date_bounds::DateBounds;
 use crate::error::{MboxTurboError, PredicateFault};
 use crate::export::CancelToken;
 use crate::fields::{raw_headers, unfold};
@@ -15,6 +17,7 @@ use crate::mailbox::{DateRange, Mailbox};
 use crate::predicates::Predicate;
 use crate::selection::Selection;
 use crate::verdict::{AUTHENTICATION_RESULTS, RECEIVED, verdict_is};
+#[cfg(feature = "test-probes")]
 use crate::width::widen;
 
 /// The compiled-program size a pattern may reach, in bytes.
@@ -80,6 +83,7 @@ pub(crate) enum Compiled {
 #[derive(Debug)]
 pub struct Filter {
     /// The number of header values handed to the predicate so far, over every pass.
+    #[cfg(feature = "test-probes")]
     collected: AtomicU64,
     /// The predicate, compiled.
     compiled: Compiled,
@@ -160,6 +164,7 @@ impl Filter {
     /// A predicate naming only `Subject` collects one value per message that has the header
     /// and none from `Received` or `Authentication-Results`. This is a test probe and not part
     /// of the stable API.
+    #[cfg(feature = "test-probes")]
     #[doc(hidden)]
     #[must_use]
     pub fn headers_collected(&self) -> u64 {
@@ -175,6 +180,7 @@ impl Filter {
                     .any(|wanted| name.eq_ignore_ascii_case(wanted.as_bytes()))
             })
             .collect();
+        #[cfg(feature = "test-probes")]
         let _previous = self
             .collected
             .fetch_add(widen(headers.len()), Ordering::Relaxed);
@@ -223,6 +229,7 @@ impl Filter {
         let mut names = Vec::new();
         collect_names(predicate, &mut names);
         Ok(Self {
+            #[cfg(feature = "test-probes")]
             collected: AtomicU64::new(0),
             compiled: Compiled::build(predicate, "")?,
             names,
@@ -262,14 +269,12 @@ impl Filter {
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct Narrowing<'filter> {
+    /// The window the index date must fall in.
+    dates: DateBounds,
     /// The filter the candidates must satisfy; the caller has already set its trust.
     filter: Option<&'filter Filter>,
     /// The positions to start from, in any order.
     positions: Option<Vec<usize>>,
-    /// The inclusive lower bound of the index date, in unix seconds.
-    since: Option<i64>,
-    /// The exclusive upper bound of the index date, in unix seconds.
-    until: Option<i64>,
 }
 
 /// The messages [`Narrowing::select`] kept.
@@ -305,17 +310,15 @@ impl<'filter> Narrowing<'filter> {
     /// The date step over `kept`, or over the whole mailbox when no positions are kept yet.
     fn dated(&self, mailbox: &Mailbox, kept: Option<&[usize]>) -> DateRange {
         kept.map_or_else(
-            || mailbox.date_range(self.since, self.until),
-            |positions| mailbox.dates_among(positions.iter().copied(), self.since, self.until),
+            || mailbox.dates_among(0..mailbox.len(), self.dates),
+            |positions| mailbox.dates_among(positions.iter().copied(), self.dates),
         )
     }
 
-    /// This narrowing keeping only the messages whose index date is at or after `since` and
-    /// before `until`, in unix seconds; `None` leaves that side open. A message with no index
-    /// date is dropped once either bound is given.
-    pub const fn dates(mut self, since: Option<i64>, until: Option<i64>) -> Self {
-        self.since = since;
-        self.until = until;
+    /// This narrowing keeping only the messages whose index date `bounds` admit. A message with
+    /// no index date is dropped once either bound is given.
+    pub const fn dates(mut self, bounds: DateBounds) -> Self {
+        self.dates = bounds;
         self
     }
 
@@ -328,10 +331,9 @@ impl<'filter> Narrowing<'filter> {
     /// A narrowing that keeps every message.
     pub const fn new() -> Self {
         Self {
+            dates: DateBounds::new(None, None),
             filter: None,
             positions: None,
-            since: None,
-            until: None,
         }
     }
 
@@ -357,7 +359,7 @@ impl<'filter> Narrowing<'filter> {
         check_cancelled(cancel)?;
         let mut kept = self.checked_positions(mailbox.len())?;
         let mut excluded_undated = None;
-        if self.since.is_some() || self.until.is_some() {
+        if !self.dates.is_unbounded() {
             let range = self.dated(mailbox, kept.as_deref());
             excluded_undated = Some(range.undated);
             kept = Some(range.positions);

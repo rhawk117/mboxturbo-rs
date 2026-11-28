@@ -105,6 +105,26 @@ mod show_info {
     }
 
     #[test]
+    fn show_to_a_pipe_and_with_raw_writes_control_bytes_unchanged() {
+        let stored = concat!(
+            "From h@example.com Mon Jan  1 00:00:00 2024\nSubject: osc\n\n",
+            "\u{1b}]52;c;aGk=\u{7}\u{7f}\n"
+        );
+        let fixture = Fixture::holding(stored);
+        for extra in [&[][..], &["--raw"][..]] {
+            let mut args = vec!["show", fixture.mailbox(), "0"];
+            args.extend_from_slice(extra);
+            let output = run(&args);
+            assert_eq!(code(&output), 0_i32, "show {extra:?}: {}", stderr(&output));
+            assert_eq!(
+                output.stdout,
+                stored.as_bytes(),
+                "show {extra:?} to a pipe keeps ESC, BEL and DEL"
+            );
+        }
+    }
+
+    #[test]
     fn show_past_the_end_exits_64_naming_the_position() {
         let fixture = Fixture::new();
         let output = run(&["show", fixture.mailbox(), "4711"]);

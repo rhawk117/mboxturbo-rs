@@ -13,8 +13,7 @@ use arrow_array::{Array as _, ArrayRef, ListArray, StructArray};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields};
 use mboxturbo_headers::{
     ArcHeader, ArcSet, AuthMethod, AuthenticationResults, ChainValidation, DkimSignature, Issue,
-    RequiredTag, ResInfo, Tag, TagList, TrustSet, TrustStatus, parse_arc_sets,
-    parse_dkim_signature,
+    RequiredTag, ResInfo, Tag, TagList, TrustStatus, parse_arc_sets, parse_dkim_signature,
 };
 pub(crate) use received::{
     MicrosoftAntispamColumn, ReceivedHopsColumn, ReceivedSpfColumn, microsoft_antispam_type,
@@ -22,6 +21,7 @@ pub(crate) use received::{
 };
 
 use crate::fields::{Mail, strip_line_break};
+use crate::pipeline::{ColumnBuilder, Record};
 use crate::verdict::{decide_results, trusted_entry};
 use crate::width::widen;
 
@@ -392,9 +392,22 @@ pub(crate) struct AuthResultsColumn {
 }
 
 impl AuthResultsColumn {
+    /// An empty column.
+    pub(crate) fn new() -> Self {
+        Self {
+            issues: IssueLists::new(),
+            results: ResultsRows::new(),
+            shape: Shape::new(),
+        }
+    }
+}
+
+impl ColumnBuilder for AuthResultsColumn {
     /// Appends the list of every `Authentication-Results` header of `mail`, parsed from its raw
     /// bytes in header order; an unparsed message appends an empty list.
-    pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>, trust: Option<&TrustSet>) {
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail();
+        let trust = record.trust();
         let decided = mail.map_or_else(Vec::new, |parsed| {
             decide_results(mail_headers(parsed), trust)
         });
@@ -410,21 +423,12 @@ impl AuthResultsColumn {
     /// # Errors
     ///
     /// The Arrow error when the nested arrays do not fit [`auth_results_fields`].
-    pub(crate) fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
         let mut columns = self.results.finish_columns()?;
         columns.push(self.issues.finish()?);
         let values = StructArray::try_new(auth_results_fields(), columns, None)?;
         self.shape
             .wrap(struct_item(auth_results_fields()), Arc::new(values))
-    }
-
-    /// An empty column.
-    pub(crate) fn new() -> Self {
-        Self {
-            issues: IssueLists::new(),
-            results: ResultsRows::new(),
-            shape: Shape::new(),
-        }
     }
 }
 
@@ -448,43 +452,6 @@ pub(crate) struct ArcSetsColumn {
 }
 
 impl ArcSetsColumn {
-    /// Appends the ARC sets and chain issues of `mail`, parsed from the raw bytes of its ARC
-    /// headers; an unparsed message appends an empty list of each.
-    pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>, trust: Option<&TrustSet>) {
-        let headers: Vec<ArcHeader<'_>> = mail.into_iter().flat_map(arc_headers).collect();
-        let (sets, issues) = parse_arc_sets(&headers, trust).into_parts();
-        for set in &sets {
-            self.push_set(set);
-        }
-        self.shape.push_list(sets.len());
-        self.issues.push(issues.iter());
-    }
-
-    /// The column, as an Arrow struct array holding the `{sets, issues}` of every message appended.
-    ///
-    /// # Errors
-    ///
-    /// The Arrow error when the nested arrays do not fit [`arc_set_fields`] or
-    /// [`arc_sets_fields`].
-    pub(crate) fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(self.instance.finish()),
-            self.seal.finish()?,
-            self.message_signature.finish()?,
-            self.results.finish_struct()?,
-            Arc::new(self.chain_validation.finish()),
-        ];
-        let values = StructArray::try_new(arc_set_fields(), columns, None)?;
-        let sets = self
-            .shape
-            .wrap(struct_item(arc_set_fields()), Arc::new(values))?;
-        Ok(Arc::new(StructArray::try_new(
-            arc_sets_fields(),
-            vec![sets, self.issues.finish()?],
-            None,
-        )?))
-    }
-
     /// An empty column.
     pub(crate) fn new() -> Self {
         Self {
@@ -515,6 +482,47 @@ impl ArcSetsColumn {
     }
 }
 
+impl ColumnBuilder for ArcSetsColumn {
+    /// Appends the ARC sets and chain issues of `mail`, parsed from the raw bytes of its ARC
+    /// headers; an unparsed message appends an empty list of each.
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail();
+        let trust = record.trust();
+        let headers: Vec<ArcHeader<'_>> = mail.into_iter().flat_map(arc_headers).collect();
+        let (sets, issues) = parse_arc_sets(&headers, trust).into_parts();
+        for set in &sets {
+            self.push_set(set);
+        }
+        self.shape.push_list(sets.len());
+        self.issues.push(issues.iter());
+    }
+
+    /// The column, as an Arrow struct array holding the `{sets, issues}` of every message appended.
+    ///
+    /// # Errors
+    ///
+    /// The Arrow error when the nested arrays do not fit [`arc_set_fields`] or
+    /// [`arc_sets_fields`].
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.instance.finish()),
+            self.seal.finish()?,
+            self.message_signature.finish()?,
+            self.results.finish_struct()?,
+            Arc::new(self.chain_validation.finish()),
+        ];
+        let values = StructArray::try_new(arc_set_fields(), columns, None)?;
+        let sets = self
+            .shape
+            .wrap(struct_item(arc_set_fields()), Arc::new(values))?;
+        Ok(Arc::new(StructArray::try_new(
+            arc_sets_fields(),
+            vec![sets, self.issues.finish()?],
+            None,
+        )?))
+    }
+}
+
 /// Builder of the `dkim_signatures` column.
 #[derive(Debug)]
 pub(crate) struct DkimSignaturesColumn {
@@ -541,44 +549,6 @@ pub(crate) struct DkimSignaturesColumn {
 }
 
 impl DkimSignaturesColumn {
-    /// Appends the list of every `DKIM-Signature` header of `mail`, parsed from its raw bytes in
-    /// header order; an unparsed message appends an empty list.
-    pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>) {
-        let mut len = 0_usize;
-        for value in mail
-            .into_iter()
-            .flat_map(|parsed| raw_values(parsed, DKIM_SIGNATURE))
-        {
-            let (signature, issues) = parse_dkim_signature(value).into_parts();
-            self.push_signature(&signature);
-            self.issues.push(issues.iter());
-            len = len.saturating_add(1);
-        }
-        self.shape.push_list(len);
-    }
-
-    /// The column, as an Arrow array with one list per message appended.
-    ///
-    /// # Errors
-    ///
-    /// The Arrow error when the nested arrays do not fit [`dkim_fields`].
-    pub(crate) fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(self.version.finish()),
-            Arc::new(self.algorithm.finish()),
-            Arc::new(self.body_hash.finish()),
-            Arc::new(self.domain.finish()),
-            Arc::new(self.selector.finish()),
-            Arc::new(self.signature.finish()),
-            Arc::new(self.signed_headers.finish()),
-            self.tags.finish()?,
-            self.issues.finish()?,
-        ];
-        let values = StructArray::try_new(dkim_fields(), columns, None)?;
-        self.shape
-            .wrap(struct_item(dkim_fields()), Arc::new(values))
-    }
-
     /// An empty column.
     pub(crate) fn new() -> Self {
         Self {
@@ -616,6 +586,47 @@ impl DkimSignaturesColumn {
     }
 }
 
+impl ColumnBuilder for DkimSignaturesColumn {
+    /// Appends the list of every `DKIM-Signature` header of `mail`, parsed from its raw bytes in
+    /// header order; an unparsed message appends an empty list.
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail();
+        let mut len = 0_usize;
+        for value in mail
+            .into_iter()
+            .flat_map(|parsed| raw_values(parsed, DKIM_SIGNATURE))
+        {
+            let (signature, issues) = parse_dkim_signature(value).into_parts();
+            self.push_signature(&signature);
+            self.issues.push(issues.iter());
+            len = len.saturating_add(1);
+        }
+        self.shape.push_list(len);
+    }
+
+    /// The column, as an Arrow array with one list per message appended.
+    ///
+    /// # Errors
+    ///
+    /// The Arrow error when the nested arrays do not fit [`dkim_fields`].
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.version.finish()),
+            Arc::new(self.algorithm.finish()),
+            Arc::new(self.body_hash.finish()),
+            Arc::new(self.domain.finish()),
+            Arc::new(self.selector.finish()),
+            Arc::new(self.signature.finish()),
+            Arc::new(self.signed_headers.finish()),
+            self.tags.finish()?,
+            self.issues.finish()?,
+        ];
+        let values = StructArray::try_new(dkim_fields(), columns, None)?;
+        self.shape
+            .wrap(struct_item(dkim_fields()), Arc::new(values))
+    }
+}
+
 /// Builder of one `verdict_*` column.
 #[derive(Debug)]
 pub(crate) struct VerdictColumn {
@@ -626,10 +637,22 @@ pub(crate) struct VerdictColumn {
 }
 
 impl VerdictColumn {
+    /// An empty column reading `method`.
+    pub(crate) fn new(method: AuthMethod<'static>) -> Self {
+        Self {
+            builder: StringBuilder::new(),
+            method,
+        }
+    }
+}
+
+impl ColumnBuilder for VerdictColumn {
     /// Appends the result word of the first `method` entry in the topmost trusted
     /// `Authentication-Results` of `mail` that has one; null when there is none, the message is
     /// unparsed or no trust set was given.
-    pub(crate) fn append(&mut self, mail: Option<&Mail<'_>>, trust: Option<&TrustSet>) {
+    fn append(&mut self, record: &Record<'_>) {
+        let mail = record.mail();
+        let trust = record.trust();
         let decided = mail.map_or_else(Vec::new, |parsed| {
             decide_results(mail_headers(parsed), trust)
         });
@@ -639,16 +662,8 @@ impl VerdictColumn {
     }
 
     /// The column built so far, resetting the builder.
-    pub(crate) fn finish(&mut self) -> ArrayRef {
-        Arc::new(self.builder.finish())
-    }
-
-    /// An empty column reading `method`.
-    pub(crate) fn new(method: AuthMethod<'static>) -> Self {
-        Self {
-            builder: StringBuilder::new(),
-            method,
-        }
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        Ok(Arc::new(self.builder.finish()))
     }
 }
 

@@ -1,7 +1,7 @@
 [project]
 name = "mboxturbo-cli"
 description = "Command-line exporter for large mbox files"
-readme = "../mboxturbo-py/README.md"
+readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "rhawk117", email = "noplaceLike127dot0dot0dot1@proton.me" }]
 requires-python = ">=3.14"

@@ -5,6 +5,8 @@ Rust rewrite of [MboxTurbo](https://github.com/rhawk117/mboxturbo): offset-index
 | Crate | What it is |
 |---|---|
 | `crates/mboxturbo` | Pure Rust core: mmap, SIMD `From ` scan split across rayon threads, fingerprinted, block-verified index mapped beside the mbox, zero-copy two-tier lazy parsing via `mail-parser`, and a columnar pipeline into Arrow batches and Parquet |
+| `crates/mboxturbo-headers` | Total, panic-free parsers for email header values (`Date`, `Received`, `Authentication-Results`, `ARC-*`, `DKIM-Signature`, `Received-SPF`, `X-Microsoft-Antispam`, RFC 2047 encoded words) that report malformed input as issues, never as a panic or an error |
+| `crates/mboxturbo-cli` | The `mboxturbo` command-line exporter for large mbox files; see [its README](crates/mboxturbo-cli/README.md) |
 | `crates/mboxturbo-py` | Thin PyO3 layer (`import mboxturbo`), CPython 3.14 and free-threaded 3.14t |
 
 ## Python
@@ -46,16 +48,36 @@ table = pa.table(selection)
 frame = pl.DataFrame(selection)
 duckdb.sql('select subject, len(received) as hops from selection')
 selection.to_parquet('inbox.parquet', compression='zstd')
+
+from datetime import UTC, datetime
+from mboxturbo import column_names
+
+january = mailbox.select(
+    column_names(group='defaults'),
+    since=datetime(2024, 1, 1, tzinfo=UTC),
+    until=datetime(2024, 2, 1, tzinfo=UTC),
+)
 ```
 
 - `select` returns a reusable selection that any Arrow consumer reads through `__arrow_c_stream__` (verified with pyarrow 26, polars 2.1, DuckDB 2.0, and pandas 3.1 through `DataFrame.from_arrow`). Every read extracts in parallel in Rust; no Python object is created per message.
 - Parsing follows the projection: `position`, `offset` and `size` read only the index, header columns run a header-only parser that skips every header no column needs, and only body or attachment columns pay for the full MIME parse.
-- Columns: `position`, `offset`, `size`, `from`, `to`, `cc`, `reply_to`, `subject`, `date` (UTC, microseconds), `date_offset_minutes`, `message_id`, `received`, `authentication_results`, `received_spf`, `dkim_signature`, `return_path`, `text`, `html`, `attachment_names`, `attachment_types`, `attachment_sizes`, `attachment_sha256`, `header:<Name>` for the raw values of any header, and `raw` (each message's stored bytes, as LargeBinary). With no argument, `select()` takes every column that needs only headers; `raw` is never selected unless named.
+- Columns, in three groups that `mboxturbo.column_names(group=...)` returns (`'defaults'`, `'opt_in'` or `'all'`, the default):
+  - `'defaults'` (what `select()` takes with no argument: every column that needs only headers): `position`, `offset`, `size`, `from`, `to`, `cc`, `reply_to`, `subject`, `date` (UTC, microseconds), `date_offset_minutes`, `message_id`, `received`, `authentication_results`, `received_spf`, `dkim_signature`, `return_path`.
+  - `'opt_in'` (never selected unless named): `raw` (each message's stored bytes, as LargeBinary) and the structured columns `auth_results`, `arc_sets`, `dkim_signatures`, `received_hops`, `received_spf_parsed`, `microsoft_antispam`, `verdict_dmarc`, `verdict_spf`, `verdict_dkim`, `verdict_compauth`; [docs/soc-guide.md](docs/soc-guide.md) describes them.
+  - `'all'` is both groups plus the body and attachment columns that are in neither, which need the full MIME parse and are also never defaulted: `text`, `html`, `attachment_names`, `attachment_types`, `attachment_sizes`, `attachment_sha256`.
+  - `header:<Name>` selects the raw values of any header and is not in any list.
+- `select` also takes `since` and `until` (timezone-aware datetimes; `since <= date < until` on the index date, so an undated message is dropped once either is given), `positions`, `where` and `trust`.
 - `to_parquet` writes atomically while the next batches are extracted on other threads; `compression` is `zstd` (default, level 1), `snappy` or `none`. An existing file raises `FileExistsError` unless `overwrite=True`.
+
+## Command line
+
+`crates/mboxturbo-cli` builds the `mboxturbo` binary (`mboxturbo[cli]` on the Python side). It has three subcommands: `export` writes selected messages and columns to a file, a directory or standard output, `info` prints the message count and the earliest and latest dates, and `show` writes one message's stored bytes. `export --format` takes `csv`, `jsonl`, `arrow` (Arrow IPC), `parquet`, `mbox` and `eml`; `csv`, `jsonl`, `arrow` and `mbox` can stream to standard output with `-o -`, while `parquet` and `eml` (one file per message in a directory) cannot. `--since` and `--until` bound the dates, `--where` filters by predicate and `--json` writes an event stream. Flags, formats and exit codes are in the [CLI README](crates/mboxturbo-cli/README.md); the structured columns are in the [SOC guide](docs/soc-guide.md).
 
 ## Rust
 
 ```rust
+use rayon::prelude::*; // `par_iter` returns a rayon iterator
+
 let mailbox = mboxturbo::Mailbox::open_cached("inbox.mbox", "inbox.mbxidx")?;
 let total_bytes: usize = mailbox.par_iter().map(<[u8]>::len).sum();
 let message = mailbox.message(0).expect("non-empty");
@@ -63,6 +85,29 @@ let received: Vec<_> = message.header_values("Received").collect();
 ```
 
 `Mailbox::open` keeps the index beside the mailbox by default; `MailboxBuilder` picks the policy (`IndexPolicy::Sidecar`, `Path` or `Memory`) and the block size. `Mailbox::date` and `Index::date` return `None` for a message without a parsable `Date` header; a real epoch date is `Some(0)`.
+
+A date window is a `DateBounds` in unix seconds, `since` inclusive and `until` exclusive. `Mailbox::date_range(bounds)` returns the positions inside it and the count of undated messages (which no bound admits), and `Narrowing::dates(bounds)` applies the same window to a filter. The export sinks (`CsvExporter`, `JsonlExporter`, `IpcExporter`, `ParquetExporter`, `MboxExporter`, `EmlExporter`) run through `Export`:
+
+```rust
+use std::sync::Arc;
+use mboxturbo::{
+    Column, Compression, DateBounds, Destination, Export, Mailbox, ParquetExporter, Pipeline,
+};
+
+let mailbox = Arc::new(Mailbox::open("inbox.mbox")?);
+let january = DateBounds::new(Some(1_704_067_200), Some(1_706_745_600));
+let range = mailbox.date_range(january);
+let pipeline = Arc::new(Pipeline::new(Column::defaults(), 8192));
+let summary = Export::new(pipeline, mailbox, Destination::File("inbox.parquet".into()))
+    .selection(range.into())
+    .run(Box::new(
+        ParquetExporter::new(Compression::Zstd).with_row_groups_for_batch_size(8192),
+    ))?;
+```
+
+`with_row_groups_for_batch_size` sizes a row group as 16 batches, so it closes on a batch boundary.
+
+By default an opened mailbox checks each span its index stores against the mapped bytes before handing it out (`BoundaryCheck::Verified`), and a mismatch rebuilds the index. `MailboxBuilder::boundary_check(BoundaryCheck::Trusted)` skips that check, which suits a static archive; if the mailbox is rewritten in place while its index is kept, it returns stale slices with no error.
 
 ## Benchmarks
 
@@ -79,7 +124,7 @@ The index scan runs at about 18 GB/s on two threads from a warm cache. Cold, a b
 
 ## Development
 
-The workspace denies warnings, clippy `all`, `pedantic`, `nursery` and `cargo`, and the whole `restriction` group except the lints that contradict another lint or a convention in `.claude/rules/rust/` (each listed with its reason in `Cargo.toml`). `clippy.toml` holds ruff-parity thresholds and the banned methods; `prek.toml` wires every check. `unsafe` is denied except for the single read-only mmap call.
+The workspace denies warnings, clippy `all`, `pedantic`, `nursery` and `cargo`, and the whole `restriction` group except the lints that contradict another lint or a convention in `.claude/rules/rust/` (each listed with its reason in `Cargo.toml`). `clippy.toml` holds ruff-parity thresholds and the banned methods; `prek.toml` wires every check. `unsafe` is denied except for the single read-only mmap call in `crates/mboxturbo/src/mapping.rs` and one Win32 FFI call (`GenerateConsoleCtrlEvent`) in the CLI's `crates/mboxturbo-cli/tests/console_signals.rs`.
 
 ```sh
 cargo fmt --check
@@ -98,7 +143,7 @@ UV_PROJECT_ENVIRONMENT=.venv-ft uv run -p 3.14t --no-group polars pytest
 ## CI and releases
 
 Workflows follow the same shape as `mightymodels`:
-- `ci.yml` runs on pull requests to `main` and as a reusable workflow. Lint: `uv run prek run --all-files` (rustfmt, clippy, rustdoc, cargo-deny, cargo-machete, ruff, ty, typos, taplo, shellcheck, actionlint, zizmor). Rust: tests. Python on 3.14 and 3.14t: pytest, plus a `pysentry` audit. It also runs the labeler and the workflow narrator.
+- `ci.yml` runs on pull requests to `main` and as a reusable workflow. Lint: `uv run prek run --all-files` (rustfmt, clippy, rustdoc, cargo-deny, cargo-machete, ruff, ty, typos, taplo, shellcheck, actionlint, zizmor). Rust: `cargo test --workspace` and a dry-run package of `mboxturbo-headers`. Python on 3.14 and 3.14t: pytest, plus a `pysentry` audit. CLI: `CLI Extra Install` builds the wheels, installs `mboxturbo[cli]` from them and runs the installed binary, and `CLI Tests` runs `cargo test -p mboxturbo-cli` on Ubuntu, macOS and Windows. It also runs the labeler and the workflow narrator.
 - `cd.yml` (Release) is a manual dispatch from `main` with `recover`, `patch`, `minor` or `major`. It runs CI, then `.github/scripts/release.sh` bumps `pyproject.toml` (the version source of truth) and syncs the Cargo workspace version and both lockfiles. It commits, tags and pushes atomically, builds abi-specific wheels for CPython 3.14 and 3.14t on Linux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, and attaches them to the GitHub Release.
 - `weekly-security-scan.yml` audits the uv lockfile with `pysentry` and Cargo dependencies against RustSec, then opens or updates a tracking issue.
 

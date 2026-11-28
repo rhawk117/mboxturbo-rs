@@ -83,7 +83,7 @@ files = '^crates/.*\.rs$'
 id = "deny-pattern"
 alias = "rust-display-assertion"
 name = "rust-tests.md 3: assert errors by variant, not Display"
-args = ['\.to_string\(\)\s*\.(contains|starts_with|ends_with)\(']
+args = ["--multiline", '\.to_string\(\)\s*\.\s*(contains|starts_with|ends_with)\(']
 files = '^crates/.*\.rs$'
 
 [[repos.hooks]]

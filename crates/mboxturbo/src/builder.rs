@@ -36,6 +36,26 @@ pub enum IndexPolicy {
     Sidecar,
 }
 
+/// Whether a [`Mailbox`] checks the spans its index stores against the mapped bytes.
+///
+/// A saved index is accepted when the mbox's fingerprint (length, modification time and the
+/// first and last 4 KiB) still matches, which a file rewritten in place can survive. With
+/// [`BoundaryCheck::Verified`] every span handed out is checked to start at a message start and
+/// end at one, and a mismatch at either end of a span rebuilds the index. A rewrite that leaves
+/// both ends of every stored span on message starts is not detected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BoundaryCheck {
+    /// Serve the stored spans without reading any mailbox bytes to validate them.
+    ///
+    /// Safe only for a mailbox that is never rewritten in place while its index is kept, such
+    /// as a static archive. Otherwise a rewritten mailbox yields stale slices and no error.
+    Trusted,
+    /// Check each span against the mapped bytes before handing it out. This is the default.
+    #[default]
+    Verified,
+}
+
 /// Where the index a [`Mailbox`] serves came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -79,6 +99,8 @@ impl IndexOrigin {
 pub struct MailboxBuilder {
     /// Block size for an index built by this open.
     block_size: BlockSize,
+    /// Whether the opened mailbox checks stored spans against the mapped bytes.
+    check: BoundaryCheck,
     /// Where the index is kept.
     policy: IndexPolicy,
 }
@@ -89,6 +111,16 @@ impl MailboxBuilder {
     #[must_use]
     pub const fn block_size(mut self, size: BlockSize) -> Self {
         self.block_size = size;
+        self
+    }
+
+    /// Chooses whether the opened mailbox checks the spans its index stores against the mapped
+    /// bytes. The default is [`BoundaryCheck::Verified`]; [`BoundaryCheck::Trusted`] skips the
+    /// check for a static archive and returns stale slices, with no error, if the mailbox is
+    /// rewritten in place while its index is kept.
+    #[must_use]
+    pub const fn boundary_check(mut self, check: BoundaryCheck) -> Self {
+        self.check = check;
         self
     }
 
@@ -119,14 +151,15 @@ impl MailboxBuilder {
     {
         let mbox = path.as_ref();
         let mapped = Mapped::open(mbox)?;
-        match &self.policy {
+        let opened = match &self.policy {
             IndexPolicy::Memory => {
                 let index = mapped.build(self.block_size);
                 Ok(mapped.with_index(index, IndexSource::Memory, IndexOrigin::Rebuilt))
             },
             IndexPolicy::Path(index_path) => self.open_at(mapped, index_path),
             IndexPolicy::Sidecar => self.open_sidecar(mapped, mbox),
-        }
+        };
+        opened.map(|mailbox| mailbox.checking(self.check))
     }
 
     /// Serves the index at `index_path`, rebuilding and saving it when it is missing or stale;

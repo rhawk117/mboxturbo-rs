@@ -739,6 +739,7 @@ dependencies = [
  "arrow-schema",
  "base64",
  "mail-parser",
+ "mboxturbo",
  "mboxturbo-headers",
  "memchr",
  "memmap2",

@@ -20,7 +20,7 @@ const ROW_GROUP_BATCHES: usize = 16;
 
 /// Writes the exported columns as one Parquet file.
 ///
-/// Accepts a file or a stream destination and refuses a directory. The file holds one column
+/// Accepts a file and refuses a directory or a stream. The file holds one column
 /// per selected [`Column`](crate::Column), in order, with the Arrow schema embedded, so it reads
 /// back with the same types the pipeline produced. Dictionary encoding is off and statistics are
 /// kept per column chunk.
@@ -58,13 +58,6 @@ impl ParquetExporter {
         }
     }
 
-    /// The same sink with row groups of 16 batches of `batch_size` rows each, so a row group
-    /// closes on a batch boundary.
-    #[must_use]
-    pub fn with_row_group_batches(self, batch_size: usize) -> Self {
-        self.with_row_group_rows(batch_size.saturating_mul(ROW_GROUP_BATCHES))
-    }
-
     /// The same sink with row groups of at most `rows` rows (at least one); the default is
     /// 131072.
     #[must_use]
@@ -72,11 +65,18 @@ impl ParquetExporter {
         self.row_group_rows = rows.max(1);
         self
     }
+
+    /// The same sink with row groups of 16 batches of `batch_size` rows each, so a row group
+    /// closes on a batch boundary.
+    #[must_use]
+    pub fn with_row_groups_for_batch_size(self, batch_size: usize) -> Self {
+        self.with_row_group_rows(batch_size.saturating_mul(ROW_GROUP_BATCHES))
+    }
 }
 
 impl Exporter for ParquetExporter {
     fn accepts(&self, kind: DestinationKind) -> bool {
-        kind != DestinationKind::Directory
+        kind == DestinationKind::File
     }
 
     fn begin(&mut self, schema: &SchemaRef, staged: &mut Staged) -> Result<(), MboxTurboError> {
@@ -127,10 +127,14 @@ fn parquet_compression(compression: Compression) -> ParquetCompression {
     }
 }
 
-/// A Parquet failure on the destination `staged` writes to.
+/// A Parquet failure on the destination `staged` writes to: [`MboxTurboError::Parquet`] naming
+/// the file, or the refusal of a stream, which this sink does not accept and has no path to name.
 fn parquet_failure(staged: &Staged, source: ParquetError) -> MboxTurboError {
-    MboxTurboError::Parquet {
-        path: staged.target_label().to_path_buf(),
-        source,
-    }
+    staged.target().map_or_else(
+        || staged.unsupported(),
+        |path| MboxTurboError::Parquet {
+            path: path.to_path_buf(),
+            source,
+        },
+    )
 }

@@ -6,7 +6,7 @@ mod mailbox {
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use std::{fs, thread};
 
     use arrow_array::cast::AsArray as _;
@@ -14,8 +14,8 @@ mod mailbox {
     #[cfg(unix)]
     use mboxturbo::IndexSource;
     use mboxturbo::{
-        Column, Corruption, IndexOrigin, IndexPolicy, Mailbox, MailboxBuilder, MboxTurboError,
-        Message, Pipeline, Selection,
+        BoundaryCheck, Column, Corruption, DateBounds, IndexOrigin, IndexPolicy, Mailbox,
+        MailboxBuilder, MboxTurboError, Message, Pipeline, Selection,
     };
     use rayon::prelude::*;
     use tempfile::TempDir;
@@ -320,7 +320,7 @@ body\n\n";
     #[test]
     fn a_date_range_includes_since_and_excludes_until_at_the_exact_second() {
         let (_directory, mailbox) = mixed();
-        let range = mailbox.date_range(Some(MIDNIGHT), Some(MIDNIGHT + 1));
+        let range = mailbox.date_range(DateBounds::new(Some(MIDNIGHT), Some(MIDNIGHT + 1)));
         assert_eq!(
             range.positions,
             vec![1],
@@ -330,13 +330,13 @@ body\n\n";
             range.undated, 2,
             "a missing and an unparsable Date are undated"
         );
-        let wider = mailbox.date_range(Some(MIDNIGHT - 1), Some(MIDNIGHT + 2));
+        let wider = mailbox.date_range(DateBounds::new(Some(MIDNIGHT - 1), Some(MIDNIGHT + 2)));
         assert_eq!(
             wider.positions,
             vec![0, 1, 2],
             "one second wider on both sides"
         );
-        let next = mailbox.date_range(Some(MIDNIGHT + 1), Some(MIDNIGHT + 2));
+        let next = mailbox.date_range(DateBounds::new(Some(MIDNIGHT + 1), Some(MIDNIGHT + 2)));
         assert_eq!(
             next.positions,
             vec![2],
@@ -348,16 +348,20 @@ body\n\n";
     fn an_open_bound_leaves_that_side_unlimited() {
         let (_directory, mailbox) = mixed();
         assert_eq!(
-            mailbox.date_range(Some(MIDNIGHT), None).positions,
+            mailbox
+                .date_range(DateBounds::new(Some(MIDNIGHT), None))
+                .positions,
             vec![1, 2],
             "since alone"
         );
         assert_eq!(
-            mailbox.date_range(None, Some(MIDNIGHT)).positions,
+            mailbox
+                .date_range(DateBounds::new(None, Some(MIDNIGHT)))
+                .positions,
             vec![0],
             "until alone"
         );
-        let unbounded = mailbox.date_range(None, None);
+        let unbounded = mailbox.date_range(DateBounds::new(None, None));
         assert_eq!(
             unbounded.positions,
             vec![0, 1, 2, 3, 4],
@@ -370,7 +374,7 @@ body\n\n";
     fn since_at_or_past_until_selects_nothing() {
         let (_directory, mailbox) = mixed();
         for until in [MIDNIGHT, MIDNIGHT - 1] {
-            let range = mailbox.date_range(Some(MIDNIGHT), Some(until));
+            let range = mailbox.date_range(DateBounds::new(Some(MIDNIGHT), Some(until)));
             assert!(range.positions.is_empty(), "since {MIDNIGHT} until {until}");
             assert_eq!(range.undated, 2, "undated is reported for an empty range");
         }
@@ -384,11 +388,11 @@ body\n\n";
             (None, Some(MIDNIGHT)),
             (Some(0), Some(MIDNIGHT)),
         ] {
-            let range = mailbox.date_range(since, until);
+            let range = mailbox.date_range(DateBounds::new(since, until));
             assert!(range.positions.is_empty(), "bounds {since:?}..{until:?}");
             assert_eq!(range.undated, 3, "bounds {since:?}..{until:?}");
         }
-        let unbounded = mailbox.date_range(None, None);
+        let unbounded = mailbox.date_range(DateBounds::new(None, None));
         assert_eq!(unbounded.positions, vec![0, 1, 2], "no bound returns all");
         assert_eq!(unbounded.undated, 3, "all three are undated");
     }
@@ -396,7 +400,7 @@ body\n\n";
     #[test]
     fn a_date_range_selects_exactly_its_messages_through_the_pipeline() {
         let (_directory, mailbox) = mixed();
-        let range = mailbox.date_range(Some(MIDNIGHT - 1), Some(MIDNIGHT + 1));
+        let range = mailbox.date_range(DateBounds::new(Some(MIDNIGHT - 1), Some(MIDNIGHT + 1)));
         assert_eq!(range.positions, vec![0, 1], "the range under test");
         let pipeline = Arc::new(Pipeline::new(vec![Column::Position, Column::Subject], 10));
         let batch = pipeline
@@ -575,6 +579,177 @@ body\n\n";
         );
         let reloaded = fixture.cached();
         assert_eq!(reloaded.index(), mailbox.index(), "rewritten cache matches");
+    }
+
+    /// A mailbox of 120 messages, about 24 KiB, so that the middle lies outside the 4 KiB head
+    /// and tail the fingerprint samples.
+    fn long_mailbox() -> String {
+        let mut contents = String::new();
+        for number in 0_u32..120 {
+            let body = "x".repeat(150);
+            write!(
+                contents,
+                "From a@x Mon Jan  1 00:00:00 2024\nSubject: {number:04}\n\n{body}\n"
+            )
+            .expect("writing to a string cannot fail");
+        }
+        contents
+    }
+
+    /// Overwrites `mbox` with `contents` and sets its modification time back to `modified`.
+    fn rewrite_in_place(mbox: &Path, contents: &[u8], modified: SystemTime) {
+        fs::write(mbox, contents).expect("the mailbox is rewritten in place");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(mbox)
+            .and_then(|file| file.set_modified(modified))
+            .expect("the modification time is restored");
+    }
+
+    /// Review finding MV-1: a mailbox rewritten in place with the length, the modification time
+    /// and the first and last 4 KiB unchanged keeps its fingerprint, so its saved index loads.
+    /// Returns the fixture, the rewritten bytes and the index file as saved before the rewrite.
+    fn moved_in_place() -> (Fixture, Vec<u8>, Vec<u8>) {
+        let original = long_mailbox();
+        let marker = original
+            .match_indices("From a@x")
+            .nth(60)
+            .map(|(offset, _)| offset)
+            .expect("the fixture holds more than sixty messages");
+        let earlier = marker.saturating_sub(50);
+        let mut rewritten = original.clone().into_bytes();
+        rewritten[marker..][..4].copy_from_slice(b"Xrom");
+        rewritten[earlier..][..6].copy_from_slice(b"\nFrom ");
+        let fixture = Fixture::holding(original.as_bytes());
+        assert_eq!(
+            fixture.cached().len(),
+            120,
+            "the saved index holds every message"
+        );
+        let saved = fs::read(&fixture.index).expect("the saved index reads back");
+        let modified = fs::metadata(&fixture.mbox)
+            .and_then(|metadata| metadata.modified())
+            .expect("the modification time is readable");
+        rewrite_in_place(&fixture.mbox, &rewritten, modified);
+        (fixture, rewritten, saved)
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_position() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.index_origin(),
+            IndexOrigin::Loaded,
+            "the unchanged fingerprint lets the stale index load"
+        );
+        let positions = 0..=reference.len();
+        assert_eq!(
+            positions
+                .clone()
+                .map(|position| mailbox.raw(position))
+                .collect::<Vec<_>>(),
+            positions
+                .map(|position| reference.raw(position))
+                .collect::<Vec<_>>(),
+            "every position answers as a mailbox with no saved index does"
+        );
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_iteration() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "iteration answers as a mailbox with no saved index does"
+        );
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_reverse_iteration() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.iter().rev().collect::<Vec<_>>(),
+            reference.iter().rev().collect::<Vec<_>>(),
+            "a backward walk checks the start it does not share with the row after it"
+        );
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_parallel_iteration() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.par_iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "each parallel split checks the first start it crosses"
+        );
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_rewrites_the_index() {
+        let (fixture, _rewritten, saved) = moved_in_place();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.iter().count(),
+            120,
+            "one separator moved, so the message count is unchanged"
+        );
+        assert_ne!(
+            fs::read(&fixture.index).expect("the index file is still readable"),
+            saved,
+            "the mismatch rewrote the saved index"
+        );
+    }
+
+    #[test]
+    fn a_trusting_builder_serves_the_stored_spans_and_leaves_the_index_unrewritten() {
+        let (fixture, rewritten, saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = MailboxBuilder::new()
+            .index(IndexPolicy::Path(fixture.index.clone()))
+            .boundary_check(BoundaryCheck::Trusted)
+            .open(&fixture.mbox)
+            .expect("the fixture opens with trusted boundaries");
+        assert_eq!(mailbox.iter().count(), 120, "the stored spans are served");
+        assert_ne!(
+            mailbox.iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "the stale spans are not corrected"
+        );
+        assert_eq!(
+            fs::read(&fixture.index).expect("the index file is still readable"),
+            saved,
+            "no mismatch was seen, so the saved index is untouched"
+        );
+    }
+
+    #[test]
+    fn a_verifying_builder_checks_boundaries_as_the_default_does() {
+        let (fixture, rewritten, saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = MailboxBuilder::new()
+            .index(IndexPolicy::Path(fixture.index.clone()))
+            .boundary_check(BoundaryCheck::Verified)
+            .open(&fixture.mbox)
+            .expect("the fixture opens with verified boundaries");
+        assert_eq!(
+            mailbox.iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "iteration answers as a mailbox with no saved index does"
+        );
+        assert_ne!(
+            fs::read(&fixture.index).expect("the index file is still readable"),
+            saved,
+            "the mismatch rewrote the saved index"
+        );
     }
 
     fn sidecar_of(fixture: &Fixture) -> PathBuf {

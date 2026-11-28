@@ -20,6 +20,7 @@
 mod builder;
 mod columns;
 mod csv_sink;
+mod date_bounds;
 mod eml_sink;
 mod encode;
 mod error;
@@ -46,9 +47,10 @@ mod structured;
 mod verdict;
 mod width;
 
-pub use builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
-pub use columns::Column;
+pub use builder::{BoundaryCheck, IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
+pub use columns::{Column, UnknownColumn};
 pub use csv_sink::{CsvExporter, FormulaEscaping};
+pub use date_bounds::DateBounds;
 pub use eml_sink::EmlExporter;
 pub use error::{Corruption, MboxTurboError, PredicateFault};
 pub use export::{CancelToken, Export, Exporter, Progress};

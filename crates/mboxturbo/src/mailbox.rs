@@ -8,7 +8,8 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
+use crate::builder::{BoundaryCheck, IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
+use crate::date_bounds::DateBounds;
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
@@ -17,6 +18,39 @@ use crate::mapping::map_read_only;
 use crate::message::Message;
 use crate::selection::Selection;
 
+/// The line that opens every message.
+const SEPARATOR: &[u8; 5] = b"From ";
+
+/// The line feed that ends a message followed by the separator of the next one: the six bytes
+/// around every message start but the first.
+const SEPARATOR_AFTER_LINE: &[u8; 6] = b"\nFrom ";
+
+/// A span no boundary of a mapping can fall on, for a check with no boundary already checked:
+/// every offset of a mapping is below `isize::MAX`.
+const NONE_CHECKED: Range<usize> = usize::MAX..usize::MAX;
+
+/// An index cursor for a walk over rows, with the span of the row it handed out last.
+///
+/// Both ends of that span were checked against the mapped bytes, or answered by a rebuild, so
+/// the next row, forwards or backwards, checks only the boundary it does not share with it.
+#[derive(Debug)]
+struct Walk<'index> {
+    /// The span of the last row handed out, or [`NONE_CHECKED`] before the first.
+    checked: Range<usize>,
+    /// The cursor answering each row's span from this mailbox's index.
+    cursor: Cursor<'index>,
+}
+
+impl<'index> Walk<'index> {
+    /// A walk with no row handed out yet.
+    const fn new(cursor: Cursor<'index>) -> Self {
+        Self {
+            checked: NONE_CHECKED,
+            cursor,
+        }
+    }
+}
+
 /// An mbox file mapped read-only, with the byte offset of every message.
 ///
 /// The file must not be modified or truncated while the mailbox, or any [`Message`] taken
@@ -24,6 +58,8 @@ use crate::selection::Selection;
 /// this crate only ever replaces by renaming a new file over it.
 #[derive(Debug)]
 pub struct Mailbox {
+    /// Whether stored spans are checked against `contents` before they are handed out.
+    check: BoundaryCheck,
     /// The read-only mapping, shared with every [`Message`] taken from this mailbox.
     contents: Arc<Mmap>,
     /// Start offsets of the messages within `contents`.
@@ -131,16 +167,35 @@ impl Mapped {
             index,
             source,
             origin,
+            check: BoundaryCheck::Verified,
         }
     }
 }
 
 impl Mailbox {
+    /// `span` as a span whose ends were checked: itself when it lies inside the mapping, which
+    /// [`Mailbox::on_boundaries`] reads, else [`NONE_CHECKED`], since a span past the end
+    /// passes that check unread.
+    #[inline]
+    fn as_checked(&self, span: &Range<usize>) -> Range<usize> {
+        if span.end <= self.contents.len() {
+            span.clone()
+        } else {
+            NONE_CHECKED
+        }
+    }
+
     /// The bytes of `span`, or an empty span and slice when the index has no span inside the
     /// file contents.
     fn bounded(&self, span: Option<Range<usize>>) -> (Range<usize>, &[u8]) {
         span.and_then(|inside| Some((inside.clone(), self.contents.get(inside)?)))
             .unwrap_or((0..0, &[]))
+    }
+
+    /// This mailbox with its stored spans checked, or not, as `check` says.
+    pub(crate) const fn checking(mut self, check: BoundaryCheck) -> Self {
+        self.check = check;
+        self
     }
 
     /// Narrows `positions` to the messages that exist. A range that starts past the end becomes
@@ -150,9 +205,26 @@ impl Mailbox {
         positions.start.min(end)..end
     }
 
-    /// [`Mailbox::row`] with the span answered by `cursor`, which must walk this mailbox's index.
-    fn cursor_row(&self, cursor: &mut Cursor<'_>, position: usize) -> (Range<usize>, &[u8]) {
-        self.bounded(cursor.span(position))
+    /// `span`, the index's answer for `position`, when it still sits on message boundaries of
+    /// the mapped bytes; an end of `checked` counts as one without being read again. Otherwise
+    /// the file was rewritten under an index that its fingerprint still accepted, so the index
+    /// is rebuilt and answers again from the rescan.
+    #[inline]
+    fn confirmed(
+        &self,
+        position: usize,
+        span: Option<Range<usize>>,
+        checked: &Range<usize>,
+    ) -> Option<Range<usize>> {
+        let inside = span?;
+        if self.check == BoundaryCheck::Trusted
+            || self.on_boundaries(&inside, checked)
+            || self.index.is_rebuilt()
+        {
+            return Some(inside);
+        }
+        self.index.force_rebuild();
+        self.index.span(position)
     }
 
     /// Unix seconds of the Date header of the message at `position`, as the index recorded it,
@@ -165,15 +237,15 @@ impl Mailbox {
     /// The positions of the messages whose index date `d` satisfies `since <= d < until`, in
     /// ascending order, and the number of messages with no index date.
     ///
-    /// Bounds are unix seconds, inclusive for `since` and exclusive for `until`; `None` leaves
-    /// that side open. Both bounds with `since >= until` select nothing. A message without an
+    /// The bounds are unix seconds, inclusive for `since` and exclusive for `until`; an open
+    /// side has no limit. Both bounds with `since >= until` select nothing. A message without an
     /// index date (no Date header, or one that did not parse) matches no bound, so it is
     /// excluded whenever either bound is given; with neither, every position is returned.
     /// [`DateRange::undated`] counts those messages in every case. Only the index is read,
     /// never the message bytes.
     #[must_use]
-    pub fn date_range(&self, since: Option<i64>, until: Option<i64>) -> DateRange {
-        self.dates_among(0..self.len(), since, until)
+    pub fn date_range(&self, bounds: DateBounds) -> DateRange {
+        self.dates_among(0..self.len(), bounds)
     }
 
     /// [`Mailbox::date_range`] over `candidates`, which must all be below the mailbox length:
@@ -181,10 +253,8 @@ impl Mailbox {
     pub(crate) fn dates_among(
         &self,
         candidates: impl IntoIterator<Item = usize>,
-        since: Option<i64>,
-        until: Option<i64>,
+        bounds: DateBounds,
     ) -> DateRange {
-        let unbounded = since.is_none() && until.is_none();
         let mut range = DateRange {
             positions: Vec::new(),
             undated: 0,
@@ -193,12 +263,9 @@ impl Mailbox {
             let kept = self.date(position).map_or_else(
                 || {
                     range.undated = range.undated.saturating_add(1);
-                    unbounded
+                    bounds.is_unbounded()
                 },
-                |date| {
-                    since.is_none_or(|bound| bound <= date)
-                        && until.is_none_or(|bound| date < bound)
-                },
+                |date| bounds.admits(date),
             );
             if kept {
                 range.positions.push(position);
@@ -207,7 +274,7 @@ impl Mailbox {
         range
     }
 
-    /// The message index.
+    /// The index this mailbox serves lookups from, rebuilt in place when a block fails its checks.
     #[must_use]
     pub const fn index(&self) -> &Index {
         &self.index
@@ -240,14 +307,29 @@ impl Mailbox {
         self.index.is_empty()
     }
 
+    /// Whether `offset` is where a message starts: the first byte or the one after a line feed,
+    /// with a `From ` separator there.
+    #[inline]
+    fn is_start(&self, offset: usize) -> bool {
+        offset.checked_sub(1).map_or_else(
+            || self.contents.starts_with(SEPARATOR),
+            |before| {
+                self.contents
+                    .get(before..)
+                    .is_some_and(|line| line.starts_with(SEPARATOR_AFTER_LINE))
+            },
+        )
+    }
+
     /// Raw bytes of every message, in file order.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
-        let mut cursor = self.index.cursor();
-        (0..self.len()).map(move |position| self.cursor_row(&mut cursor, position).1)
+        let mut walk = Walk::new(self.index.cursor());
+        (0..self.len()).map(move |position| self.walk_row(&mut walk, position).1)
     }
 
-    /// Number of messages.
+    /// The number of messages in the mailbox: the count the index recorded, or the rebuild's count
+    /// once a rebuild ran.
     #[must_use]
     pub fn len(&self) -> usize {
         self.index.len()
@@ -256,10 +338,23 @@ impl Mailbox {
     /// The message at `position`, parsed lazily on first field access.
     #[must_use]
     pub fn message(&self, position: usize) -> Option<Message> {
-        Some(Message::new(
-            Arc::clone(&self.contents),
-            self.index.span(position)?,
-        ))
+        let span = self.confirmed(position, self.index.span(position), &NONE_CHECKED)?;
+        Some(Message::new(Arc::clone(&self.contents), span))
+    }
+
+    /// Whether `span` starts at a message start and ends at one or at the end of the mapping.
+    /// An offset that is an end of `checked`, a span whose ends were both checked already, is
+    /// taken as a boundary without reading it. A span outside the mapping passes, because
+    /// [`Mailbox::bounded`] already turns it into an empty message.
+    #[inline]
+    fn on_boundaries(&self, span: &Range<usize>, checked: &Range<usize>) -> bool {
+        let length = self.contents.len();
+        if span.end > length {
+            return true;
+        }
+        let known = |offset: usize| offset == checked.start || offset == checked.end;
+        (known(span.start) || self.is_start(span.start))
+            && (span.end == length || known(span.end) || self.is_start(span.end))
     }
 
     /// Maps the mbox at `path` and serves its index from the sidecar file `<path>.mbxidx`
@@ -302,8 +397,8 @@ impl Mailbox {
     #[must_use]
     pub fn par_iter(&self) -> impl IndexedParallelIterator<Item = &[u8]> {
         (0..self.len()).into_par_iter().map_init(
-            || self.index.cursor(),
-            |cursor, position| self.cursor_row(cursor, position).1,
+            || Walk::new(self.index.cursor()),
+            |walk, position| self.walk_row(walk, position).1,
         )
     }
 
@@ -346,7 +441,8 @@ impl Mailbox {
     /// Raw bytes of the message at `position`, including its `From ` separator line.
     #[must_use]
     pub fn raw(&self, position: usize) -> Option<&[u8]> {
-        self.contents.get(self.index.span(position)?)
+        self.contents
+            .get(self.confirmed(position, self.index.span(position), &NONE_CHECKED)?)
     }
 
     /// The span and raw bytes of the message at `position`, which must be below `len()`.
@@ -357,7 +453,7 @@ impl Mailbox {
     /// mailbox holds. Such a position yields an empty span at 0 and an empty slice, so iterators
     /// sized from the claimed count still end without a panic.
     fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
-        self.bounded(self.index.span(position))
+        self.bounded(self.confirmed(position, self.index.span(position), &NONE_CHECKED))
     }
 
     /// The span and raw bytes of every message in `positions`, clamped to the messages that
@@ -375,11 +471,22 @@ impl Mailbox {
         &self,
         positions: Range<usize>,
     ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
-        let mut cursor = self.index.cursor();
+        let mut walk = Walk::new(self.index.cursor());
         self.clamped(positions).map(move |position| {
-            let (span, raw) = self.cursor_row(&mut cursor, position);
+            let (span, raw) = self.walk_row(&mut walk, position);
             (position, span, raw)
         })
+    }
+
+    /// [`Mailbox::row`] with the span answered by `walk`'s cursor, which must walk this
+    /// mailbox's index, checking only the boundary the row does not share with `walk`'s last.
+    #[inline]
+    fn walk_row(&self, walk: &mut Walk<'_>, position: usize) -> (Range<usize>, &[u8]) {
+        let span = self.confirmed(position, walk.cursor.span(position), &walk.checked);
+        walk.checked = span
+            .as_ref()
+            .map_or(NONE_CHECKED, |inside| self.as_checked(inside));
+        self.bounded(span)
     }
 }
 

@@ -35,6 +35,12 @@ subprocess.run([binary, "info", "mail.mbox"], check=True)
 
 <!-- Source: crates/mboxturbo-py/src/mboxturbo/_bin.py and crates/mboxturbo-py/tests/integration/packaging/test_find_bin.py. -->
 
+## Index sidecar
+
+`export`, `info` and `show` each create an index file named `<mailbox>.mbxidx` beside the mailbox (`mail.mbox` gets `mail.mbox.mbxidx`), even a read-only command such as `info`, unless `--index <PATH>` places it elsewhere. An existing sidecar is reused while it matches the mailbox. It is trusted only when it is a regular file owned by the same user as the mailbox file; a symlink, FIFO, directory or socket is refused without being opened, and a regular file owned by someone else is refused once its owner is checked. A refused sidecar is not used and is replaced by a rebuilt index. A sidecar that is stale or damaged is rebuilt. When the mailbox's directory cannot be written, nothing is left behind and the index is held in memory for that run. With `--index <PATH>`, a failed write of that file is an error instead.
+
+<!-- Source: crates/mboxturbo-cli/src/open.rs:14-18 (Sidecar by default, Path with --index), crates/mboxturbo/src/builder.rs:10-37 and 183-200 (name, trust rule, rebuild, in-memory fallback), crates/mboxturbo/src/index/trust.rs:20-36, 136, 163-165 and 177-187 (refusals, owner rule), and crates/mboxturbo-cli/src/{export,info,show}.rs (all call open). -->
+
 ## Commands and flags
 
 ```text
@@ -152,7 +158,7 @@ mboxturbo show [OPTIONS] <MAILBOX> <POSITION>
 
 <!-- Source: ./target/debug/mboxturbo show --help -->
 
-Writes one message's stored bytes to standard output, `From ` separator line included. `<POSITION>` is 0-based. A position at or past the message count exits 64. Flags: `--index <PATH>`, plus the global flags. `--json` cannot be combined with `show`, because standard output carries the message. It exits 64 with one `error` event and no message bytes.
+Writes one message's stored bytes to standard output, `From ` separator line included. `<POSITION>` is 0-based. A position at or past the message count exits 64. When standard output is a terminal, ESC, DEL, every other control byte below 0x20 except tab, line feed and carriage return, every C1 control character (U+0080 to U+009F) and every byte that is not valid UTF-8 are written as visible `\xNN` escapes, one per byte, so a hostile message cannot drive the terminal. Valid non-ASCII text is written unchanged. When standard output is a pipe or a file, the bytes are written unchanged. `--raw` writes the exact stored bytes whatever standard output is. Flags: `--index <PATH>`, `--raw`, plus the global flags. `--json` cannot be combined with `show`, because standard output carries the message. It exits 64 with one `error` event and no message bytes.
 
 ```console
 $ mboxturbo show mail.mbox 1
@@ -383,7 +389,7 @@ The output of `mboxturbo info`. `earliest` and `latest` are RFC 3339 UTC strings
 The run failed. It is the last line of a failed run. `code` is the process exit code and `message` is the line written to standard error.
 
 ```json
-{"code":64,"event":"error","message":"mboxturbo: unknown column `bogus`","v":1}
+{"code":64,"event":"error","message":"mboxturbo: unknown column 'bogus'; expected one of position, offset, size, raw, from, to, cc, reply_to, subject, date, date_offset_minutes, message_id, received, authentication_results, received_spf, dkim_signature, return_path, text, html, attachment_names, attachment_types, attachment_sizes, attachment_sha256, auth_results, arc_sets, dkim_signatures, received_hops, received_spf_parsed, microsoft_antispam, verdict_dmarc, verdict_spf, verdict_dkim, verdict_compauth, or header:<Name>","v":1}
 ```
 
 <!-- Source: ran the built binary with --json export --columns bogus; crates/mboxturbo-cli/tests/json.rs (a_usage_error_before_the_mailbox_opens_is_only_an_error_event). -->

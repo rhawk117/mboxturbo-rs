@@ -29,7 +29,7 @@ GUIDE_COLUMNS = (
 
 
 def opt_in_names() -> set[str]:
-    return set(mboxturbo.column_names(opt_in=True))
+    return set(mboxturbo.column_names(group='opt_in'))
 
 
 class TestGuide:
@@ -38,6 +38,7 @@ class TestGuide:
         assert blocks
         namespace: dict[str, object] = {'__name__': 'soc_guide'}
         for block in blocks:
+            # Runs only the fenced Python blocks of the repo's own docs/soc-guide.md.
             exec(compile(block, str(GUIDE), 'exec'), namespace)  # noqa: S102
 
     @pytest.mark.parametrize('column', GUIDE_COLUMNS)

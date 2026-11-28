@@ -2,22 +2,19 @@
 //! record batches, and stream them to a consumer. See [`Export`](crate::Export) and
 //! [`ParquetExporter`](crate::ParquetExporter) for files.
 
-use std::borrow::Cow;
+mod slots;
+
 use std::cell::OnceCell;
-#[cfg(test)]
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::builder::{
-    Int32Builder, LargeBinaryBuilder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
-    UInt64Builder,
-};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
-use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
-use mboxturbo_headers::{AuthMethod, TrustSet};
-use sha2::{Digest as _, Sha256};
+use mail_parser::{HeaderForm, HeaderName, MessageParser};
+use mboxturbo_headers::TrustSet;
+pub(crate) use slots::ColumnBuilder;
+use slots::column_builder;
 
 use crate::columns::Column;
 use crate::error::MboxTurboError;
@@ -28,11 +25,6 @@ use crate::mailbox::Mailbox;
 use crate::message::Timestamp;
 use crate::selection::{Plan, Selection};
 use crate::stream::Ordered;
-use crate::structured::{
-    ArcSetsColumn, AuthResultsColumn, DkimSignaturesColumn, MicrosoftAntispamColumn,
-    ReceivedHopsColumn, ReceivedSpfColumn, VerdictColumn,
-};
-use crate::width::widen;
 
 /// Parquet page compression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,7 +78,7 @@ trait Probe: Debug + Send + Sync {
 }
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
-struct Record<'mail> {
+pub(crate) struct Record<'mail> {
     /// The `Date` header, read from `raw` on first use so two date columns share one read.
     date: OnceCell<Option<Timestamp>>,
     /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
@@ -102,10 +94,20 @@ struct Record<'mail> {
     trust: Option<&'mail TrustSet>,
 }
 
-impl Record<'_> {
+impl<'mail> Record<'mail> {
     /// The message's `Date` header, read from the raw bytes at most once.
     fn date(&self) -> Option<Timestamp> {
         *self.date.get_or_init(|| fields::date(self.raw))
+    }
+
+    /// The parsed message, or `None` when no column needs parsing or the parser rejected it.
+    pub(crate) const fn mail(&self) -> Option<&'mail Mail<'mail>> {
+        self.mail
+    }
+
+    /// The trust set of the pipeline, if it has one.
+    pub(crate) const fn trust(&self) -> Option<&'mail TrustSet> {
+        self.trust
     }
 }
 
@@ -152,10 +154,10 @@ impl Pipeline {
         runs: &[Range<usize>],
     ) -> Result<RecordBatch, MboxTurboError> {
         let rows = runs.iter().map(Range::len).fold(0, usize::saturating_add);
-        let mut slots: Vec<Slot> = self
+        let mut builders: Vec<Box<dyn ColumnBuilder>> = self
             .columns
             .iter()
-            .map(|column| Slot::new(column, rows))
+            .map(|column| column_builder(column, rows))
             .collect();
         for (position, span, raw) in runs.iter().flat_map(|run| mailbox.rows(run.clone())) {
             let parsed = self.parse(raw);
@@ -167,13 +169,13 @@ impl Pipeline {
                 mail: parsed.as_ref(),
                 trust: self.trust.as_deref(),
             };
-            for slot in &mut slots {
-                slot.append(&record);
+            for builder in &mut builders {
+                builder.append(&record);
             }
         }
-        let batch = slots
+        let batch = builders
             .iter_mut()
-            .map(Slot::finish)
+            .map(|builder| builder.finish())
             .collect::<Result<Vec<ArrayRef>, ArrowError>>()
             .and_then(|arrays| RecordBatch::try_new(self.schema(), arrays));
         batch.map_err(|source| MboxTurboError::Arrow {
@@ -318,273 +320,6 @@ impl RecordBatchReader for BatchReader {
     }
 }
 
-/// Typed column builder for one selected column; each message appends exactly one entry per slot.
-#[derive(Debug)]
-enum Slot {
-    /// Email addresses of one address header; an absent header gives an empty list.
-    Addresses(AddressHeader, ListBuilder<StringBuilder>),
-    /// ARC sets parsed from the ARC headers.
-    ArcSets(Box<ArcSetsColumn>),
-    /// One of the attachment list columns.
-    Attachments(AttachmentSlot),
-    /// Parsed `Authentication-Results` headers.
-    AuthResults(Box<AuthResultsColumn>),
-    /// Date as UTC microseconds, null when absent or invalid.
-    Date(TimestampMicrosecondBuilder),
-    /// Minutes east of UTC from the Date header, null when absent or invalid.
-    DateOffset(Int32Builder),
-    /// Parsed `DKIM-Signature` headers.
-    DkimSignatures(Box<DkimSignaturesColumn>),
-    /// First value of the named header (matched in any case), null when absent.
-    FirstHeaderValue(String, StringBuilder),
-    /// Every value of the named header (matched in any case); empty list when absent.
-    HeaderValues(String, ListBuilder<StringBuilder>),
-    /// HTML bodies joined by newlines, null when the message is unparsed.
-    Html(StringBuilder),
-    /// First Message-ID, null when absent.
-    MessageId(StringBuilder),
-    /// Parsed `X-Forefront-Antispam-Report` and `X-Microsoft-Antispam` headers.
-    MicrosoftAntispam(Box<MicrosoftAntispamColumn>),
-    /// Byte offset of the message start.
-    Offset(UInt64Builder),
-    /// Message index.
-    Position(UInt64Builder),
-    /// The message's stored bytes, separator line included.
-    Raw(LargeBinaryBuilder),
-    /// Parsed `Received` chain.
-    ReceivedHops(Box<ReceivedHopsColumn>),
-    /// Parsed `Received-SPF` headers.
-    ReceivedSpfParsed(Box<ReceivedSpfColumn>),
-    /// Message length in bytes.
-    Size(UInt64Builder),
-    /// Decoded subject, null when absent.
-    Subject(StringBuilder),
-    /// Plain-text bodies joined by newlines, null when the message is unparsed.
-    Text(StringBuilder),
-    /// The result word of one method from the newest trusted `Authentication-Results`.
-    Verdict(VerdictColumn),
-}
-
-/// Builder for one per-attachment list column; each message contributes one list, which is
-/// empty when it has no attachments.
-#[derive(Debug)]
-enum AttachmentSlot {
-    /// Attachment file names; a nameless attachment is null.
-    Names(ListBuilder<StringBuilder>),
-    /// Lowercase hex SHA-256 of each decoded attachment.
-    Sha256(ListBuilder<StringBuilder>),
-    /// Decoded attachment sizes in bytes.
-    Sizes(ListBuilder<UInt64Builder>),
-    /// Attachment content types.
-    Types(ListBuilder<StringBuilder>),
-}
-
-impl AttachmentSlot {
-    /// Appends this message's attachment list; an unparsed message (`None`) appends an empty list.
-    fn append(&mut self, mail: Option<&Mail<'_>>) {
-        let attachments = mail.into_iter().flat_map(fields::attachments);
-        match self {
-            Self::Names(builder) => {
-                builder
-                    .values()
-                    .extend(attachments.map(|attachment| attachment.filename));
-                builder.append(true);
-            },
-            Self::Types(builder) => {
-                builder
-                    .values()
-                    .extend(attachments.map(|attachment| attachment.content_type()));
-                builder.append(true);
-            },
-            Self::Sizes(builder) => {
-                let sizes = attachments.map(|attachment| Some(widen(attachment.data.len())));
-                builder.values().extend(sizes);
-                builder.append(true);
-            },
-            Self::Sha256(builder) => {
-                let digests = attachments.map(|attachment| Some(sha256_hex(&attachment.data)));
-                builder.values().extend(digests);
-                builder.append(true);
-            },
-        }
-    }
-
-    /// Finishes the builder into an Arrow list array and resets it for reuse.
-    fn finish(&mut self) -> ArrayRef {
-        match self {
-            Self::Names(builder) | Self::Types(builder) | Self::Sha256(builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Sizes(builder) => Arc::new(builder.finish()),
-        }
-    }
-
-    /// Empty builder for the per-message list of attachment sizes.
-    fn sizes() -> Self {
-        Self::Sizes(ListBuilder::new(UInt64Builder::new()))
-    }
-}
-
-/// Which address header an address column reads.
-#[derive(Debug, Clone, Copy)]
-enum AddressHeader {
-    /// The Cc header.
-    Cc,
-    /// The From header.
-    From,
-    /// The Reply-To header.
-    ReplyTo,
-    /// The To header.
-    To,
-}
-
-impl AddressHeader {
-    /// Reads this header from `mail`, or `None` when the message lacks it.
-    fn of<'mail>(self, mail: &'mail Mail<'mail>) -> Option<AddressList<'mail>> {
-        match self {
-            Self::From => mail.from(),
-            Self::To => mail.to(),
-            Self::Cc => mail.cc(),
-            Self::ReplyTo => mail.reply_to(),
-        }
-    }
-}
-
-impl Slot {
-    /// Appends this slot's value for `record`; absent or unparsed data becomes null or an empty
-    /// list, never an error.
-    fn append(&mut self, record: &Record<'_>) {
-        let mail = record.mail;
-        match self {
-            Self::Position(builder) => builder.append_value(widen(record.position)),
-            Self::Offset(builder) => builder.append_value(widen(record.span.start)),
-            Self::Size(builder) => builder.append_value(widen(record.span.len())),
-            Self::Raw(builder) => builder.append_value(record.raw),
-            Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
-            Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
-            Self::Date(builder) => {
-                builder.append_option(record.date().map(|found| micros(found.unix_seconds)));
-            },
-            Self::DateOffset(builder) => {
-                builder.append_option(record.date().map(|found| found.offset_minutes));
-            },
-            Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
-            Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
-            Self::FirstHeaderValue(name, builder) => {
-                builder.append_option(first_header_value(name, mail));
-            },
-            Self::Text(builder) => builder.append_option(mail.map(text_body)),
-            Self::Html(builder) => builder.append_option(mail.map(html_body)),
-            Self::Attachments(slot) => slot.append(mail),
-            Self::AuthResults(column) => column.append(mail, record.trust),
-            Self::ArcSets(column) => column.append(mail, record.trust),
-            Self::DkimSignatures(column) => column.append(mail),
-            Self::ReceivedHops(column) => column.append(mail, record.trust),
-            Self::ReceivedSpfParsed(column) => column.append(mail),
-            Self::MicrosoftAntispam(column) => column.append(mail),
-            Self::Verdict(column) => column.append(mail, record.trust),
-        }
-    }
-
-    /// Finishes the builder into an Arrow array and resets it for reuse.
-    ///
-    /// # Errors
-    ///
-    /// The Arrow error when a structured column's nested arrays do not fit its layout.
-    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
-        let array: ArrayRef = match self {
-            Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Raw(builder) => Arc::new(builder.finish()),
-            Self::Addresses(_, builder) | Self::HeaderValues(_, builder) => {
-                Arc::new(builder.finish())
-            },
-            Self::Subject(builder)
-            | Self::MessageId(builder)
-            | Self::FirstHeaderValue(_, builder)
-            | Self::Text(builder)
-            | Self::Html(builder) => Arc::new(builder.finish()),
-            Self::Date(builder) => Arc::new(builder.finish()),
-            Self::DateOffset(builder) => Arc::new(builder.finish()),
-            Self::Attachments(slot) => slot.finish(),
-            Self::ArcSets(column) => column.finish()?,
-            Self::AuthResults(column) => column.finish()?,
-            Self::DkimSignatures(column) => column.finish()?,
-            Self::ReceivedHops(column) => column.finish()?,
-            Self::ReceivedSpfParsed(column) => column.finish()?,
-            Self::MicrosoftAntispam(column) => column.finish()?,
-            Self::Verdict(column) => column.finish(),
-        };
-        Ok(array)
-    }
-
-    /// A slot keeping only the first value of the header `name` (matched in any case).
-    fn first_header_value(name: &str) -> Self {
-        Self::FirstHeaderValue(name.to_owned(), StringBuilder::new())
-    }
-
-    /// A slot keeping every value of the header `name` (matched in any case) as a list.
-    fn header_values(name: &str) -> Self {
-        Self::HeaderValues(name.to_owned(), text_list())
-    }
-
-    /// Builds the slot matching `column`, preallocating `rows` entries where the builder
-    /// supports it.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
-    )]
-    fn new(column: &Column, rows: usize) -> Self {
-        let addresses = |header| Self::Addresses(header, text_list());
-        match column {
-            Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
-            Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
-            Column::Size => Self::Size(UInt64Builder::with_capacity(rows)),
-            Column::Raw => Self::Raw(LargeBinaryBuilder::new()),
-            Column::From => addresses(AddressHeader::From),
-            Column::To => addresses(AddressHeader::To),
-            Column::Cc => addresses(AddressHeader::Cc),
-            Column::ReplyTo => addresses(AddressHeader::ReplyTo),
-            Column::Subject => Self::Subject(StringBuilder::new()),
-            Column::Date => Self::Date(utc_timestamps(rows)),
-            Column::DateOffsetMinutes => Self::DateOffset(Int32Builder::with_capacity(rows)),
-            Column::MessageId => Self::MessageId(StringBuilder::new()),
-            Column::Received => Self::header_values("received"),
-            Column::AuthenticationResults => Self::header_values("authentication-results"),
-            Column::ReceivedSpf => Self::header_values("received-spf"),
-            Column::DkimSignature => Self::header_values("dkim-signature"),
-            Column::ReturnPath => Self::first_header_value("return-path"),
-            Column::Text => Self::Text(StringBuilder::new()),
-            Column::Html => Self::Html(StringBuilder::new()),
-            Column::AttachmentNames => Self::Attachments(AttachmentSlot::Names(text_list())),
-            Column::AttachmentTypes => Self::Attachments(AttachmentSlot::Types(text_list())),
-            Column::AttachmentSizes => Self::Attachments(AttachmentSlot::sizes()),
-            Column::AttachmentSha256 => Self::Attachments(AttachmentSlot::Sha256(text_list())),
-            Column::Header(name) => Self::header_values(name),
-            Column::AuthResults => Self::AuthResults(Box::new(AuthResultsColumn::new())),
-            Column::ArcSets => Self::ArcSets(Box::new(ArcSetsColumn::new())),
-            Column::DkimSignatures => Self::DkimSignatures(Box::new(DkimSignaturesColumn::new())),
-            Column::ReceivedHops => Self::ReceivedHops(Box::new(ReceivedHopsColumn::new())),
-            Column::ReceivedSpfParsed => {
-                Self::ReceivedSpfParsed(Box::new(ReceivedSpfColumn::new()))
-            },
-            Column::MicrosoftAntispam => {
-                Self::MicrosoftAntispam(Box::new(MicrosoftAntispamColumn::new()))
-            },
-            Column::VerdictDmarc => Self::Verdict(VerdictColumn::new(AuthMethod::Dmarc)),
-            Column::VerdictSpf => Self::Verdict(VerdictColumn::new(AuthMethod::Spf)),
-            Column::VerdictDkim => Self::Verdict(VerdictColumn::new(AuthMethod::Dkim)),
-            Column::VerdictCompauth => Self::Verdict(VerdictColumn::new(AuthMethod::CompAuth)),
-        }
-    }
-}
-
-/// Empty builder for a list of nullable strings.
-fn text_list() -> ListBuilder<StringBuilder> {
-    ListBuilder::new(StringBuilder::new())
-}
-
 /// The smallest range covering every run in `runs`.
 fn covering(runs: &[Range<usize>]) -> Range<usize> {
     let start = runs.iter().map(|run| run.start).min().unwrap_or(0);
@@ -616,121 +351,30 @@ fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm)> {
     column.header_form()
 }
 
-/// Empty UTC timestamp builder with room for `rows` entries.
-fn utc_timestamps(rows: usize) -> TimestampMicrosecondBuilder {
-    TimestampMicrosecondBuilder::with_capacity(rows).with_timezone("UTC")
-}
-
-/// Appends one list holding the email addresses of `header` in `mail`; an unparsed message or an
-/// absent header appends an empty list.
-fn append_addresses(
-    builder: &mut ListBuilder<StringBuilder>,
-    header: AddressHeader,
-    mail: Option<&Mail<'_>>,
-) {
-    let addresses = fields::addresses(mail.and_then(|parsed| header.of(parsed)));
-    builder
-        .values()
-        .extend(addresses.map(|address| address.email));
-    builder.append(true);
-}
-
-/// Appends one list holding every value of the header `name` in `mail`, in order; an unparsed
-/// message or an absent header appends an empty list.
-fn append_header_values(
-    builder: &mut ListBuilder<StringBuilder>,
-    name: &str,
-    mail: Option<&Mail<'_>>,
-) {
-    let values = mail
-        .into_iter()
-        .flat_map(|parsed| fields::header_values(parsed, name))
-        .map(Some);
-    builder.values().extend(values);
-    builder.append(true);
-}
-
-/// The first value of the header `name` in `mail`, or `None` when unparsed or absent.
-fn first_header_value<'mail>(
-    name: &str,
-    mail: Option<&'mail Mail<'mail>>,
-) -> Option<Cow<'mail, str>> {
-    let parsed = mail?;
-    fields::header_values(parsed, name).next()
-}
-
-/// The plain-text bodies of `mail` joined by newlines.
-fn text_body(mail: &Mail<'_>) -> String {
-    joined(fields::text_bodies(mail))
-}
-
-/// The HTML bodies of `mail` joined by newlines.
-fn html_body(mail: &Mail<'_>) -> String {
-    joined(fields::html_bodies(mail))
-}
-
-// `fields::date` only yields years up to 9999 (`parse_date` reads at most four digits), so
-// `unix_seconds` stays below 3e11 and the product below 3e17: the saturation is unreachable.
-/// Converts Unix seconds to microseconds, saturating at the `i64` bounds.
-const fn micros(unix_seconds: i64) -> i64 {
-    unix_seconds.saturating_mul(1_000_000)
-}
-
-/// Joins body parts with `\n`; no parts give an empty string.
-fn joined<'mail>(bodies: impl Iterator<Item = Cow<'mail, str>>) -> String {
-    bodies.collect::<Vec<_>>().join("\n")
-}
-
-/// Lowercase hexadecimal SHA-256 digest of `data` (64 characters).
-fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data)
-        .iter()
-        .flat_map(|byte| [byte >> 4_u8, byte & 0x0F])
-        .filter_map(|nibble| char::from_digit(u32::from(nibble), 16_u32))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::io::{Write as _, sink};
-    use std::iter;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use arrow_array::builder::{ListBuilder, StringBuilder};
-    use arrow_array::cast::AsArray as _;
-    use arrow_array::{Array as _, ListArray, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-    use mail_parser::{HeaderForm, HeaderName, MessageParser};
+    use arrow_array::RecordBatch;
+    use arrow_schema::{Field, Schema, SchemaRef};
+    use mail_parser::{HeaderForm, HeaderName};
     use tempfile::NamedTempFile;
 
-    use super::{
-        AddressHeader, AttachmentSlot, Depth, Pipeline, Probe, Slot, append_addresses,
-        append_header_values, depth_for, first_header_value, header_form, html_body, joined,
-        micros, text_body, utc_timestamps,
-    };
+    use super::{Depth, Pipeline, Probe, depth_for, header_form};
     use crate::columns::Column;
     use crate::error::MboxTurboError;
     use crate::export::{Export, Exporter};
-    use crate::fields;
-    use crate::fields::Mail;
     use crate::mailbox::Mailbox;
     use crate::selection::Selection;
     use crate::staging::{Destination, DestinationKind, Staged};
 
     /// A bound only a broken implementation reaches: it turns a hang into a failure.
     const STUCK: Duration = Duration::from_secs(60);
-
-    const MULTIPART: &[u8] = b"From: a@example.org\r\nTo: b@example.org, c@example.org\r\n\
-Cc: d@example.org\r\nReply-To: e@example.org\r\nReceived: first\r\nReceived: second\r\n\
-Date: Thu, 01 Jan 1970 00:00:10 +0130\r\n\
-Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
---b\r\nContent-Type: text/plain\r\n\r\nplain part\r\n--b\r\nContent-Type: text/html\r\n\r\n\
-<p>html part</p>\r\n--b--\r\n";
 
     /// Holds the extraction job whose first message is `held_start` until the test releases it.
     #[derive(Debug)]
@@ -790,27 +434,6 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         ) -> Result<u64, MboxTurboError> {
             Ok(0)
         }
-    }
-
-    fn parse(raw: &[u8]) -> Mail<'_> {
-        MessageParser::new()
-            .parse(raw)
-            .expect("fixture message parses")
-    }
-
-    fn list_cells(array: &ListArray, row: usize) -> Vec<String> {
-        array
-            .value(row)
-            .as_string::<i32>()
-            .iter()
-            .map(|cell| cell.expect("fixture cells are non-null").to_owned())
-            .collect()
-    }
-
-    fn address_cells(header: AddressHeader, mail: Option<&Mail<'_>>) -> Vec<String> {
-        let mut builder = ListBuilder::new(StringBuilder::new());
-        append_addresses(&mut builder, header, mail);
-        list_cells(&builder.finish(), 0)
     }
 
     #[test]
@@ -879,190 +502,6 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
         assert!(
             matches!(depth_for(&[Column::Subject, Column::Text]), Depth::Whole(_)),
             "a body column parses the body"
-        );
-    }
-
-    #[test]
-    fn each_address_header_reads_its_own_header() {
-        let mail = parse(MULTIPART);
-        let read = |header| address_cells(header, Some(&mail));
-        assert_eq!(
-            read(AddressHeader::From),
-            ["a@example.org"],
-            "From reads only the From header's address"
-        );
-        assert_eq!(
-            read(AddressHeader::To),
-            ["b@example.org", "c@example.org"],
-            "To keeps every address"
-        );
-        assert_eq!(
-            read(AddressHeader::Cc),
-            ["d@example.org"],
-            "Cc reads the Cc header, not Reply-To"
-        );
-        assert_eq!(
-            read(AddressHeader::ReplyTo),
-            ["e@example.org"],
-            "Reply-To reads the Reply-To header, not Cc"
-        );
-    }
-
-    #[test]
-    fn an_unparsed_message_appends_an_empty_address_list() {
-        assert!(
-            address_cells(AddressHeader::From, None).is_empty(),
-            "no mail gives an empty list"
-        );
-    }
-
-    #[test]
-    fn repeated_headers_append_all_values_in_order() {
-        let mail = parse(MULTIPART);
-        let mut builder = ListBuilder::new(StringBuilder::new());
-        append_header_values(&mut builder, "received", Some(&mail));
-        append_header_values(&mut builder, "x-missing", Some(&mail));
-        let array = builder.finish();
-        assert_eq!(
-            list_cells(&array, 0),
-            ["first", "second"],
-            "both values, in order"
-        );
-        assert_eq!(array.len(), 2, "each call appends exactly one list");
-        assert!(
-            list_cells(&array, 1).is_empty(),
-            "an absent header gives an empty list"
-        );
-    }
-
-    #[test]
-    fn the_first_header_value_wins_and_absence_is_none() {
-        let mail = parse(MULTIPART);
-        assert_eq!(
-            first_header_value("received", Some(&mail)).as_deref(),
-            Some("first"),
-            "first of the repeated values"
-        );
-        assert_eq!(
-            first_header_value("x-missing", Some(&mail)),
-            None,
-            "an absent header has no first value"
-        );
-        assert_eq!(
-            first_header_value("received", None),
-            None,
-            "unparsed message"
-        );
-    }
-
-    #[test]
-    fn the_date_header_gives_utc_microseconds_and_a_minute_offset() {
-        assert_eq!(
-            fields::date(MULTIPART).map(|found| micros(found.unix_seconds)),
-            Some(-5_390_000_000),
-            "00:00:10 at +01:30 is 5390 seconds before the epoch"
-        );
-        assert_eq!(
-            fields::date(MULTIPART).map(|found| found.offset_minutes),
-            Some(90_i32),
-            "+0130 is 90 minutes east"
-        );
-    }
-
-    #[test]
-    fn an_empty_message_has_no_date() {
-        assert_eq!(
-            fields::date(b"").map(|found| micros(found.unix_seconds)),
-            None,
-            "no micros without a message"
-        );
-        assert_eq!(
-            fields::date(b"").map(|found| found.offset_minutes),
-            None,
-            "no offset without a message"
-        );
-    }
-
-    #[test]
-    fn text_and_html_bodies_are_not_swapped() {
-        let mail = parse(MULTIPART);
-        assert_eq!(text_body(&mail), "plain part", "text/plain part");
-        assert_eq!(html_body(&mail), "<p>html part</p>", "text/html part");
-    }
-
-    #[test]
-    fn body_parts_are_joined_by_newlines_and_none_gives_empty() {
-        let parts = [Cow::Borrowed("a"), Cow::Borrowed("b")];
-        assert_eq!(
-            joined(parts.into_iter()),
-            "a\nb",
-            "newline between parts only"
-        );
-        assert_eq!(joined(iter::empty()), "", "no parts give an empty string");
-    }
-
-    #[test]
-    fn date_slots_are_built_in_utc() {
-        let array = utc_timestamps(1).finish();
-        assert_eq!(
-            array.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            "timestamps carry the UTC zone"
-        );
-    }
-
-    fn header_slot_name(column: &Column) -> Option<String> {
-        if let Slot::HeaderValues(name, _) | Slot::FirstHeaderValue(name, _) = Slot::new(column, 0)
-        {
-            Some(name)
-        } else {
-            None
-        }
-    }
-
-    #[test]
-    fn header_columns_get_slots_named_by_their_lowercase_header() {
-        let named = |column| header_slot_name(&column);
-        assert_eq!(
-            named(Column::DkimSignature).as_deref(),
-            Some("dkim-signature"),
-            "DKIM-Signature becomes a lowercase list slot"
-        );
-        assert_eq!(
-            named(Column::ReturnPath).as_deref(),
-            Some("return-path"),
-            "Return-Path becomes a lowercase single-value slot"
-        );
-        assert_eq!(
-            named(Column::Header("x-a".to_owned())).as_deref(),
-            Some("x-a"),
-            "a custom header keeps the name the caller gave"
-        );
-    }
-
-    #[test]
-    fn return_path_keeps_only_the_first_value_while_received_keeps_all() {
-        assert!(
-            matches!(
-                Slot::new(&Column::ReturnPath, 0),
-                Slot::FirstHeaderValue(..)
-            ),
-            "return-path is a single-value slot"
-        );
-        assert!(
-            matches!(Slot::new(&Column::Received, 0), Slot::HeaderValues(..)),
-            "received is a list slot"
-        );
-    }
-
-    #[test]
-    fn the_attachment_sizes_column_gets_a_size_list_slot() {
-        assert!(
-            matches!(
-                Slot::new(&Column::AttachmentSizes, 0),
-                Slot::Attachments(AttachmentSlot::Sizes(_))
-            ),
-            "sizes are numeric lists"
         );
     }
 

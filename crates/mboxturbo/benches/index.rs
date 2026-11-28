@@ -182,12 +182,15 @@ fn index_lookup(mailbox: &Mailbox, seed: u64) -> Outcome<Duration> {
     Ok(elapsed)
 }
 
-/// Times one pass over every message's slice in order, never reading message bytes.
+/// Times one pass over every message's span in order through the index, reading no message
+/// bytes at all.
 fn index_sweep(mailbox: &Mailbox) -> Outcome<Duration> {
     let (_, elapsed) = timed(|| {
         let mut sum = 0_usize;
-        for raw in mailbox.iter() {
-            sum = sum.wrapping_add(raw.len());
+        let index = mailbox.index();
+        for position in 0..mailbox.len() {
+            let span = index.span(position).ok_or_else(|| missing_span(position))?;
+            sum = sum.wrapping_add(span.len());
         }
         Ok(black_box(sum))
     })?;

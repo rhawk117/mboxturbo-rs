@@ -14,8 +14,9 @@ mod export {
     use arrow_array::cast::AsArray as _;
     use arrow_schema::SchemaRef;
     use mboxturbo::{
-        CancelToken, Column, Compression, Destination, DestinationKind, Export, Exporter, Mailbox,
-        MboxTurboError, Output, Overwrite, ParquetExporter, Pipeline, Progress, Selection, Staged,
+        CancelToken, Column, Compression, Destination, DestinationKind, Export, Exporter,
+        JsonlExporter, Mailbox, MboxTurboError, Output, Overwrite, ParquetExporter, Pipeline,
+        Progress, Selection, Staged,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::metadata::RowGroupMetaData;
@@ -92,7 +93,7 @@ mod export {
             batch: &RecordBatch,
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
-            let target = staged.target_label().to_path_buf();
+            let target = staged.target().map_or_else(PathBuf::new, Path::to_path_buf);
             let Output::Writer(writer) = staged.output() else {
                 return Err(staged.unsupported());
             };
@@ -170,6 +171,32 @@ mod export {
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
             self.inner.write(batch, staged)
+        }
+    }
+
+    /// A writer that refuses every write.
+    struct WriteFails;
+
+    impl Write for WriteFails {
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected write failure"))
+        }
+    }
+
+    /// A writer that accepts every write and refuses to flush.
+    struct FlushFails;
+
+    impl Write for FlushFails {
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("injected flush failure"))
+        }
+
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
         }
     }
 
@@ -284,6 +311,32 @@ mod export {
         );
         assert_eq!(summary.path, Some(fixture.target()), "path reported");
         assert_eq!(fixture.leftovers(), ["target"], "only the target remains");
+    }
+
+    #[test]
+    fn a_failing_stream_write_is_a_stream_error_without_a_path() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .export(Destination::Stream(Box::new(WriteFails)))
+            .run(Box::new(JsonlExporter::new()))
+            .expect_err("the stream refuses the write");
+        assert!(
+            matches!(error, MboxTurboError::Stream { .. }),
+            "a stream write failure names no file: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_stream_flush_is_a_stream_error_without_a_path() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .export(Destination::Stream(Box::new(FlushFails)))
+            .run(Box::new(JsonlExporter::new()))
+            .expect_err("the stream refuses the flush");
+        assert!(
+            matches!(error, MboxTurboError::Stream { .. }),
+            "a stream flush failure names no file: {error:?}"
+        );
     }
 
     #[test]
@@ -568,32 +621,25 @@ mod export {
     }
 
     #[test]
-    fn a_parquet_stream_holds_the_same_rows_as_the_pipeline_yields() {
-        let (fixture, expected) = default_columns_fixture();
+    fn a_parquet_stream_destination_is_refused() {
+        let fixture = Fixture::with_messages(MESSAGES);
         let streamed = fixture.output.path().join("streamed.parquet");
-        let summary = fixture
+
+        let refusal = fixture
             .export(Destination::Stream(Box::new(
                 File::create(&streamed).expect("stream file creates"),
             )))
-            .run(Box::new(ParquetExporter::new(Compression::Zstd)))
-            .expect("the parquet stream export succeeds");
+            .run(Box::new(ParquetExporter::new(Compression::Zstd)));
 
-        let (schema, batches) = read_parquet(&streamed);
-        assert_eq!(
-            Some(&schema),
-            expected.first().map(RecordBatch::schema_ref),
-            "the Arrow schema is the pipeline's"
-        );
-        assert_eq!(
-            batches, expected,
-            "a stream carries the same rows as the pipeline yields"
-        );
-        assert_eq!(summary.path, None, "a stream has no path");
-        let written = fs::read(&streamed).expect("streamed file is readable");
-        assert_eq!(
-            summary.bytes,
-            count(written.len()),
-            "the reported bytes are the streamed buffer's length"
+        assert!(
+            matches!(
+                refusal,
+                Err(MboxTurboError::UnsupportedDestination {
+                    kind: DestinationKind::Stream,
+                    target: None,
+                })
+            ),
+            "a stream is refused with its kind and no target"
         );
     }
 
@@ -603,7 +649,8 @@ mod export {
         let _summary = fixture
             .export(Destination::File(fixture.target()))
             .run(Box::new(
-                ParquetExporter::new(Compression::Uncompressed).with_row_group_batches(BATCH_SIZE),
+                ParquetExporter::new(Compression::Uncompressed)
+                    .with_row_groups_for_batch_size(BATCH_SIZE),
             ))
             .expect("the parquet export succeeds");
 

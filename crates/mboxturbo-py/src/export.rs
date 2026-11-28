@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use mboxturbo::{
-    Column, Compression, Destination, DestinationKind, Export, ExportSummary, Exporter, Filter,
-    MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline, Progress,
+    Column, Compression, DateBounds, Destination, DestinationKind, Export, ExportSummary, Exporter,
+    Filter, MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline, Progress,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -65,16 +65,16 @@ impl CancelToken {
 /// The narrowing a ``select`` call asks for, converted from its Python arguments.
 #[derive(Debug)]
 pub(crate) struct Filters {
+    /// The window a message's indexed date must fall in to be kept: from `since` inclusive to
+    /// `until` exclusive, either side optionally open; with neither bound set no message is
+    /// dropped, undated ones included.
+    dates: DateBounds,
     /// The only positions that may be kept.
     positions: Option<Vec<usize>>,
     /// The predicate rows must satisfy.
     predicate: Option<mboxturbo::Predicate>,
-    /// The inclusive lower bound of the index date, in unix seconds.
-    since: Option<i64>,
     /// The trust set that decides verdicts and trusted flags.
     trust: Option<mboxturbo::TrustSet>,
-    /// The exclusive upper bound of the index date, in unix seconds.
-    until: Option<i64>,
 }
 
 /// Chosen columns over a mailbox. Any Arrow consumer reads it directly (``pyarrow.table``,
@@ -97,6 +97,17 @@ pub(crate) struct Selection {
     pipeline: Arc<Pipeline>,
     /// The rows every read visits.
     rows: mboxturbo::Selection,
+}
+
+/// Which catalogue columns `column_names` lists.
+#[derive(Clone, Copy, Debug)]
+enum ColumnGroup {
+    /// Every named column.
+    All,
+    /// The columns selected when none are named.
+    Defaults,
+    /// The columns left out of the defaults.
+    OptIn,
 }
 
 impl Filters {
@@ -126,13 +137,15 @@ impl Filters {
         Ok(Self {
             positions,
             predicate: predicate.map(|wrapped| wrapped.predicate().clone()),
-            since: since
-                .map(|moment| unix_seconds(py, moment, "since"))
-                .transpose()?,
+            dates: DateBounds::new(
+                since
+                    .map(|moment| unix_seconds(py, moment, "since"))
+                    .transpose()?,
+                until
+                    .map(|moment| unix_seconds(py, moment, "until"))
+                    .transpose()?,
+            ),
             trust: trust.map(|wrapped| wrapped.trust_set().clone()),
-            until: until
-                .map(|moment| unix_seconds(py, moment, "until"))
-                .transpose()?,
         })
     }
 
@@ -143,7 +156,7 @@ impl Filters {
         mailbox: &mboxturbo::Mailbox,
         filter: Option<&Filter>,
     ) -> Result<Narrowed, Box<MboxTurboError>> {
-        let mut narrowing = Narrowing::new().dates(self.since, self.until);
+        let mut narrowing = Narrowing::new().dates(self.dates);
         if let Some(positions) = &self.positions {
             narrowing = narrowing.positions(positions.clone());
         }
@@ -151,6 +164,15 @@ impl Filters {
             narrowing = narrowing.filter(found);
         }
         Ok(narrowing.select(mailbox, None)?)
+    }
+
+    /// A pipeline over `columns` in batches of `batch_size`, carrying this trust set when there
+    /// is one.
+    fn pipeline(&self, columns: Vec<Column>, batch_size: usize) -> Pipeline {
+        self.trust
+            .clone()
+            .into_iter()
+            .fold(Pipeline::new(columns, batch_size), Pipeline::with_trust)
     }
 }
 
@@ -257,9 +279,23 @@ impl Selection {
         cancel: Option<&CancelToken>,
     ) -> PyResult<u64> {
         let codec = parse_compression(compression)?;
-        let sink = ParquetExporter::new(codec).with_row_group_batches(self.batch_size);
+        let sink = ParquetExporter::new(codec).with_row_groups_for_batch_size(self.batch_size);
         let export = prepare(self, Destination::File(path), overwrite_policy(overwrite));
         run_export(py, export, Box::new(sink), progress, cancel).map(|summary| summary.messages)
+    }
+}
+
+impl ColumnGroup {
+    /// The group called `group`, or `ValueError` naming the allowed groups.
+    fn parse(group: &str) -> PyResult<Self> {
+        match group {
+            "all" => Ok(Self::All),
+            "defaults" => Ok(Self::Defaults),
+            "opt_in" => Ok(Self::OptIn),
+            other => Err(PyValueError::new_err(format!(
+                "unknown column group {other:?}; expected 'all', 'defaults' or 'opt_in'"
+            ))),
+        }
     }
 }
 
@@ -379,20 +415,23 @@ fn report_progress(
     });
 }
 
-/// The catalogue column names in order: the defaults when `opt_in` is false, the opt-in columns
-/// when it is true, and every named column when it is `None`.
+/// The catalogue column names in order: every named column for `all`, the defaults for
+/// `defaults` and the opt-in columns for `opt_in`; `ValueError` for any other group.
 #[pyfunction]
-#[pyo3(signature = (opt_in=None))]
-pub(crate) fn column_names(opt_in: Option<bool>) -> Vec<String> {
-    let columns = match opt_in {
-        Some(false) => Column::defaults(),
-        _ => Column::names().filter_map(Column::from_name).collect(),
+#[pyo3(signature = (group="all"))]
+pub(crate) fn column_names(group: &str) -> PyResult<Vec<String>> {
+    let columns = match ColumnGroup::parse(group)? {
+        ColumnGroup::Defaults => Column::defaults(),
+        ColumnGroup::All => Column::catalogue(),
+        ColumnGroup::OptIn => Column::catalogue()
+            .into_iter()
+            .filter(Column::is_opt_in)
+            .collect(),
     };
-    columns
+    Ok(columns
         .iter()
-        .filter(|column| opt_in != Some(true) || column.is_opt_in())
         .map(|column| column.name().into_owned())
-        .collect()
+        .collect())
 }
 
 /// A selection over the rows `filters` keep in `mailbox`, with the interpreter released while
@@ -405,50 +444,51 @@ pub(crate) fn select_columns(
     batch_size: usize,
     filters: &Filters,
 ) -> PyResult<Selection> {
-    if batch_size == 0 {
-        return Err(PyValueError::new_err("batch size must be positive"));
-    }
-    let columns =
-        requested.map_or_else(|| Ok(Column::defaults()), |names| parse_columns(&names))?;
-    let names = columns
-        .iter()
-        .map(|column| column.name().into_owned())
-        .collect();
-    let filter = filters
-        .built_filter()
-        .map_err(|error| into_py_err(py, *error))?;
-    let rows = py
-        .detach(|| filters.pick(&mailbox, filter.as_ref()))
-        .map_err(|error| into_py_err(py, *error))?;
-    let extraction = filters
-        .trust
-        .clone()
-        .into_iter()
-        .fold(Pipeline::new(columns, batch_size), Pipeline::with_trust);
+    let columns = checked_columns(requested, batch_size)?;
+    let rows = narrowed_rows(py, &mailbox, filters)?;
     Ok(Selection {
         batch_size,
         excluded_undated: rows.excluded_undated.unwrap_or(0),
         mailbox,
         messages: rows.count,
-        names,
-        pipeline: Arc::new(extraction),
+        names: names_of(&columns),
+        pipeline: Arc::new(filters.pipeline(columns, batch_size)),
         rows: rows.selection,
     })
 }
 
-/// The columns `names` name, or `ValueError` listing the known names for the first unknown one.
-fn parse_columns(names: &[String]) -> PyResult<Vec<Column>> {
-    names
+/// The names of `columns`, in order, in the form [`Column::from_name`] accepts (`header:<Name>` for
+/// header columns).
+fn names_of(columns: &[Column]) -> Vec<String> {
+    columns
         .iter()
-        .map(|name| {
-            Column::from_name(name).ok_or_else(|| {
-                let known = Column::names().collect::<Vec<_>>().join(", ");
-                PyValueError::new_err(format!(
-                    "unknown column '{name}'; expected one of {known}, or header:<Name>"
-                ))
-            })
-        })
+        .map(|column| column.name().into_owned())
         .collect()
+}
+
+/// The columns `requested` names (every default when `None`), or `ValueError` for a zero
+/// `batch_size` or an unknown column.
+fn checked_columns(requested: Option<Vec<String>>, batch_size: usize) -> PyResult<Vec<Column>> {
+    if batch_size == 0 {
+        return Err(PyValueError::new_err("batch size must be positive"));
+    }
+    requested.map_or_else(
+        || Ok(Column::defaults()),
+        |names| Column::parse_all(&names).map_err(|error| PyValueError::new_err(error.to_string())),
+    )
+}
+
+/// The rows `filters` keep in `mailbox`, found with the interpreter released.
+fn narrowed_rows(
+    py: Python<'_>,
+    mailbox: &mboxturbo::Mailbox,
+    filters: &Filters,
+) -> PyResult<Narrowed> {
+    let filter = filters
+        .built_filter()
+        .map_err(|error| into_py_err(py, *error))?;
+    py.detach(|| filters.pick(mailbox, filter.as_ref()))
+        .map_err(|error| into_py_err(py, *error))
 }
 
 /// The codec `name` names (`zstd`, `snappy` or `none`), or `ValueError` for anything else.

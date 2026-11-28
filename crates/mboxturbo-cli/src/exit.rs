@@ -42,7 +42,7 @@ pub(crate) enum Stage {
 /// | `CorruptIndex`, `StaleIndex` | 65 |
 /// | `Io` whose source is `NotFound` for the mailbox path itself (mailbox missing) | 66 |
 /// | `TargetExists`, `TargetNotReplaceable` | 73 |
-/// | `Io`, any other kind or any other `NotFound`, such as an output or index path | 74 |
+/// | `Io` or `Stream`, any other kind or any other `NotFound` (output or index path) | 74 |
 /// | `Cancelled` | 130 |
 ///
 /// Clap usage errors and other usage errors are mapped to 64 by the caller, not here.
@@ -58,7 +58,9 @@ pub(crate) fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
         | MboxTurboError::UnsupportedDestination { .. } => OTHER,
         MboxTurboError::Cancelled { .. } => INTERRUPTED,
         MboxTurboError::CorruptIndex { .. } | MboxTurboError::StaleIndex { .. } => CORRUPT,
-        MboxTurboError::Io { source, .. } => io_code(stage, source),
+        MboxTurboError::Io { source, .. } | MboxTurboError::Stream { source } => {
+            io_code(stage, source)
+        },
         MboxTurboError::InvalidPredicate { .. }
         | MboxTurboError::PositionOutOfRange { .. }
         | MboxTurboError::UnsupportedColumn { .. } => USAGE,

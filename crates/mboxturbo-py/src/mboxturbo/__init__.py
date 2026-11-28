@@ -65,8 +65,8 @@ class Exporter[Out: (ByteSink, Path)](Protocol):
 
 
 SOC_COLUMNS: tuple[str, ...] = (
-    *column_names(opt_in=False),
-    *(name for name in column_names(opt_in=True) if name != 'raw'),
+    *column_names(group='defaults'),
+    *(name for name in column_names(group='opt_in') if name != 'raw'),
 )
 """The default columns plus every structured and verdict column."""
 

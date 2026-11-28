@@ -1,6 +1,8 @@
 //! What the export sinks share: encoding a cell, checking a schema, finding a column and writing
 //! to the staged stream.
 
+use std::path::Path;
+
 use arrow_array::Array;
 use arrow_array::cast::AsArray as _;
 use arrow_array::types::{
@@ -176,7 +178,7 @@ pub(crate) fn encode_failure(
 ) -> MboxTurboError {
     MboxTurboError::Encode {
         sink,
-        target: staged.target_label().display().to_string(),
+        target: staged.target().map(Path::to_path_buf),
         source: Box::new(source),
     }
 }
@@ -193,7 +195,7 @@ pub(crate) fn write_stream(staged: &mut Staged, bytes: &[u8]) -> Result<u64, Mbo
         return Err(staged.unsupported());
     };
     let written = destination.write_all(bytes);
-    written.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
+    written.map_err(|source| MboxTurboError::write_failure(staged.target(), source))?;
     Ok(widen(bytes.len()))
 }
 

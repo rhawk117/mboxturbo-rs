@@ -549,8 +549,8 @@ mod export {
         ]);
         assert_eq!(code(&output), 64_i32, "an unknown column is a usage error");
         assert!(
-            stderr(&output).contains("bogus_column"),
-            "the message names the column"
+            stderr(&output).contains("unknown column 'bogus_column'; expected one of position"),
+            "the message names the column and the catalogue"
         );
     }
 
