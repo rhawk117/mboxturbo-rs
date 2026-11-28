@@ -13,7 +13,7 @@ use arrow_array::{
     Array as _, LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, SchemaRef};
-use mail_parser::DateTime;
+use mboxturbo_headers::rfc3339;
 use memchr::memmem;
 use serde_json::{Value, json};
 
@@ -183,7 +183,7 @@ impl<'batch> Columns<'batch> {
         let date = self
             .dates
             .filter(|array| !array.is_null(row))
-            .map(|array| rfc3339(array.value(row)));
+            .map(|array| rfc3339(array.value(row).div_euclid(MICROS_PER_SECOND)));
         json!({
             "position": position,
             "file": file,
@@ -235,11 +235,6 @@ impl<'batch> Columns<'batch> {
             ),
         }
     }
-}
-
-/// `micros` since the epoch as an RFC 3339 UTC string, to the second.
-fn rfc3339(micros: i64) -> String {
-    DateTime::from_timestamp(micros.div_euclid(MICROS_PER_SECOND)).to_rfc3339()
 }
 
 /// `raw` without its `From ` separator line, with one `>` removed from each `>+From ` line.

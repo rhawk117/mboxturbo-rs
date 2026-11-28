@@ -59,7 +59,7 @@ pub use ipc_sink::IpcExporter;
 pub use jsonl_sink::JsonlExporter;
 pub use mailbox::{DateRange, Mailbox, ParsedBatch};
 pub use mbox_sink::MboxExporter;
-pub use mboxturbo_headers::TrustSet;
+pub use mboxturbo_headers::{TrustSet, civil_from_days, days_from_civil, rfc3339, rfc3339_micros};
 pub use message::{Address, Attachment, Message, Timestamp};
 pub use parquet::ParquetExporter;
 pub use pipeline::{BatchReader, Compression, Pipeline};

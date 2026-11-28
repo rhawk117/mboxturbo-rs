@@ -79,30 +79,18 @@ struct Civil {
 }
 
 impl Civil {
-    /// Splits Unix seconds into proleptic Gregorian fields (Hinnant's `civil_from_days`).
+    /// Splits Unix seconds into proleptic Gregorian fields.
     fn from_unix(seconds: u64) -> Self {
         let days = seconds / 86_400;
-        let shifted = days + 719_468;
-        let era = shifted / 146_097;
-        let day_of_era = shifted % 146_097;
-        let year_of_era =
-            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        let month_index = (5 * day_of_year + 2) / 153;
-        let month = if month_index < 10 {
-            month_index + 3
-        } else {
-            month_index - 9
-        };
-        let year = era * 400 + year_of_era + u64::from(month <= 2);
+        let (year, month, day) = mboxturbo_headers::civil_from_days(days.cast_signed());
         Self {
-            day: day_of_year - (153 * month_index + 2) / 5 + 1,
+            day: day.unsigned_abs(),
             hour: seconds % 86_400 / 3_600,
             minute: seconds % 3_600 / 60,
-            month: month_name(month),
+            month: month_name(month.unsigned_abs()),
             second: seconds % 60,
             weekday: weekday_name((days + 4) % 7),
-            year,
+            year: year.unsigned_abs(),
         }
     }
 }

@@ -27,7 +27,7 @@ pub use auth_results::{
 pub use caps::{
     Cap, MAX_COMMENT_DEPTH, MAX_ENCODED_WORDS, MAX_ENTRIES, MAX_HEADER_BYTES, MAX_RECEIVED_HOPS,
 };
-pub use date::{Instant, parse_date};
+pub use date::{Instant, civil_from_days, days_from_civil, parse_date, rfc3339, rfc3339_micros};
 pub use dkim::{DkimSignature, RequiredTag, Tag, TagList, parse_dkim_signature, parse_tag_list};
 pub use encoded_word::decode_encoded_words;
 pub use issue::{ArcPart, ArcProblem, Issue, IssueKind, Parsed};

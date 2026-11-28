@@ -8,10 +8,8 @@ use std::io::{self, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use mboxturbo::{IndexOrigin, Progress};
+use mboxturbo::{IndexOrigin, Progress, rfc3339};
 use serde_json::{Value, json};
-
-use crate::info::rfc3339;
 
 /// The version carried by every event; a change to an event's shape bumps it.
 const VERSION: u8 = 1;

@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use mboxturbo::days_from_civil;
+
 /// Seconds in a day.
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -157,28 +159,6 @@ const fn month_length(year: i64, month: i64) -> Option<i64> {
         2 => Some(if leap { 29 } else { 28 }),
         _ => None,
     }
-}
-
-/// Days since 1970-01-01 of a proleptic Gregorian date, by Howard Hinnant's `days_from_civil`.
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let shifted_year = year.checked_sub(i64::from(month <= 2))?;
-    let era = shifted_year.div_euclid(400);
-    let year_of_era = shifted_year.rem_euclid(400);
-    let shifted_month = month.checked_add(9)?.rem_euclid(12);
-    let day_of_year = shifted_month
-        .checked_mul(153)?
-        .checked_add(2)?
-        .div_euclid(5)
-        .checked_add(day)?
-        .checked_sub(1)?;
-    let day_of_era = year_of_era
-        .checked_mul(365)?
-        .checked_add(year_of_era.div_euclid(4))?
-        .checked_sub(year_of_era.div_euclid(100))?
-        .checked_add(day_of_year)?;
-    era.checked_mul(146_097)?
-        .checked_add(day_of_era)?
-        .checked_sub(719_468)
 }
 
 /// `text` as a number when it is exactly `width` ASCII digits.

@@ -9,16 +9,13 @@ use arrow_array::types::{
 use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use mail_parser::DateTime;
+use mboxturbo_headers::rfc3339_micros;
 use serde_json::{Map, Value};
 
 use crate::columns::Column;
 use crate::error::MboxTurboError;
 use crate::staging::{Output, Staged};
 use crate::width::widen;
-
-/// Microseconds in a second.
-const MICROS_PER_SECOND: i64 = 1_000_000;
 
 /// Whether a sink writes binary columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,24 +92,6 @@ fn list_value(array: &dyn Array, row: usize) -> Result<Value, ArrowError> {
         .map(|item| cell_value(items.as_ref(), item))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Value::Array(values))
-}
-
-/// `micros` since the epoch as an RFC 3339 UTC string, with fractional seconds only when
-/// non-zero.
-pub(crate) fn rfc3339_micros(micros: i64) -> String {
-    let date = DateTime::from_timestamp(micros.div_euclid(MICROS_PER_SECOND));
-    let mut text = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        date.year, date.month, date.day, date.hour, date.minute, date.second
-    );
-    let fraction = micros.rem_euclid(MICROS_PER_SECOND);
-    if fraction != 0 {
-        let digits = format!("{fraction:06}");
-        text.push('.');
-        text.push_str(digits.trim_end_matches('0'));
-    }
-    text.push('Z');
-    text
 }
 
 /// Whether `data_type` is one of the types the columns produce, or a list or struct of them;
@@ -305,34 +284,5 @@ pub(crate) mod fixtures {
         );
         sets.append(true);
         Arc::new(sets.finish())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rfc3339_micros;
-
-    #[test]
-    fn fractional_seconds_appear_only_when_non_zero_without_trailing_zeros() {
-        assert_eq!(
-            rfc3339_micros(1_704_096_000_000_000),
-            "2024-01-01T08:00:00Z",
-            "whole seconds carry no fraction"
-        );
-        assert_eq!(
-            rfc3339_micros(1_704_096_000_500_000),
-            "2024-01-01T08:00:00.5Z",
-            "trailing zeros of the fraction are trimmed"
-        );
-        assert_eq!(
-            rfc3339_micros(1_704_096_000_000_001),
-            "2024-01-01T08:00:00.000001Z",
-            "leading zeros of the fraction are kept"
-        );
-        assert_eq!(
-            rfc3339_micros(-500_000),
-            "1969-12-31T23:59:59.5Z",
-            "a time before the epoch rounds down to the second"
-        );
     }
 }
