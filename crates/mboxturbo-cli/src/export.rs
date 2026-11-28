@@ -408,7 +408,7 @@ fn columns(format: Format, requested: Option<&[String]>) -> Result<Vec<Column>, 
             Column::MessageId,
             Column::Date,
         ]),
-        Format::Mbox => Some(vec![Column::Raw]),
+        Format::Mbox => Some(vec![Column::Raw, Column::Position]),
         Format::Arrow | Format::Csv | Format::Jsonl | Format::Parquet => None,
     };
     if let Some(fixed) = whole {
@@ -566,8 +566,8 @@ mod tests {
         args: ExportArgs,
     }
 
-    /// The message `scan_failure` gives a cancelled scan of an export written to `output`.
-    fn cancelled_message(output: &str) -> String {
+    /// What `scan_failure` gives a cancelled scan of an export written to `output`.
+    fn cancelled_failure(output: &str) -> Failure {
         let line = Line::try_parse_from(["export", "mail.mbox", "--format", "csv", "-o", output])
             .expect("the export arguments parse");
         let cancel = CancelToken::new();
@@ -577,24 +577,34 @@ mod tests {
             target: None,
             written: 0,
         };
-        scan_failure(error, &line.args, &watch).to_string()
+        scan_failure(error, &line.args, &watch)
     }
 
     #[test]
     fn a_cancelled_scan_names_the_output_path() {
-        let message = cancelled_message("out/mail.csv");
+        let failure = cancelled_failure("out/mail.csv");
+        let Failure::Core { error, .. } = failure else {
+            panic!("a cancelled scan is a library failure, got {failure:?}");
+        };
         assert!(
-            message.contains("export to out/mail.csv cancelled after"),
-            "the message names the -o target, got: {message}"
+            matches!(
+                &*error,
+                MboxTurboError::Cancelled { target: Some(target), .. }
+                    if target == Path::new("out/mail.csv")
+            ),
+            "the error names the -o target, got: {error:?}"
         );
     }
 
     #[test]
     fn a_cancelled_scan_names_a_stream_for_dash() {
-        let message = cancelled_message("-");
+        let failure = cancelled_failure("-");
+        let Failure::Core { error, .. } = failure else {
+            panic!("a cancelled scan is a library failure, got {failure:?}");
+        };
         assert!(
-            message.contains("export to a stream cancelled after"),
-            "the message names a stream for -o -, got: {message}"
+            matches!(&*error, MboxTurboError::Cancelled { target: None, .. }),
+            "the error names no target for -o -, got: {error:?}"
         );
     }
 }
