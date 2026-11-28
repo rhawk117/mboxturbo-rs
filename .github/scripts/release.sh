@@ -171,7 +171,7 @@ record_version_bump() {
 
   git add -- "${CARGO_MANIFEST}" "${CORE_MANIFEST}" Cargo.lock "${PYTHON_MANIFEST}" uv.lock
 
-  git commit -m "release: ${release_tag}"
+  git commit -m "chore(release): ${release_tag}"
   git tag -a "${release_tag}" -m "Release ${release_tag}"
 
   git push --atomic origin \
