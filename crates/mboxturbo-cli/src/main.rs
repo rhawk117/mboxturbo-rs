@@ -57,7 +57,7 @@ use crate::show::ShowArgs;
 )]
 #[command(name = "mboxturbo", version, about)]
 struct Cli {
-    /// What to do.
+    /// The command to run; each has its own options, listed by `mboxturbo <command> --help`.
     #[command(subcommand)]
     command: Command,
     /// Write a versioned JSON Lines event stream on standard output instead of human text.
@@ -69,7 +69,7 @@ struct Cli {
     quiet: bool,
 }
 
-/// The subcommands.
+/// The commands mboxturbo runs: choosing one selects the operation and its options.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Write the selected messages of a mailbox as parquet, eml, mbox, jsonl, csv or arrow.

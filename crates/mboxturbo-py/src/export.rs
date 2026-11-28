@@ -65,7 +65,8 @@ impl CancelToken {
 /// The narrowing a ``select`` call asks for, converted from its Python arguments.
 #[derive(Debug)]
 pub(crate) struct Filters {
-    /// The index dates kept.
+    /// The window a message's indexed date must fall in to be kept: from `since` inclusive to
+    /// `until` exclusive, either side optionally open.
     dates: DateBounds,
     /// The only positions that may be kept.
     positions: Option<Vec<usize>>,

@@ -91,7 +91,7 @@ pub trait Exporter: Send {
     fn write(&mut self, batch: &RecordBatch, staged: &mut Staged) -> Result<u64, MboxTurboError>;
 }
 
-/// Progress callback type.
+/// A callback the export calls with running totals after each batch it writes.
 type ProgressHook = Box<dyn FnMut(Progress) + Send>;
 
 /// An export of a selection of a mailbox to a destination, run with [`Export::run`].

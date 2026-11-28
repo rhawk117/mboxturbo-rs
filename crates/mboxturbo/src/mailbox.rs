@@ -274,7 +274,7 @@ impl Mailbox {
         range
     }
 
-    /// The message index.
+    /// The index this mailbox serves lookups from, rebuilt in place when a block fails its checks.
     #[must_use]
     pub const fn index(&self) -> &Index {
         &self.index
@@ -328,7 +328,8 @@ impl Mailbox {
         (0..self.len()).map(move |position| self.walk_row(&mut walk, position).1)
     }
 
-    /// Number of messages.
+    /// The number of messages in the mailbox: the count the index recorded, or the rebuild's count
+    /// once a rebuild ran.
     #[must_use]
     pub fn len(&self) -> usize {
         self.index.len()

@@ -74,7 +74,7 @@ struct Entry {
 pub(crate) struct Layout {
     /// Each block holds this many messages, except possibly the last.
     pub block_size: BlockSize,
-    /// Number of messages.
+    /// The number of messages the index records, which a rebuild replaces with its own count.
     pub count: usize,
     /// Where the starts directory begins, from the file start.
     pub dir_offset: u64,
