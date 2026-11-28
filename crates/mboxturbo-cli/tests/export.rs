@@ -414,6 +414,20 @@ mod export {
     }
 
     #[test]
+    fn a_column_the_csv_sink_cannot_write_exits_64_naming_the_column_and_the_sink() {
+        let fixture = Fixture::new();
+        let target = fixture.target("out.csv");
+        let output = fixture.export(&["--format", "csv", "-o", &target, "--columns", "raw"]);
+        assert_eq!(code(&output), 64_i32, "an unusable column is a usage error");
+        let message = stderr(&output);
+        assert!(
+            message.contains("`raw`") && message.contains("CSV"),
+            "the message names the column and the sink: {message}"
+        );
+        assert!(!fixture.path("out.csv").exists(), "nothing is written");
+    }
+
+    #[test]
     fn an_empty_select_file_exits_64_naming_it() {
         let fixture = Fixture::new();
         let target = fixture.target("out.csv");

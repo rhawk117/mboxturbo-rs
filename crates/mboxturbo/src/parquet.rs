@@ -7,11 +7,11 @@ use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
+use crate::encode::write_stream;
 use crate::error::MboxTurboError;
 use crate::export::Exporter;
 use crate::pipeline::Compression;
-use crate::staging::{DestinationKind, Output, Staged};
-use crate::width::widen;
+use crate::staging::{DestinationKind, Staged};
 
 /// Rows per row group: 16 batches of the default 8192.
 const ROW_GROUP_ROWS: usize = 0x0002_0000;
@@ -112,13 +112,7 @@ impl Exporter for ParquetExporter {
 /// Moves the bytes the encoder has finished into the staged destination and returns how many.
 fn drain(writer: &mut ArrowWriter<Vec<u8>>, staged: &mut Staged) -> Result<u64, MboxTurboError> {
     let pending = writer.inner_mut();
-    let bytes = widen(pending.len());
-    let Output::Writer(destination) = staged.output() else {
-        // `accepts` refuses directory destinations, so the driver never stages one for this sink
-        return Err(staged.unsupported());
-    };
-    let written = destination.write_all(pending);
-    written.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
+    let bytes = write_stream(staged, pending)?;
     pending.clear();
     Ok(bytes)
 }

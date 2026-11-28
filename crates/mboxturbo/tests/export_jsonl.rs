@@ -10,7 +10,7 @@ mod export_jsonl {
     use arrow_array::cast::AsArray as _;
     use arrow_array::types::{Int32Type, TimestampMicrosecondType, UInt64Type};
     use arrow_array::{Array as _, ArrayRef, RecordBatch};
-    use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use mail_parser::DateTime;
@@ -384,14 +384,11 @@ mod export_jsonl {
             .begin(&schema, &mut staged)
             .expect_err("a float column cannot be encoded");
 
-        let MboxTurboError::Arrow {
-            source: ArrowError::SchemaError(message),
-            ..
-        } = error
-        else {
-            panic!("the refusal is an Arrow schema error");
+        let MboxTurboError::UnsupportedColumn { column, sink, .. } = error else {
+            panic!("the refusal is an unsupported column error");
         };
-        assert!(message.contains("`ratio`"), "the column is named");
+        assert_eq!(sink, "JSONL", "the sink is named");
+        assert_eq!(column, "ratio", "the column is named");
         assert!(
             fs::read(fixture.target()).map_or(true, |bytes| bytes.is_empty()),
             "nothing was written"

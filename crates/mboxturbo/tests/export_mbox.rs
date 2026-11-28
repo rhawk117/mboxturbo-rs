@@ -7,7 +7,6 @@ mod export_mbox {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use arrow_schema::ArrowError;
     use mboxturbo::{
         CancelToken, Column, Destination, Export, Mailbox, MboxExporter, MboxTurboError, Pipeline,
         Selection,
@@ -148,14 +147,11 @@ mod export_mbox {
             .run(Box::new(MboxExporter::new()))
             .expect_err("the sink needs the raw column");
 
-        let MboxTurboError::Arrow {
-            source: ArrowError::SchemaError(message),
-            ..
-        } = error
-        else {
-            panic!("the refusal is an Arrow schema error");
+        let MboxTurboError::UnsupportedColumn { column, sink, .. } = error else {
+            panic!("the refusal is an unsupported column error");
         };
-        assert!(message.contains("`raw`"), "the raw column is named");
+        assert_eq!(sink, "mbox", "the sink is named");
+        assert_eq!(column, "raw", "the raw column is named");
         assert!(!fixture.target().exists(), "nothing was written");
     }
 

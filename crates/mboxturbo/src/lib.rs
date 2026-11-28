@@ -21,6 +21,7 @@ mod builder;
 mod columns;
 mod csv_sink;
 mod eml_sink;
+mod encode;
 mod error;
 mod export;
 mod fields;

@@ -1,14 +1,16 @@
 //! The CSV sink of the export driver.
 
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
+use arrow_schema::{ArrowError, SchemaRef};
 use serde_json::Value;
 
+use crate::encode::{Binary, cell_value, check_encodable, encode_failure, write_stream};
 use crate::error::MboxTurboError;
 use crate::export::Exporter;
-use crate::jsonl_sink::cell_value;
-use crate::staging::{DestinationKind, Output, Staged};
-use crate::width::widen;
+use crate::staging::{DestinationKind, Staged};
+
+/// What error messages call this sink.
+const SINK: &str = "CSV";
 
 /// Whether the CSV sink defuses cells a spreadsheet would read as a formula.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -30,8 +32,8 @@ pub enum FormulaEscaping {
 /// RFC 3339 UTC string, and a missing value an empty cell.
 ///
 /// [`Exporter::begin`] refuses a schema holding a column type the sink cannot encode, such as
-/// [`Column::Raw`](crate::Column::Raw), with an [`MboxTurboError::Arrow`] schema error naming the
-/// column, before anything is written.
+/// [`Column::Raw`](crate::Column::Raw), with an [`MboxTurboError::UnsupportedColumn`] naming the
+/// column and the sink, before anything is written.
 #[derive(Debug, Clone, Copy)]
 pub struct CsvExporter {
     /// How text cells that look like formulas are written.
@@ -52,24 +54,13 @@ impl Exporter for CsvExporter {
     }
 
     fn begin(&mut self, schema: &SchemaRef, staged: &mut Staged) -> Result<(), MboxTurboError> {
-        for field in schema.fields() {
-            if !is_encodable(field.data_type()) {
-                return Err(MboxTurboError::Arrow {
-                    positions: 0..0,
-                    source: ArrowError::SchemaError(format!(
-                        "the `{}` column has a type the CSV sink cannot encode: {}",
-                        field.name(),
-                        field.data_type()
-                    )),
-                });
-            }
-        }
+        check_encodable(schema, SINK, Binary::Refused)?;
         let mut header = Vec::new();
         for (index, field) in schema.fields().iter().enumerate() {
             push_field(&mut header, index, field.name());
         }
         header.extend_from_slice(b"\r\n");
-        write_bytes(staged, &header).map(drop)
+        write_stream(staged, &header).map(drop)
     }
 
     fn finish(&mut self, _staged: &mut Staged) -> Result<u64, MboxTurboError> {
@@ -80,12 +71,13 @@ impl Exporter for CsvExporter {
         let mut encoded = Vec::new();
         for row in 0..batch.num_rows() {
             for (index, column) in batch.columns().iter().enumerate() {
-                let cell = cell_text(column.as_ref(), row, self.escaping)?;
+                let cell = cell_text(column.as_ref(), row, self.escaping)
+                    .map_err(|source| encode_failure(SINK, staged, source))?;
                 push_field(&mut encoded, index, &cell);
             }
             encoded.extend_from_slice(b"\r\n");
         }
-        write_bytes(staged, &encoded)
+        write_stream(staged, &encoded)
     }
 }
 
@@ -94,7 +86,7 @@ fn cell_text(
     array: &dyn Array,
     row: usize,
     escaping: FormulaEscaping,
-) -> Result<String, MboxTurboError> {
+) -> Result<String, ArrowError> {
     let value = cell_value(array, row)?;
     Ok(match value {
         Value::Null => String::new(),
@@ -116,28 +108,6 @@ fn escape_formula(text: String, escaping: FormulaEscaping) -> String {
     }
 }
 
-/// Whether `data_type` is one of the types the sink writes, or a list or struct of them.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "Arrow has dozens of types and only the ones the columns produce are encoded"
-)]
-fn is_encodable(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::List(field) => is_encodable(field.data_type()),
-        DataType::Struct(fields) => fields.iter().all(|field| is_encodable(field.data_type())),
-        DataType::Timestamp(unit, _) => *unit == TimeUnit::Microsecond,
-        DataType::Boolean
-        | DataType::UInt8
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Int8
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Utf8 => true,
-        _ => false,
-    }
-}
-
 /// Appends `text` to `buffer` as the field at column `index`, comma-separated and quoted when
 /// it holds a comma, double quote, CR or LF.
 fn push_field(buffer: &mut Vec<u8>, index: usize, text: &str) {
@@ -153,27 +123,17 @@ fn push_field(buffer: &mut Vec<u8>, index: usize, text: &str) {
     }
 }
 
-/// Writes `bytes` to the staged destination and returns how many.
-fn write_bytes(staged: &mut Staged, bytes: &[u8]) -> Result<u64, MboxTurboError> {
-    let Output::Writer(destination) = staged.output() else {
-        // `accepts` refuses directory destinations
-        return Err(staged.unsupported());
-    };
-    let written = destination.write_all(bytes);
-    written.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
-    Ok(widen(bytes.len()))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FormulaEscaping, cell_text, is_encodable};
+    use super::{FormulaEscaping, cell_text};
+    use crate::encode::{Binary, is_encodable};
     use crate::jsonl_sink::tests::sets_column;
 
     #[test]
     fn a_list_of_structs_is_one_compact_json_cell() {
         let column = sets_column();
         assert!(
-            is_encodable(column.data_type()),
+            is_encodable(column.data_type(), Binary::Refused),
             "a list of structs of encodable fields is accepted"
         );
         assert_eq!(

@@ -10,7 +10,7 @@ mod export_csv {
     use std::{fs, io};
 
     use arrow_array::RecordBatch;
-    use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use mboxturbo::{
         CancelToken, Column, CsvExporter, Destination, Export, Exporter, FormulaEscaping, Mailbox,
         MboxTurboError, Overwrite, Pipeline, Staged,
@@ -372,14 +372,11 @@ mod export_csv {
             .run(Box::new(CsvExporter::new(FormulaEscaping::Prefix)))
             .expect_err("raw cannot be a CSV cell");
 
-        let MboxTurboError::Arrow {
-            source: ArrowError::SchemaError(message),
-            ..
-        } = error
-        else {
-            panic!("the refusal is an Arrow schema error");
+        let MboxTurboError::UnsupportedColumn { column, sink, .. } = error else {
+            panic!("the refusal is an unsupported column error");
         };
-        assert!(message.contains("`raw`"), "the column is named");
+        assert_eq!(sink, "CSV", "the sink is named");
+        assert_eq!(column, "raw", "the column is named");
         assert!(
             fixture.leftovers().is_empty(),
             "nothing is left at or beside the target"
@@ -400,14 +397,11 @@ mod export_csv {
             .begin(&schema, &mut staged)
             .expect_err("a float column cannot be encoded");
 
-        let MboxTurboError::Arrow {
-            source: ArrowError::SchemaError(message),
-            ..
-        } = error
-        else {
-            panic!("the refusal is an Arrow schema error");
+        let MboxTurboError::UnsupportedColumn { column, sink, .. } = error else {
+            panic!("the refusal is an unsupported column error");
         };
-        assert!(message.contains("`ratio`"), "the column is named");
+        assert_eq!(sink, "CSV", "the sink is named");
+        assert_eq!(column, "ratio", "the column is named");
         assert!(
             fs::read(fixture.target()).map_or(true, |bytes| bytes.is_empty()),
             "nothing was written"

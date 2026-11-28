@@ -34,9 +34,10 @@ pub(crate) enum Stage {
 ///
 /// | Failure | Code |
 /// |---------|------|
-/// | other failure (Arrow, Parquet, unsupported destination, any future variant) | 1 |
+/// | other failure (Arrow, `Encode`, Parquet, unsupported destination, any future variant) | 1 |
 /// | `InvalidPredicate` (`--where` or `--where-file` is not valid JSON or fails validation) | 64 |
 /// | `PositionOutOfRange` (usage) | 64 |
+/// | `UnsupportedColumn` (`--columns` names a column the format cannot write) | 64 |
 /// | `CorruptIndex`, `StaleIndex` | 65 |
 /// | `Io` whose source is `NotFound` for the mailbox path itself (mailbox missing) | 66 |
 /// | `TargetExists`, `TargetNotReplaceable` | 73 |
@@ -51,14 +52,15 @@ pub(crate) enum Stage {
 pub(crate) fn error_code(stage: Stage, error: &MboxTurboError) -> u8 {
     match error {
         MboxTurboError::Arrow { .. }
+        | MboxTurboError::Encode { .. }
         | MboxTurboError::Parquet { .. }
         | MboxTurboError::UnsupportedDestination { .. } => OTHER,
         MboxTurboError::Cancelled { .. } => INTERRUPTED,
         MboxTurboError::CorruptIndex { .. } | MboxTurboError::StaleIndex { .. } => CORRUPT,
         MboxTurboError::Io { source, .. } => io_code(stage, source),
-        MboxTurboError::InvalidPredicate { .. } | MboxTurboError::PositionOutOfRange { .. } => {
-            USAGE
-        },
+        MboxTurboError::InvalidPredicate { .. }
+        | MboxTurboError::PositionOutOfRange { .. }
+        | MboxTurboError::UnsupportedColumn { .. } => USAGE,
         MboxTurboError::TargetExists { .. } | MboxTurboError::TargetNotReplaceable { .. } => {
             TARGET_EXISTS
         },
@@ -190,6 +192,16 @@ mod tests {
         let error = Predicate::from_json("{\"op\":\"and\",\"args\":[]}")
             .expect_err("an empty `and` is invalid");
         assert_eq!(code(&error), 64, "an invalid predicate is a usage error");
+    }
+
+    #[test]
+    fn an_unusable_column_exits_64() {
+        let error = MboxTurboError::UnsupportedColumn {
+            column: "raw".into(),
+            sink: "CSV",
+            reason: "its type cannot be encoded by this sink",
+        };
+        assert_eq!(code(&error), 64, "an unusable column is a usage error");
     }
 
     #[test]

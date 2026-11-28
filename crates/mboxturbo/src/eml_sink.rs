@@ -12,17 +12,20 @@ use arrow_array::types::{TimestampMicrosecondType, UInt64Type};
 use arrow_array::{
     Array as _, LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
 };
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::SchemaRef;
 use mail_parser::DateTime;
 use memchr::memmem;
 use serde_json::{Value, json};
 
 use crate::columns::Column;
+use crate::encode::{column_index, null_error};
 use crate::error::MboxTurboError;
 use crate::export::Exporter;
 use crate::staging::{DestinationKind, Output, Staged};
 use crate::width::widen;
 
+/// What error messages call this sink.
+const SINK: &str = "EML";
 /// The byte that ends a line.
 const NEWLINE: u8 = b'\n';
 /// The byte that quotes a `From ` line in mboxrd.
@@ -49,7 +52,7 @@ const MIN_FILES_PER_WORKER: usize = 64;
 /// `position` to `file`, `message_id` and `date` (RFC 3339 UTC); the last two are `null` when
 /// the message has none or the export did not extract them. The export must extract
 /// [`Column::Raw`] and [`Column::Position`]; [`Exporter::begin`] refuses a schema without them
-/// with an [`MboxTurboError::Arrow`] schema error naming the column. Only directory
+/// with an [`MboxTurboError::UnsupportedColumn`] naming the column and the sink. Only directory
 /// destinations are accepted.
 #[derive(Debug)]
 pub struct EmlExporter {
@@ -97,8 +100,8 @@ impl Exporter for EmlExporter {
     }
 
     fn begin(&mut self, schema: &SchemaRef, staged: &mut Staged) -> Result<(), MboxTurboError> {
-        column_index(schema, &Column::Raw).map(drop)?;
-        column_index(schema, &Column::Position).map(drop)?;
+        column_index(schema, &Column::Raw, SINK).map(drop)?;
+        column_index(schema, &Column::Position, SINK).map(drop)?;
         let Output::Directory(directory) = staged.output() else {
             // `accepts` refuses every other destination
             return Err(staged.unsupported());
@@ -209,24 +212,13 @@ impl<'batch> Columns<'batch> {
             ids: optional_index(&schema, &Column::MessageId)
                 .map(|index| batch.column(index).as_string::<i32>()),
             positions: batch
-                .column(column_index(&schema, &Column::Position)?)
+                .column(column_index(&schema, &Column::Position, SINK)?)
                 .as_primitive::<UInt64Type>(),
             raws: batch
-                .column(column_index(&schema, &Column::Raw)?)
+                .column(column_index(&schema, &Column::Raw, SINK)?)
                 .as_binary::<i64>(),
         })
     }
-}
-
-/// The index of `column` in `schema`, or an Arrow schema error naming it.
-fn column_index(schema: &SchemaRef, column: &Column) -> Result<usize, MboxTurboError> {
-    let name = column.name();
-    schema
-        .index_of(&name)
-        .map_err(|_missing| MboxTurboError::Arrow {
-            positions: 0..0,
-            source: ArrowError::SchemaError(format!("the `{name}` column was not extracted")),
-        })
 }
 
 /// The index of `column` in `schema`, or `None` when the export did not extract it.
@@ -234,14 +226,6 @@ fn optional_index(schema: &SchemaRef, column: &Column) -> Option<usize> {
     schema
         .column_with_name(&column.name())
         .map(|(index, _field)| index)
-}
-
-/// The error for a null `raw` or `position` value at `row` of a batch.
-fn null_error(row: usize) -> MboxTurboError {
-    MboxTurboError::Arrow {
-        positions: row..row.saturating_add(1),
-        source: ArrowError::SchemaError("the `raw` and `position` columns must not be null".into()),
-    }
 }
 
 /// `micros` since the epoch as an RFC 3339 UTC string, to the second.
@@ -253,6 +237,8 @@ fn rfc3339(micros: i64) -> String {
 ///
 /// Borrows the body when no line is quoted, which is most messages, and copies it otherwise.
 fn unquote(raw: &[u8]) -> Cow<'_, [u8]> {
+    // A message with no newline, or whose first line ends the bytes, has no body, so empty is
+    // the right body; `end` indexes a byte of `raw`, so `get` is never out of range.
     let body = memchr::memchr(NEWLINE, raw).map_or(&[][..], |end| {
         raw.get(end.saturating_add(1)..).unwrap_or(&[])
     });

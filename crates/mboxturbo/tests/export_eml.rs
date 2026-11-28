@@ -7,7 +7,6 @@ mod export_eml {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use arrow_schema::ArrowError;
     use mboxturbo::{
         CancelToken, Column, Destination, EmlExporter, Export, Mailbox, MboxTurboError, Pipeline,
         Selection,
@@ -352,14 +351,11 @@ mod export_eml {
                 .run(Box::new(EmlExporter::new(MESSAGES)))
                 .expect_err("the sink needs both columns");
 
-            let MboxTurboError::Arrow {
-                source: ArrowError::SchemaError(message),
-                ..
-            } = error
-            else {
-                panic!("the refusal is an Arrow schema error");
+            let MboxTurboError::UnsupportedColumn { column, sink, .. } = error else {
+                panic!("the refusal is an unsupported column error");
             };
-            assert!(message.contains(missing), "{missing} is named");
+            assert_eq!(sink, "EML", "the sink is named");
+            assert_eq!(column, missing.trim_matches('`'), "{missing} is named");
             assert!(!fixture.target().exists(), "nothing was written");
         }
     }
