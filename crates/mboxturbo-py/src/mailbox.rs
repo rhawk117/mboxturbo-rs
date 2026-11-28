@@ -16,11 +16,12 @@ use std::sync::{Arc, PoisonError, RwLock};
 use pyo3::IntoPyObjectExt as _;
 use pyo3::exceptions::{PyIndexError, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PySlice, PyTuple};
+use pyo3::types::{PyDateTime, PySlice, PyTuple};
 
 use crate::errors::{closed, into_py_err};
-use crate::export::{Selection, select_columns};
+use crate::export::{Filters, Selection, select_columns};
 use crate::message::Message;
+use crate::predicates::{Predicate, Trust};
 
 /// A mailbox mapping shared between a handle and the iterators and messages taken from it.
 type Shared = Arc<mboxturbo::Mailbox>;
@@ -186,9 +187,42 @@ impl Mailbox {
     /// Selects columns for export; ``None`` selects every column that needs only headers.
     /// Name columns from the catalogue (``subject``, ``received``, ``attachment_sha256``…) or
     /// as ``header:<Name>`` for any header's raw values.
-    #[pyo3(signature = (columns = None, *, batch_size = 8192))]
-    fn select(&self, columns: Option<Vec<String>>, batch_size: usize) -> PyResult<Selection> {
-        select_columns(self.slot.get()?, columns, batch_size)
+    ///
+    /// ``positions``, ``since``/``until`` (timezone-aware, ``since <= date < until`` on the
+    /// index date) and ``where`` each narrow the rows; the selection keeps the messages every
+    /// one given admits, in ascending position order. ``trust`` decides the trusted flags and
+    /// verdict columns and the ``verdict`` predicates; without it they are null and never match.
+    /// ``excluded_undated`` on the result counts the undated messages a bound dropped.
+    #[pyo3(signature = (
+        columns = None,
+        *,
+        batch_size = 8192,
+        positions = None,
+        since = None,
+        until = None,
+        r#where = None,
+        trust = None
+    ))]
+    fn select(
+        &self,
+        py: Python<'_>,
+        columns: Option<Vec<String>>,
+        batch_size: usize,
+        positions: Option<Vec<usize>>,
+        since: Option<&Bound<'_, PyDateTime>>,
+        until: Option<&Bound<'_, PyDateTime>>,
+        r#where: Option<&Bound<'_, Predicate>>,
+        trust: Option<&Bound<'_, Trust>>,
+    ) -> PyResult<Selection> {
+        let filters = Filters::from_python(
+            py,
+            positions,
+            since,
+            until,
+            r#where.map(Bound::get),
+            trust.map(Bound::get),
+        )?;
+        select_columns(py, self.slot.get()?, columns, batch_size, &filters)
     }
 }
 

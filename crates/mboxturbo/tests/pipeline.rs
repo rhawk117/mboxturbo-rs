@@ -8,12 +8,15 @@ mod pipeline {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use arrow_array::RecordBatch;
     use arrow_array::cast::AsArray as _;
-    use arrow_array::types::UInt64Type;
+    use arrow_array::types::{
+        Int8Type, Int32Type, TimestampMicrosecondType, UInt8Type, UInt64Type,
+    };
+    use arrow_array::{Array as _, RecordBatch, StructArray};
+    use mail_parser::MessageParser;
     use mboxturbo::{
         Column, Compression, Destination, Export, Mailbox, MboxTurboError, ParquetExporter,
-        Pipeline, Selection,
+        Pipeline, Selection, TrustSet,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use proptest::prelude::*;
@@ -44,6 +47,161 @@ Content-Transfer-Encoding: base64\n\
 \n\
 AAEC\n\
 --B--\n";
+
+    const DATE_MIX: [&str; 10] = [
+        "Date: Mon, 01 Jan 2024 12:00:00 +0000\n",
+        "Date: Mon Jan  1 12:00:00 2024\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 EST\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 -0500 (EST)\n",
+        "Date: Mon, 01 Jan 24 12:00:00 +1400\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 +0000\nDate: Tue, 02 Jan 2024 08:30:00 -0700\n",
+        "Date: Mon, 01 Jan 2024\n 12:00:00 +0530\n",
+        "Date: not a date\n",
+        "Subject: no date\n",
+        "Date: Mon, 01 Jan 2024 12:00:00 +0000\nDate: not a date\n",
+    ];
+
+    const STRUCTURED: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Authentication-Results: evil.example; dmarc=pass header.from=example.org\n\
+Authentication-Results: mx.example.org; spf=pass smtp.mailfrom=example.org;\n\
+\tdkim=fail reason=\"bad sig\"\n\
+Subject: forged above real\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+ARC-Seal: i=1; a=rsa-sha256; cv=none; d=example.org; s=arc; b=c2VhbA==\n\
+ARC-Message-Signature: i=1; a=rsa-sha256; d=example.org; s=arc; h=from; bh=aGFzaA==; b=c2ln\n\
+ARC-Authentication-Results: i=1; mx.example.org; spf=pass\n\
+DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=sel; h=from:to; bh=aGFzaA==;\n\
+\tb=c2ln; t=1700000000\n\
+Subject: signed\n\
+\n\
+body\n\
+\n\
+From c@example.com Wed Jan  3 00:00:00 2024\n\
+DKIM-Signature: v=1; garbage\n\
+Subject: malformed signature\n\
+\n\
+body\n\
+\n\
+From d@example.com Thu Jan  4 00:00:00 2024\n\
+Subject: none of these headers\n\
+\n\
+body\n";
+
+    /// Three messages: a forged `Authentication-Results` above a real one, an Exchange-style
+    /// id-less header above the first external hop, and the same header below it.
+    const VERDICTS: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Authentication-Results: evil.example; dmarc=pass header.from=example.org\n\
+Authentication-Results: mx.example.org; dmarc=fail header.from=example.org;\n\
+\tspf=pass smtp.mailfrom=example.org; dkim=softfail header.d=example.org\n\
+Subject: forged above real\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Received: from sender.example.net (sender.example.net [203.0.113.5])\n\
+\tby mx.example.org with ESMTPS id 1; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Subject: id-less above the first external hop\n\
+\n\
+body\n\
+\n\
+From c@example.com Wed Jan  3 00:00:00 2024\n\
+Received: from sender.example.net (sender.example.net [203.0.113.5])\n\
+\tby mx.example.org with ESMTPS id 2; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Subject: id-less below the first external hop\n\
+\n\
+body\n";
+
+    /// Two messages whose real boundary hop presents a trusted HELO, a name in the first and a
+    /// `[literal]` in the second, from an untrusted recorded address, over a forged hop the
+    /// sender wrote and an id-less `dmarc=pass` between them (MV-1).
+    const HELO_SPOOF: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Received: from mx.example.org (unknown [198.51.100.7])\n\
+\tby mx.example.org with ESMTP id 1; Mon, 2 Nov 2026 10:00:01 +0000\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Received: from x.example.net ([198.51.100.66])\n\
+\tby mx.example.org with ESMTP id 0; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Subject: HELO names a trusted relay\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+Received: from [192.0.2.9] (unknown [198.51.100.7])\n\
+\tby mx.example.org with ESMTP id 1; Mon, 2 Nov 2026 10:00:01 +0000\n\
+Authentication-Results: spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org;\n\
+\tdmarc=pass action=none header.from=example.org; compauth=pass reason=100\n\
+Received: from x.example.net ([198.51.100.66])\n\
+\tby mx.example.org with ESMTP id 0; Mon, 2 Nov 2026 10:00:00 +0000\n\
+Subject: HELO literal is a trusted relay address\n\
+\n\
+body\n";
+
+    const VERDICT_COLUMNS: [Column; 4] = [
+        Column::VerdictDmarc,
+        Column::VerdictSpf,
+        Column::VerdictDkim,
+        Column::VerdictCompauth,
+    ];
+
+    /// Header blocks of messages with varied real-world `Received` forms, newest hop first.
+    const RECEIVED_CORPUS: [&str; 13] = [
+        "Received: from mail.example.org (mail.example.org [203.0.113.7])\n\
+\tby mx.example.com (Postfix) with ESMTPS id 4ABC123\n\
+\tfor <a@example.com>; Mon, 2 Nov 2026 10:00:00 +0000 (UTC)\n",
+        "Received: from [192.0.2.4] (helo=host.example.net)\n\
+\tby mx.example.com with esmtp (Exim 4.96) (envelope-from <s@example.net>)\n\
+\tid 1abc-0002-XY for a@example.com; Tue, 03 Nov 2026 11:00:00 +0100\n",
+        "Received: from AM6PR01MB1234.eurprd01.prod.exchangelabs.com (2603:10a6:20b::22)\n\
+\tby DB8PR01MB5678.eurprd01.prod.exchangelabs.com with Microsoft SMTP Server\n\
+\t(version=TLS1_2, cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.20.1;\n\
+\tWed, 4 Nov 2026 12:00:00 +0000\n",
+        "Received: by 2002:a17:906:1234:0:0:0:0 with SMTP id b1csp123ejc;\n\
+\tThu, 5 Nov 2026 01:00:00 -0800 (PST)\n\
+Received: from mail-sor-f41.google.com (mail-sor-f41.google.com. [209.85.220.41])\n\
+\tby mx.google.com with SMTPS id abc123 for <a@gmail.com>\n\
+\t(Google Transport Security); Thu, 5 Nov 2026 01:00:00 -0800 (PST)\n",
+        "Received: (qmail 4242 invoked by uid 1000); 5 Nov 2026 09:00:00 -0000\n",
+        "Received: from relay.example.org\n\
+\t(relay.example.org\n\
+\t[198.51.100.9])\n\
+\tby mx.example.com\n\
+\twith ESMTP\n\
+\tid Z9; Fri, 6 Nov 2026 09:00:00 +0000\n",
+        "Received: by mx.example.com (Postfix, from userid 0)\n\
+\tid ABC; Sat, 7 Nov 2026 08:00:00 +0000\n",
+        "Received: from a.example.org by mx.example.com with SMTP id 1\n",
+        "Received: ;;;((( not a received header at all\n",
+        "Subject: no received header\n",
+        "Received: from mx.example.net (mx.example.net [192.0.2.1])\n\
+\t(using TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits))\n\
+\tby mx.example.com (Postfix) with ESMTPS id 1; Sun, 8 Nov 2026 07:00:00 +0000\n",
+        "Received: from mx.example.com (mx.example.com [192.0.2.10])\n\
+\tby mx2.example.com with ESMTP id 2; Mon, 9 Nov 2026 07:00:03 +0000\n\
+Received: from edge.example.org (edge.example.org [198.51.100.5])\n\
+\tby mx.example.com with ESMTP id 3; Mon, 9 Nov 2026 07:00:01 +0000\n",
+        "Received: from\n",
+    ];
+
+    const PARSED_HEADERS: &str = "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Received-SPF: pass (example.com: domain of a@example.org designates 192.0.2.1 as permitted\n\
+\tsender) client-ip=192.0.2.1; envelope-from=a@example.org;\n\
+X-Forefront-Antispam-Report: CIP:192.0.2.1;SCL:5;CAT:SPM;SFV:SPM;\n\
+X-Microsoft-Antispam: BCL:3;\n\
+Subject: scored\n\
+\n\
+body\n\
+\n\
+From b@example.com Tue Jan  2 00:00:00 2024\n\
+Subject: none of these headers\n\
+\n\
+body\n";
 
     struct Fixture {
         directory: TempDir,
@@ -92,6 +250,17 @@ AAEC\n\
                 .collect::<Result<_, _>>()
                 .expect("every parquet batch is decoded")
         }
+    }
+
+    /// The corpus as one mailbox, each header block followed by a one-line body.
+    fn corpus_mbox() -> String {
+        let mut mbox = String::new();
+        for headers in RECEIVED_CORPUS {
+            mbox.push_str("From x Mon Jan  1 00:00:00 2024\n");
+            mbox.push_str(headers);
+            mbox.push_str("\nbody\n\n");
+        }
+        mbox
     }
 
     fn text_lists(batch: &RecordBatch, column: usize) -> Vec<Vec<String>> {
@@ -237,6 +406,71 @@ AAEC\n\
         let pipeline = Arc::new(Pipeline::new(Column::defaults(), 1));
         let rows = fixture.export_parquet(&pipeline);
         assert_eq!(rows, 2, "both fixture messages are counted");
+    }
+
+    /// A select of the whole date fixture with the Date and offset columns, one row per message.
+    fn date_batch() -> (Fixture, RecordBatch) {
+        let contents = DATE_MIX
+            .iter()
+            .map(|header| format!("From x Mon Jan  1 00:00:00 2024\n{header}\nbody\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let fixture = Fixture::with(&contents);
+        let pipeline = Arc::new(Pipeline::new(
+            vec![Column::Date, Column::DateOffsetMinutes],
+            DATE_MIX.len(),
+        ));
+        let batch = pipeline
+            .select(&fixture.mailbox, Selection::All)
+            .expect("the whole mailbox is selectable")
+            .next()
+            .expect("one batch covers the fixture")
+            .expect("the batch is assembled");
+        (fixture, batch)
+    }
+
+    fn assert_date_row_agrees(fixture: &Fixture, batch: &RecordBatch, position: usize) {
+        let dates = batch.column(0).as_primitive::<TimestampMicrosecondType>();
+        let offsets = batch.column(1).as_primitive::<Int32Type>();
+        let indexed = fixture
+            .mailbox
+            .date(position)
+            .map(|seconds| seconds.saturating_mul(1_000_000));
+        let stamp = fixture
+            .mailbox
+            .message(position)
+            .expect("the position exists")
+            .date();
+        assert_eq!(
+            dates.is_valid(position).then(|| dates.value(position)),
+            indexed,
+            "message {position}: the Date column matches the index"
+        );
+        assert_eq!(
+            stamp.map(|found| found.unix_seconds.saturating_mul(1_000_000)),
+            indexed,
+            "message {position}: Message::date matches the index"
+        );
+        assert_eq!(
+            offsets.is_valid(position).then(|| offsets.value(position)),
+            stamp.map(|found| found.offset_minutes),
+            "message {position}: the offset column matches Message::date"
+        );
+    }
+
+    #[test]
+    fn the_date_column_equals_the_index_date_for_every_message() {
+        let (fixture, batch) = date_batch();
+        for position in 0..DATE_MIX.len() {
+            assert_date_row_agrees(&fixture, &batch, position);
+        }
+        let dates = batch.column(0).as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            dates.null_count(),
+            3,
+            "unparsable, missing and bad-last are null"
+        );
+        assert!(fixture.mailbox.date(1).is_some(), "asctime is dated");
     }
 
     #[test]
@@ -514,6 +748,780 @@ AAEC\n\
             2_i32,
             "the pool still runs work after the reader was dropped"
         );
+    }
+
+    fn structured_batch(columns: &[Column], trust: Option<TrustSet>) -> RecordBatch {
+        let fixture = Fixture::with(STRUCTURED);
+        let base = Pipeline::new(columns.to_vec(), 8);
+        let pipeline = Arc::new(match trust {
+            Some(set) => base.with_trust(set),
+            None => base,
+        });
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("four messages fit one batch of eight")
+            .expect("the structured batch is assembled")
+    }
+
+    fn trust_mx() -> TrustSet {
+        TrustSet::new().add_authserv_id("mx.example.org").clone()
+    }
+
+    /// The elements of row `row` of the list-of-struct column `column`.
+    fn elements(batch: &RecordBatch, column: usize, row: usize) -> StructArray {
+        batch
+            .column(column)
+            .as_list::<i32>()
+            .value(row)
+            .as_struct()
+            .clone()
+    }
+
+    fn text_field(elements: &StructArray, name: &str) -> Vec<Option<String>> {
+        elements
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("the element struct has a {name} field"))
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.map(str::to_owned))
+            .collect()
+    }
+
+    fn assert_tags(elements: &StructArray, column: &str, expected: &[&str]) {
+        let list = elements
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("the element struct has a {column} field"))
+            .as_list::<i32>()
+            .value(0);
+        let tags = list.as_struct();
+        let pairs: Vec<String> = text_field(tags, "name")
+            .into_iter()
+            .zip(text_field(tags, "value"))
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    name.expect("a tag has a name"),
+                    value.expect("a tag has a value")
+                )
+            })
+            .collect();
+        assert_eq!(pairs, expected, "the {column} tag list is exposed");
+    }
+
+    fn trusted_flags(elements: &StructArray) -> Vec<Option<bool>> {
+        elements
+            .column_by_name("trusted")
+            .expect("the element struct has a trusted field")
+            .as_boolean()
+            .iter()
+            .collect()
+    }
+
+    fn issue_kinds(elements: &StructArray, element: usize) -> Vec<String> {
+        let issues = elements
+            .column_by_name("issues")
+            .expect("the element struct has an issues field")
+            .as_list::<i32>()
+            .value(element);
+        text_field(issues.as_struct(), "kind")
+            .into_iter()
+            .map(|kind| kind.expect("an issue always has a kind"))
+            .collect()
+    }
+
+    #[test]
+    fn a_forged_topmost_authentication_results_is_untrusted_and_the_real_one_trusted() {
+        let batch = structured_batch(&[Column::AuthResults], Some(trust_mx()));
+        let first = elements(&batch, 0, 0);
+        assert_eq!(
+            text_field(&first, "authserv_id"),
+            vec![
+                Some("evil.example".to_owned()),
+                Some("mx.example.org".to_owned())
+            ],
+            "both headers are listed in header order"
+        );
+        assert_eq!(
+            trusted_flags(&first),
+            vec![Some(false), Some(true)],
+            "only the authserv-id in the trust set is trusted"
+        );
+    }
+
+    #[test]
+    fn without_a_trust_set_every_trusted_flag_is_null() {
+        let batch = structured_batch(&[Column::AuthResults], None);
+        assert_eq!(
+            trusted_flags(&elements(&batch, 0, 0)),
+            vec![None, None],
+            "nothing can be said without a trust set"
+        );
+    }
+
+    fn trust_mx_relay() -> TrustSet {
+        TrustSet::new()
+            .add_authserv_id("mx.example.org")
+            .add_host("mx.example.org")
+            .clone()
+    }
+
+    fn trust_mx_relay_idless() -> TrustSet {
+        trust_mx_relay().trust_idless_inside(true).clone()
+    }
+
+    /// The `auth_results` and four verdict columns of the three `VERDICTS` messages.
+    fn verdicts_batch(trust: Option<TrustSet>) -> RecordBatch {
+        let fixture = Fixture::with(VERDICTS);
+        let mut columns = vec![Column::AuthResults];
+        columns.extend(VERDICT_COLUMNS);
+        let base = Pipeline::new(columns, 8);
+        let pipeline = Arc::new(match trust {
+            Some(set) => base.with_trust(set),
+            None => base,
+        });
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("three messages fit one batch of eight")
+            .expect("the verdict batch is assembled")
+    }
+
+    /// The dmarc, spf, dkim and compauth verdicts of message `row`.
+    fn verdicts_of(batch: &RecordBatch, row: usize) -> Vec<Option<String>> {
+        (1..=4)
+            .map(|column| {
+                let values = batch.column(column).as_string::<i32>();
+                values.is_valid(row).then(|| values.value(row).to_owned())
+            })
+            .collect()
+    }
+
+    fn some_words(words: [&str; 4]) -> Vec<Option<String>> {
+        words.iter().map(|word| Some((*word).to_owned())).collect()
+    }
+
+    #[test]
+    fn verdicts_ignore_a_forged_topmost_authentication_results() {
+        let batch = verdicts_batch(Some(trust_mx_relay()));
+        assert_eq!(
+            batch.column(1).as_string::<i32>().value(0),
+            "fail",
+            "the trusted dmarc=fail wins over the forged dmarc=pass above it"
+        );
+        assert_eq!(
+            verdicts_of(&batch, 0)[1..3],
+            [Some("pass".to_owned()), Some("softfail".to_owned())],
+            "spf and dkim come from the trusted header too"
+        );
+        assert_eq!(
+            verdicts_of(&batch, 0)[3],
+            None,
+            "a method no trusted header names is null"
+        );
+    }
+
+    #[test]
+    fn verdicts_are_null_without_a_trust_set() {
+        let batch = verdicts_batch(None);
+        for row in 0..3 {
+            assert_eq!(
+                verdicts_of(&batch, row),
+                vec![None; 4],
+                "message {row}: nothing can be said without a trust set"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idless_header_above_the_first_external_hop_gives_verdicts_only_with_the_switch_on() {
+        let on = verdicts_batch(Some(trust_mx_relay_idless()));
+        assert_eq!(
+            verdicts_of(&on, 1),
+            some_words(["pass", "pass", "pass", "pass"]),
+            "the Exchange-style header inside the trusted relays sets all four verdicts"
+        );
+        assert_eq!(
+            trusted_flags(&elements(&on, 0, 1)),
+            vec![Some(true)],
+            "auth_results agrees with the verdicts"
+        );
+        let off = verdicts_batch(Some(trust_mx_relay()));
+        assert_eq!(
+            verdicts_of(&off, 1),
+            vec![None; 4],
+            "the switch is off by default, so an id-less header sets nothing"
+        );
+        assert_eq!(
+            trusted_flags(&elements(&off, 0, 1)),
+            vec![Some(false)],
+            "an id-less header is untrusted with the switch off"
+        );
+    }
+
+    #[test]
+    fn an_idless_header_below_the_first_external_hop_stays_untrusted_with_the_switch_on() {
+        let batch = verdicts_batch(Some(trust_mx_relay_idless()));
+        assert_eq!(
+            trusted_flags(&elements(&batch, 0, 2)),
+            vec![Some(false)],
+            "a header the sender could have added is untrusted"
+        );
+        assert_eq!(
+            verdicts_of(&batch, 2),
+            vec![None; 4],
+            "so it sets no verdict"
+        );
+    }
+
+    /// The `received_hops`, `auth_results` and `verdict_dmarc` columns of the `HELO_SPOOF`
+    /// messages, trusting the id-less relay set plus `192.0.2.0/24`.
+    fn helo_spoof_batch() -> RecordBatch {
+        let mut trust = trust_mx_relay_idless();
+        let _relays = trust
+            .add_ip_range("192.0.2.0/24")
+            .expect("the documentation range is a valid CIDR");
+        let fixture = Fixture::with(HELO_SPOOF);
+        let columns = vec![
+            Column::ReceivedHops,
+            Column::AuthResults,
+            Column::VerdictDmarc,
+        ];
+        let pipeline = Arc::new(Pipeline::new(columns, 8).with_trust(trust));
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("two messages fit one batch of eight")
+            .expect("the HELO spoof batch is assembled")
+    }
+
+    #[test]
+    fn a_trusted_helo_from_an_untrusted_address_leaves_a_forged_idless_header_untrusted() {
+        let batch = helo_spoof_batch();
+        for row in 0..2 {
+            assert!(
+                batch.column(2).is_null(row),
+                "message {row}: a header below the real boundary sets no dmarc verdict"
+            );
+            assert_eq!(
+                trusted_flags(&elements(&batch, 1, row)),
+                vec![Some(false)],
+                "message {row}: the id-less header the sender wrote is untrusted"
+            );
+            assert_eq!(
+                first_external_flags(&hops_of(&batch, row)),
+                [Some(false), Some(true)],
+                "message {row}: the real hop is first_external, not the forged one below it"
+            );
+        }
+    }
+
+    /// The `entries` of element `element` of the first message's `auth_results`.
+    fn entries_of(batch: &RecordBatch, element: usize) -> StructArray {
+        let first = elements(batch, 0, 0);
+        let list = first
+            .column_by_name("entries")
+            .expect("the element struct has an entries field")
+            .as_list::<i32>()
+            .value(element);
+        list.as_struct().clone()
+    }
+
+    #[test]
+    fn auth_results_entries_carry_method_result_and_reason() {
+        let batch = structured_batch(&[Column::AuthResults], None);
+        let entries = entries_of(&batch, 1);
+        assert_eq!(
+            text_field(&entries, "method"),
+            vec![Some("spf".to_owned()), Some("dkim".to_owned())],
+            "methods are named as written, in order"
+        );
+        assert_eq!(
+            text_field(&entries, "result"),
+            vec![Some("pass".to_owned()), Some("fail".to_owned())],
+            "results are named as written"
+        );
+        assert_eq!(
+            text_field(&entries, "reason"),
+            vec![None, Some("bad sig".to_owned())],
+            "a missing reason is null and a quoted one is unquoted"
+        );
+    }
+
+    #[test]
+    fn auth_results_entries_carry_their_properties() {
+        let batch = structured_batch(&[Column::AuthResults], None);
+        let entries = entries_of(&batch, 1);
+        let properties = entries
+            .column_by_name("properties")
+            .expect("the entry struct has a properties field")
+            .as_list::<i32>()
+            .value(0);
+        assert_eq!(
+            text_field(properties.as_struct(), "property"),
+            vec![Some("mailfrom".to_owned())],
+            "the spf entry has its smtp.mailfrom property"
+        );
+    }
+
+    #[test]
+    fn a_message_without_the_headers_gets_empty_lists_never_null() {
+        let batch = structured_batch(
+            &[Column::AuthResults, Column::ArcSets, Column::DkimSignatures],
+            None,
+        );
+        for column in [0, 2] {
+            let list = batch.column(column).as_list::<i32>();
+            assert!(
+                list.is_valid(3),
+                "column {column} is not null for a bare message"
+            );
+            assert_eq!(
+                list.value(3).len(),
+                0,
+                "column {column} is empty for a bare message"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_without_arc_headers_gets_an_arc_sets_struct_of_empty_lists() {
+        let batch = structured_batch(&[Column::ArcSets], None);
+        let arc_sets = batch.column(0).as_struct();
+        for name in ["sets", "issues"] {
+            let list = arc_sets
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("arc_sets has a {name} field"))
+                .as_list::<i32>();
+            assert!(
+                list.is_valid(3),
+                "arc_sets.{name} is not null for a bare message"
+            );
+            assert_eq!(
+                list.value(3).len(),
+                0,
+                "arc_sets.{name} is empty for a bare message"
+            );
+        }
+        assert!(
+            arc_sets.is_valid(3),
+            "arc_sets is not null for a bare message"
+        );
+    }
+
+    fn arc_sets_of_second_message() -> StructArray {
+        let batch = structured_batch(&[Column::ArcSets], Some(trust_mx()));
+        arc_sets_of(&batch, 1)
+    }
+
+    /// The sets of message `row` in the `arc_sets` struct column 0.
+    fn arc_sets_of(batch: &RecordBatch, row: usize) -> StructArray {
+        batch
+            .column(0)
+            .as_struct()
+            .column_by_name("sets")
+            .expect("arc_sets has a sets field")
+            .as_list::<i32>()
+            .value(row)
+            .as_struct()
+            .clone()
+    }
+
+    /// The chain-level issue kinds of message `row` in the `arc_sets` struct column 0.
+    fn arc_chain_issue_kinds(batch: &RecordBatch, row: usize) -> Vec<String> {
+        let issues = batch
+            .column(0)
+            .as_struct()
+            .column_by_name("issues")
+            .expect("arc_sets has an issues field")
+            .as_list::<i32>()
+            .value(row);
+        text_field(issues.as_struct(), "kind")
+            .into_iter()
+            .map(|kind| kind.expect("an issue always has a kind"))
+            .collect()
+    }
+
+    #[test]
+    fn three_arc_headers_of_one_instance_form_one_set_with_its_seal() {
+        let batch = structured_batch(&[Column::ArcSets], Some(trust_mx()));
+        let sets = arc_sets_of(&batch, 1);
+        assert_eq!(sets.len(), 1, "the three ARC headers form one set");
+        let instances = sets
+            .column_by_name("instance")
+            .expect("the element struct has an instance field")
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec();
+        assert_eq!(instances, vec![1_u8], "the set is instance 1");
+        assert_eq!(
+            text_field(&sets, "chain_validation"),
+            vec![Some("none".to_owned())],
+            "the seal's cv tag is exposed"
+        );
+        assert!(
+            arc_chain_issue_kinds(&batch, 1).is_empty(),
+            "a complete ARC set has no issues"
+        );
+    }
+
+    #[test]
+    fn an_arc_chain_problem_that_names_no_instance_is_reported_in_arc_sets_issues() {
+        let fixture = Fixture::with(
+            "From a@example.com Mon Jan  1 00:00:00 2024\n\
+ARC-Seal: a=rsa-sha256; cv=none; d=example.org; s=arc; b=c2VhbA==\n\
+Subject: seal without an instance\n\
+\n\
+body\n",
+        );
+        let batches = fixture.batches(&[Column::ArcSets], 8);
+        let batch = batches.first().expect("one batch holds the message");
+        assert_eq!(
+            arc_sets_of(batch, 0).len(),
+            0,
+            "the seal without an instance forms no set"
+        );
+        assert!(
+            !arc_chain_issue_kinds(batch, 0).is_empty(),
+            "the dropped header is reported at the chain level"
+        );
+    }
+
+    #[test]
+    fn an_arc_sets_seal_and_message_signature_expose_their_tag_lists_in_header_order() {
+        let sets = arc_sets_of_second_message();
+        assert_tags(
+            &sets,
+            "seal",
+            &[
+                "i=1",
+                "a=rsa-sha256",
+                "cv=none",
+                "d=example.org",
+                "s=arc",
+                "b=c2VhbA==",
+            ],
+        );
+        assert_tags(
+            &sets,
+            "message_signature",
+            &[
+                "i=1",
+                "a=rsa-sha256",
+                "d=example.org",
+                "s=arc",
+                "h=from",
+                "bh=aGFzaA==",
+                "b=c2ln",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_arc_sets_authentication_results_are_judged_by_the_trust_set() {
+        let sets = arc_sets_of_second_message();
+        let results = sets
+            .column_by_name("authentication_results")
+            .expect("the element struct has an authentication_results field")
+            .as_struct();
+        assert_eq!(
+            text_field(results, "authserv_id"),
+            vec![Some("mx.example.org".to_owned())],
+            "the ARC AR carries its authserv-id"
+        );
+        assert_eq!(
+            trusted_flags(results),
+            vec![Some(true)],
+            "the ARC AR is trusted"
+        );
+    }
+
+    #[test]
+    fn one_dkim_signature_yields_one_element_with_its_tags_and_no_issues() {
+        let batch = structured_batch(&[Column::DkimSignatures], None);
+        let signatures = elements(&batch, 0, 1);
+        assert_eq!(signatures.len(), 1, "one DKIM-Signature header");
+        assert_eq!(
+            text_field(&signatures, "domain"),
+            vec![Some("example.org".to_owned())],
+            "the d tag is exposed"
+        );
+        let other = signatures
+            .column_by_name("tags")
+            .expect("the element struct has a tags field")
+            .as_list::<i32>()
+            .value(0);
+        assert_eq!(
+            text_field(other.as_struct(), "name"),
+            vec![Some("t".to_owned())],
+            "only the tags without a column of their own are listed"
+        );
+        assert!(
+            issue_kinds(&signatures, 0).is_empty(),
+            "a well-formed signature, folded over two lines, has no issues"
+        );
+    }
+
+    #[test]
+    fn a_malformed_dkim_signature_yields_an_element_with_issues() {
+        let batch = structured_batch(&[Column::DkimSignatures], None);
+        let signatures = elements(&batch, 0, 2);
+        assert_eq!(
+            signatures.len(),
+            1,
+            "the malformed header still yields an element"
+        );
+        let kinds = issue_kinds(&signatures, 0);
+        assert!(
+            kinds.contains(&"missing_tag".to_owned()),
+            "the absent required tags are reported by name: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn structured_columns_round_trip_through_parquet() {
+        let fixture = Fixture::with(STRUCTURED);
+        let pipeline = Arc::new(
+            Pipeline::new(
+                vec![
+                    Column::AuthResults,
+                    Column::ArcSets,
+                    Column::DkimSignatures,
+                    Column::ReceivedHops,
+                    Column::ReceivedSpfParsed,
+                    Column::MicrosoftAntispam,
+                ],
+                2,
+            )
+            .with_trust(trust_mx()),
+        );
+        assert_eq!(
+            fixture.export_parquet(&pipeline),
+            4,
+            "every message is written"
+        );
+        let rows: usize = fixture
+            .written_batches()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows, 4,
+            "the nested columns are read back for every message"
+        );
+    }
+
+    fn received_hops_batch(trust: Option<TrustSet>) -> RecordBatch {
+        let fixture = Fixture::with(&corpus_mbox());
+        let base = Pipeline::new(vec![Column::ReceivedHops], 16);
+        let pipeline = Arc::new(match trust {
+            Some(set) => base.with_trust(set),
+            None => base,
+        });
+        pipeline
+            .reader(&fixture.mailbox)
+            .next()
+            .expect("thirteen messages fit one batch of sixteen")
+            .expect("the received_hops batch is assembled")
+    }
+
+    /// The hops of message `row` in the `received_hops` struct column 0.
+    fn hops_of(batch: &RecordBatch, row: usize) -> StructArray {
+        batch
+            .column(0)
+            .as_struct()
+            .column_by_name("hops")
+            .expect("received_hops has a hops field")
+            .as_list::<i32>()
+            .value(row)
+            .as_struct()
+            .clone()
+    }
+
+    #[test]
+    fn received_hops_finds_a_hop_wherever_mail_parser_finds_a_host() {
+        let batch = received_hops_batch(None);
+        let ours = (0..RECEIVED_CORPUS.len())
+            .filter(|row| !hops_of(&batch, *row).is_empty())
+            .count();
+        let theirs = RECEIVED_CORPUS
+            .iter()
+            .filter(|headers| {
+                let text = format!("{headers}\nbody\n");
+                MessageParser::new()
+                    .parse(text.as_bytes())
+                    .is_some_and(|message| {
+                        message
+                            .all_received()
+                            .any(|hop| hop.from().is_some() || hop.by().is_some())
+                    })
+            })
+            .count();
+        assert!(
+            theirs >= 8,
+            "mail-parser reads the varied corpus ({theirs} messages)"
+        );
+        assert!(
+            ours >= theirs,
+            "received_hops has a hop for {ours} messages, mail-parser a host for {theirs}"
+        );
+    }
+
+    #[test]
+    fn received_hops_exposes_the_microsoft_tls_details() {
+        let batch = received_hops_batch(None);
+        let exchange = hops_of(&batch, 2);
+        let tls = exchange
+            .column_by_name("tls")
+            .expect("a hop has a tls field")
+            .as_struct();
+        assert_eq!(
+            text_field(tls, "version"),
+            [Some("TLS1_2".to_owned())],
+            "the Microsoft TLS version is exposed"
+        );
+        assert_eq!(
+            text_field(tls, "cipher"),
+            [Some("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".to_owned())],
+            "the Microsoft cipher is exposed"
+        );
+    }
+
+    #[test]
+    fn received_hops_dates_are_utc_microseconds_and_null_when_missing() {
+        let batch = received_hops_batch(None);
+        let exchange = hops_of(&batch, 2);
+        let dates = exchange
+            .column_by_name("date")
+            .expect("a hop has a date field")
+            .as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            dates.value(0),
+            1_793_793_600_000_000,
+            "the hop date is UTC microseconds"
+        );
+        let undated = hops_of(&batch, 7);
+        assert!(
+            undated
+                .column_by_name("date")
+                .expect("a hop has a date field")
+                .is_null(0),
+            "a hop without a date has a null date"
+        );
+    }
+
+    #[test]
+    fn a_message_without_received_headers_gets_empty_hops_never_null() {
+        let batch = received_hops_batch(None);
+        assert!(
+            batch.column(0).as_struct().is_valid(9) && hops_of(&batch, 9).is_empty(),
+            "a message without Received headers gets an empty hops list, not null"
+        );
+    }
+
+    /// The `first_external` flags of `hops`, null without a trust set.
+    fn first_external_flags(hops: &StructArray) -> Vec<Option<bool>> {
+        hops.column_by_name("first_external")
+            .expect("a hop has a first_external field")
+            .as_boolean()
+            .iter()
+            .collect()
+    }
+
+    #[test]
+    fn first_external_is_true_on_exactly_the_hop_from_outside_the_trust_set() {
+        let mut trust = TrustSet::new();
+        let _hosts = trust.add_host("mx.example.com").add_host("mx2.example.com");
+        let _relay = trust
+            .add_ip_range("192.0.2.10")
+            .expect("a bare address is a valid range");
+        let chain = hops_of(&received_hops_batch(Some(trust)), 11);
+        assert_eq!(
+            text_field(&chain, "from_host"),
+            [
+                Some("edge.example.org".to_owned()),
+                Some("mx.example.com".to_owned())
+            ],
+            "the hops are oldest first"
+        );
+        assert_eq!(
+            first_external_flags(&chain),
+            [Some(true), Some(false)],
+            "only the hop received from outside the trust set is first_external"
+        );
+    }
+
+    #[test]
+    fn first_external_is_null_without_a_trust_set() {
+        let chain = hops_of(&received_hops_batch(None), 11);
+        assert_eq!(
+            first_external_flags(&chain),
+            [None, None],
+            "first_external is null on every hop without a trust set"
+        );
+    }
+
+    fn parsed_headers_batch() -> RecordBatch {
+        Fixture::with(PARSED_HEADERS)
+            .batches(&[Column::ReceivedSpfParsed, Column::MicrosoftAntispam], 8)
+            .into_iter()
+            .next()
+            .expect("two messages fit one batch of eight")
+    }
+
+    #[test]
+    fn received_spf_parsed_exposes_the_verdict_and_client_address() {
+        let spf = elements(&parsed_headers_batch(), 0, 0);
+        assert_eq!(
+            text_field(&spf, "result"),
+            [Some("pass".to_owned())],
+            "the SPF verdict is exposed"
+        );
+        assert_eq!(
+            text_field(&spf, "client_ip"),
+            [Some("192.0.2.1".to_owned())],
+            "the SPF client address is exposed"
+        );
+    }
+
+    #[test]
+    fn microsoft_antispam_gives_an_element_per_header_in_header_order() {
+        let antispam = elements(&parsed_headers_batch(), 1, 0);
+        assert_eq!(
+            text_field(&antispam, "header"),
+            [
+                Some("x-forefront-antispam-report".to_owned()),
+                Some("x-microsoft-antispam".to_owned())
+            ],
+            "both Microsoft headers give an element, in header order"
+        );
+        assert_eq!(
+            antispam
+                .column_by_name("scl")
+                .expect("an element has an scl field")
+                .as_primitive::<Int8Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some(5), None],
+            "SCL is read from the header that has it"
+        );
+    }
+
+    #[test]
+    fn a_message_without_the_parsed_headers_gets_empty_lists_never_null() {
+        let batch = parsed_headers_batch();
+        for column in [0, 1] {
+            let list = batch.column(column).as_list::<i32>();
+            assert!(
+                list.is_valid(1),
+                "column {column} is not null for a bare message"
+            );
+            assert_eq!(
+                list.value(1).len(),
+                0,
+                "column {column} is empty for a bare message"
+            );
+        }
     }
 
     proptest! {

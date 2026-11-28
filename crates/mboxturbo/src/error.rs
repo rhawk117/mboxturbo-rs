@@ -66,6 +66,27 @@ pub enum Corruption {
     Version(u32),
 }
 
+/// Why a predicate was rejected.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PredicateFault {
+    /// An `and` or an `or` has no arguments, so it would hold for no message or for every one.
+    #[error("an `and` or `or` needs at least one argument")]
+    EmptyList,
+    /// The text is not JSON, or its JSON is not the form [`Predicate`](crate::Predicate) writes.
+    #[error("the JSON is not a predicate")]
+    Json(#[source] serde_json::Error),
+    /// A regular expression does not compile, or compiles past the size limit.
+    #[error("the pattern {pattern:?} does not compile")]
+    Regex {
+        /// The pattern as written.
+        pattern: String,
+        /// Why the pattern was refused.
+        #[source]
+        source: regex::Error,
+    },
+}
+
 /// Everything that can go wrong opening a mailbox or handling its index.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -94,6 +115,17 @@ pub enum MboxTurboError {
         path: PathBuf,
         /// What failed validation.
         corruption: Corruption,
+    },
+    /// A predicate is malformed.
+    #[error("invalid predicate at `{path}`")]
+    InvalidPredicate {
+        /// Where in the predicate tree the fault sits, such as `and[1].regex`: the operator
+        /// of each ancestor, indexed within `and` and `or`, then the field at fault. `json`
+        /// when the text is not a predicate at all.
+        path: String,
+        /// What is wrong there.
+        #[source]
+        fault: Box<PredicateFault>,
     },
     /// Reading, mapping or writing a file failed.
     #[error("I/O error on {}", path.display())]

@@ -1,10 +1,12 @@
 //! Field extraction over a parsed message, shared by `Message` and the column pipeline.
 
 use std::borrow::Cow;
+use std::iter;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::LazyLock;
 
-use mail_parser::{AddressList, DateTime, HeaderForm, HeaderName, MessageParser, MessagePart};
+use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser, MessagePart};
+use mboxturbo_headers::parse_date;
 
 use crate::message::{Address, Attachment, Timestamp};
 
@@ -16,8 +18,14 @@ pub(crate) static FULL_PARSER: LazyLock<MessageParser> =
 /// The mbox separator that opens every stored message, ahead of the RFC 822 content.
 const SEPARATOR: &[u8] = b"From ";
 
+/// Name of the header `date` reads, compared without regard to letter case.
+const DATE_NAME: &[u8; 5] = b"date:";
+
 /// A parsed message borrowing its text from the mapping.
 pub(crate) type Mail<'text> = mail_parser::Message<'text>;
+
+/// A header and the bytes that follow it.
+type Split<'bytes> = (&'bytes [u8], &'bytes [u8]);
 
 /// `parser` with `Received:` headers kept as raw text instead of parsed into a structure.
 pub(crate) fn builtin_table_with_raw_received(parser: MessageParser) -> MessageParser {
@@ -84,54 +92,107 @@ where
 }
 
 /// `raw` without its one final line break, which mail-parser keeps on a header's raw value.
-fn strip_line_break(raw: &[u8]) -> &[u8] {
+pub(crate) fn strip_line_break(raw: &[u8]) -> &[u8] {
     raw.strip_suffix(b"\r\n")
         .or_else(|| raw.strip_suffix(b"\n"))
         .unwrap_or(raw)
 }
 
-/// The `Date:` header as an instant plus the offset it was written in; `None` when the header
-/// is absent or not a valid date.
-pub(crate) fn date(mail: &Mail<'_>) -> Option<Timestamp> {
-    let date = mail.date().filter(DateTime::is_valid)?;
-    let raw = header_values(mail, "date")
-        .last()
-        .unwrap_or(Cow::Borrowed(""));
-    timestamp(&date, &raw)
+/// The `Date:` header of `message` as an instant plus the offset it was written in; `None` when
+/// the header is absent or [`mboxturbo_headers::parse_date`] rejects it.
+///
+/// `message` is the stored bytes, with or without its leading `From ` line. Only the head is
+/// read, up to the first blank line, so a `Date:` line in the body never counts. When the
+/// header repeats, the last occurrence wins; if that one does not parse, the result is `None`
+/// even when an earlier one would. The index, the date columns and `Message::date` all read the
+/// date here, so they cannot disagree.
+pub(crate) fn date(message: &[u8]) -> Option<Timestamp> {
+    let mut rest = message;
+    let mut last = None;
+    while let Some((header, remainder)) = next_header(rest) {
+        if let Some(value) = date_value(header) {
+            last = Some(value);
+        }
+        rest = remainder;
+    }
+    let value = last?;
+    // Header issues are dropped here; surfacing them is the job of the header-issue columns.
+    let (instant, _issues) = parse_date(value.as_bytes()).into_parts();
+    instant.map(|found| Timestamp {
+        offset_minutes: i32::from(found.offset_minutes()),
+        unix_seconds: found.unix_seconds(),
+    })
 }
 
-/// The instant `date` names, given the unfolded `Date:` header text `raw` it was parsed from;
-/// `None` when `date` fails `DateTime::is_valid`.
+/// The text after the colon of `header` when it is a `Date:` header, unfolded onto one line.
+fn date_value(header: &[u8]) -> Option<Cow<'_, str>> {
+    let (name, value) = header.split_at_checked(DATE_NAME.len())?;
+    name.eq_ignore_ascii_case(DATE_NAME)
+        .then(|| unfold(String::from_utf8_lossy(value)))
+}
+
+/// The name and the raw value of every header in the head of `message`, in file order.
 ///
-/// A numeric zone in `raw` wins over the parser's own, which cannot hold offsets past twelve
-/// hours; without one, the parsed zone applies. Shared by the message accessor and the index's
-/// header-only extractor so both compute the same seconds.
-pub(crate) fn timestamp(date: &DateTime, raw: &str) -> Option<Timestamp> {
-    if !date.is_valid() {
+/// `message` is the stored bytes, with or without its leading `From ` line. The walk stops at
+/// the first blank line, so a header-looking line in the body never shows up. The name is the
+/// text before the first colon, as written; the value is everything after that colon, folds
+/// included, without the final line break. A line with no colon is skipped.
+pub(crate) fn raw_headers(message: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    let mut rest = strip_separator(message);
+    iter::from_fn(move || {
+        loop {
+            let (header, remainder) = next_header(rest)?;
+            rest = remainder;
+            if let Some(split) = split_header(header) {
+                return Some(split);
+            }
+        }
+    })
+}
+
+/// The name and the value of `header` around its first colon; `None` when it has no colon.
+fn split_header(header: &[u8]) -> Option<Split<'_>> {
+    let (name, from_colon) = header.split_at_checked(memchr::memchr(b':', header)?)?;
+    let value = from_colon.get(1..)?;
+    Some((name, value.strip_suffix(b"\r").unwrap_or(value)))
+}
+
+/// The offset of the first newline in `bytes`, or its length when there is none.
+fn line_end(bytes: &[u8]) -> usize {
+    memchr::memchr(b'\n', bytes).unwrap_or(bytes.len())
+}
+
+/// Whether `line` (without its newline) ends the head: empty, or a lone carriage return.
+const fn is_blank(line: &[u8]) -> bool {
+    matches!(line, [] | [b'\r'])
+}
+
+/// The offset where the header starting at the front of `rest` ends: the end of its first line,
+/// pushed past every following line that starts with a space or a tab.
+fn header_end(rest: &[u8]) -> usize {
+    let mut end = line_end(rest);
+    while let Some(after) = end.checked_add(1).and_then(|start| rest.get(start..)) {
+        if !matches!(after.first(), Some(b' ' | b'\t')) {
+            break;
+        }
+        end = end.saturating_add(1).saturating_add(line_end(after));
+    }
+    end
+}
+
+/// The next header at the front of `rest`, continuation lines included and the final newline
+/// excluded, with what follows it; `None` at the first blank line or the end of the bytes.
+fn next_header(rest: &[u8]) -> Option<Split<'_>> {
+    if is_blank(rest.get(..line_end(rest))?) {
         return None;
     }
-    let offset_minutes = raw
-        .split_whitespace()
-        .rev()
-        .find_map(numeric_zone_minutes)
-        .unwrap_or_else(|| parsed_zone_minutes(date));
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "offset_minutes is at most 23 * 60 + 59 in magnitude: numeric_zone_minutes \
-                  keeps hours below 24 and minutes below 60, and parsed_zone_minutes reads a \
-                  DateTime that is_valid bounds the same way, so * 60 fits in i64"
-    )]
-    let offset_seconds = i64::from(offset_minutes).strict_mul(60);
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "is_valid() keeps the year within 1900..=3000, so the local timestamp stays \
-                  near 3.3e10 seconds and subtracting an offset under 86_400 cannot overflow i64"
-    )]
-    let unix_seconds = date.to_timestamp_local().strict_sub(offset_seconds);
-    Some(Timestamp {
-        offset_minutes,
-        unix_seconds,
-    })
+    let end = header_end(rest);
+    let header = rest.get(..end)?;
+    let remainder = end
+        .checked_add(1)
+        .and_then(|start| rest.get(start..))
+        .unwrap_or(&[]);
+    Some((header, remainder))
 }
 
 /// Every plain-text body; an HTML-only message yields its HTML converted to text.
@@ -169,70 +230,6 @@ pub(crate) fn attachments<'mail>(
 fn attachment_bytes(part: MessagePart<'_>) -> Cow<'_, [u8]> {
     part.nested()
         .map_or_else(|| part.decoded(), |nested| Cow::Borrowed(nested.raw()))
-}
-
-/// The zone `date` carries, in minutes east of UTC.
-///
-/// `date` must satisfy `DateTime::is_valid`, which bounds the hours below 24 and the minutes
-/// below 60.
-fn parsed_zone_minutes(date: &DateTime) -> i32 {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the caller passes a DateTime that is_valid accepted, so tz_hour <= 23 and \
-                  tz_minute <= 59: the sum is at most 1439 and negating it cannot overflow"
-    )]
-    let minutes = i32::from(date.tz_hour)
-        .strict_mul(60)
-        .strict_add(i32::from(date.tz_minute));
-    if date.tz_before_gmt {
-        negate_zone(minutes)
-    } else {
-        minutes
-    }
-}
-
-/// `minutes` with its sign flipped, for a zone west of UTC.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "minutes is at most 1439, so negating it cannot overflow i32"
-)]
-const fn negate_zone(minutes: i32) -> i32 {
-    minutes.strict_neg()
-}
-
-/// A two-digit decimal number from `text`, or `None` when `text` is not one.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the only caller passes two bytes already checked as ASCII digits, so parse cannot \
-              fail and ok() only converts Result to Option; anything else is simply not a number"
-)]
-fn two_digit_number(text: &str) -> Option<i32> {
-    text.parse::<i32>().ok()
-}
-
-/// A numeric zone such as `+0530` or `-0800` as minutes east of UTC; `None` for any other
-/// token, including hours of 24 or more and minutes of 60 or more.
-fn numeric_zone_minutes(token: &str) -> Option<i32> {
-    let (direction, digits) = token
-        .strip_prefix('+')
-        .map(|unsigned| (1_i32, unsigned))
-        .or_else(|| token.strip_prefix('-').map(|unsigned| (-1_i32, unsigned)))?;
-    if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let (hours_text, minutes_text) = digits.split_at_checked(2)?;
-    let hours = two_digit_number(hours_text).filter(|&value| value < 24_i32)?;
-    let minutes = two_digit_number(minutes_text).filter(|&value| value < 60_i32)?;
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "hours < 24 and minutes < 60 were just checked, so the magnitude is at most \
-                  1439 and the sign multiply cannot overflow i32"
-    )]
-    let signed_minutes = hours
-        .strict_mul(60)
-        .strict_add(minutes)
-        .strict_mul(direction);
-    Some(signed_minutes)
 }
 
 /// `text` as one line: line breaks removed, surrounding whitespace trimmed. Borrows when the

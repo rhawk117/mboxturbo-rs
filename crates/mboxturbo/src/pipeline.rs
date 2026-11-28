@@ -3,6 +3,7 @@
 //! [`ParquetExporter`](crate::ParquetExporter) for files.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 #[cfg(test)]
 use std::fmt::Debug;
 use std::ops::Range;
@@ -15,6 +16,7 @@ use arrow_array::builder::{
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{AddressList, HeaderForm, HeaderName, MessageParser};
+use mboxturbo_headers::{AuthMethod, TrustSet};
 use sha2::{Digest as _, Sha256};
 
 use crate::columns::Column;
@@ -23,8 +25,13 @@ use crate::fields::{
     self, Mail, builtin_table_with_raw_received, contain_parser_panic, strip_separator,
 };
 use crate::mailbox::Mailbox;
+use crate::message::Timestamp;
 use crate::selection::{Plan, Selection};
 use crate::stream::Ordered;
+use crate::structured::{
+    ArcSetsColumn, AuthResultsColumn, DkimSignaturesColumn, MicrosoftAntispamColumn,
+    ReceivedHopsColumn, ReceivedSpfColumn, VerdictColumn,
+};
 use crate::width::widen;
 
 /// Parquet page compression.
@@ -66,6 +73,9 @@ pub struct Pipeline {
     probe: Option<Arc<dyn Probe>>,
     /// Arrow schema derived from `columns`, shared by every batch.
     schema: SchemaRef,
+    /// The trust set deciding the `trusted` flags of the structured columns; without one they
+    /// are null.
+    trust: Option<Arc<TrustSet>>,
 }
 
 /// A test hook told which runs each extraction job covers as the job starts.
@@ -77,6 +87,8 @@ trait Probe: Debug + Send + Sync {
 
 /// One message as seen by the column builders: where it sits in the mailbox and its parsed form.
 struct Record<'mail> {
+    /// The `Date` header, read from `raw` on first use so two date columns share one read.
+    date: OnceCell<Option<Timestamp>>,
     /// Parsed message, or `None` when no column needs parsing or the parser rejected or panicked
     /// on it.
     mail: Option<&'mail Mail<'mail>>,
@@ -86,6 +98,15 @@ struct Record<'mail> {
     raw: &'mail [u8],
     /// Byte range of the message in the mailbox file.
     span: Range<usize>,
+    /// The trust set of the pipeline, if it has one.
+    trust: Option<&'mail TrustSet>,
+}
+
+impl Record<'_> {
+    /// The message's `Date` header, read from the raw bytes at most once.
+    fn date(&self) -> Option<Timestamp> {
+        *self.date.get_or_init(|| fields::date(self.raw))
+    }
 }
 
 /// Batches over a selection of a mailbox, extracted on all rayon threads and handed over in
@@ -139,17 +160,23 @@ impl Pipeline {
         for (position, span, raw) in runs.iter().flat_map(|run| mailbox.rows(run.clone())) {
             let parsed = self.parse(raw);
             let record = Record {
+                date: OnceCell::new(),
                 position,
                 raw,
                 span,
                 mail: parsed.as_ref(),
+                trust: self.trust.as_deref(),
             };
             for slot in &mut slots {
                 slot.append(&record);
             }
         }
-        let arrays: Vec<ArrayRef> = slots.iter_mut().map(Slot::finish).collect();
-        RecordBatch::try_new(self.schema(), arrays).map_err(|source| MboxTurboError::Arrow {
+        let batch = slots
+            .iter_mut()
+            .map(Slot::finish)
+            .collect::<Result<Vec<ArrayRef>, ArrowError>>()
+            .and_then(|arrays| RecordBatch::try_new(self.schema(), arrays));
+        batch.map_err(|source| MboxTurboError::Arrow {
             positions: covering(runs),
             source,
         })
@@ -166,6 +193,7 @@ impl Pipeline {
             batch_size: batch_size.max(1),
             #[cfg(test)]
             probe: None,
+            trust: None,
         }
     }
 
@@ -230,6 +258,14 @@ impl Pipeline {
             stream: Ordered::new(),
         })
     }
+
+    /// Sets the trust set that decides the `trusted` flag of the `auth_results` and `arc_sets`
+    /// columns and the `verdict_*` columns. Without one every flag and verdict is null.
+    #[must_use]
+    pub fn with_trust(mut self, trust: TrustSet) -> Self {
+        self.trust = Some(Arc::new(trust));
+        self
+    }
 }
 
 impl BatchReader {
@@ -287,12 +323,18 @@ impl RecordBatchReader for BatchReader {
 enum Slot {
     /// Email addresses of one address header; an absent header gives an empty list.
     Addresses(AddressHeader, ListBuilder<StringBuilder>),
+    /// ARC sets parsed from the ARC headers.
+    ArcSets(Box<ArcSetsColumn>),
     /// One of the attachment list columns.
     Attachments(AttachmentSlot),
+    /// Parsed `Authentication-Results` headers.
+    AuthResults(Box<AuthResultsColumn>),
     /// Date as UTC microseconds, null when absent or invalid.
     Date(TimestampMicrosecondBuilder),
     /// Minutes east of UTC from the Date header, null when absent or invalid.
     DateOffset(Int32Builder),
+    /// Parsed `DKIM-Signature` headers.
+    DkimSignatures(Box<DkimSignaturesColumn>),
     /// First value of the named header (matched in any case), null when absent.
     FirstHeaderValue(String, StringBuilder),
     /// Every value of the named header (matched in any case); empty list when absent.
@@ -301,18 +343,26 @@ enum Slot {
     Html(StringBuilder),
     /// First Message-ID, null when absent.
     MessageId(StringBuilder),
+    /// Parsed `X-Forefront-Antispam-Report` and `X-Microsoft-Antispam` headers.
+    MicrosoftAntispam(Box<MicrosoftAntispamColumn>),
     /// Byte offset of the message start.
     Offset(UInt64Builder),
     /// Message index.
     Position(UInt64Builder),
     /// The message's stored bytes, separator line included.
     Raw(LargeBinaryBuilder),
+    /// Parsed `Received` chain.
+    ReceivedHops(Box<ReceivedHopsColumn>),
+    /// Parsed `Received-SPF` headers.
+    ReceivedSpfParsed(Box<ReceivedSpfColumn>),
     /// Message length in bytes.
     Size(UInt64Builder),
     /// Decoded subject, null when absent.
     Subject(StringBuilder),
     /// Plain-text bodies joined by newlines, null when the message is unparsed.
     Text(StringBuilder),
+    /// The result word of one method from the newest trusted `Authentication-Results`.
+    Verdict(VerdictColumn),
 }
 
 /// Builder for one per-attachment list column; each message contributes one list, which is
@@ -412,8 +462,12 @@ impl Slot {
             Self::Raw(builder) => builder.append_value(record.raw),
             Self::Addresses(header, builder) => append_addresses(builder, *header, mail),
             Self::Subject(builder) => builder.append_option(mail.and_then(Mail::subject)),
-            Self::Date(builder) => builder.append_option(date_micros(mail)),
-            Self::DateOffset(builder) => builder.append_option(date_offset_minutes(mail)),
+            Self::Date(builder) => {
+                builder.append_option(record.date().map(|found| micros(found.unix_seconds)));
+            },
+            Self::DateOffset(builder) => {
+                builder.append_option(record.date().map(|found| found.offset_minutes));
+            },
             Self::MessageId(builder) => builder.append_option(mail.and_then(Mail::message_id)),
             Self::HeaderValues(name, builder) => append_header_values(builder, name, mail),
             Self::FirstHeaderValue(name, builder) => {
@@ -422,12 +476,23 @@ impl Slot {
             Self::Text(builder) => builder.append_option(mail.map(text_body)),
             Self::Html(builder) => builder.append_option(mail.map(html_body)),
             Self::Attachments(slot) => slot.append(mail),
+            Self::AuthResults(column) => column.append(mail, record.trust),
+            Self::ArcSets(column) => column.append(mail, record.trust),
+            Self::DkimSignatures(column) => column.append(mail),
+            Self::ReceivedHops(column) => column.append(mail, record.trust),
+            Self::ReceivedSpfParsed(column) => column.append(mail),
+            Self::MicrosoftAntispam(column) => column.append(mail),
+            Self::Verdict(column) => column.append(mail, record.trust),
         }
     }
 
     /// Finishes the builder into an Arrow array and resets it for reuse.
-    fn finish(&mut self) -> ArrayRef {
-        match self {
+    ///
+    /// # Errors
+    ///
+    /// The Arrow error when a structured column's nested arrays do not fit its layout.
+    fn finish(&mut self) -> Result<ArrayRef, ArrowError> {
+        let array: ArrayRef = match self {
             Self::Position(builder) | Self::Offset(builder) | Self::Size(builder) => {
                 Arc::new(builder.finish())
             },
@@ -443,7 +508,15 @@ impl Slot {
             Self::Date(builder) => Arc::new(builder.finish()),
             Self::DateOffset(builder) => Arc::new(builder.finish()),
             Self::Attachments(slot) => slot.finish(),
-        }
+            Self::ArcSets(column) => column.finish()?,
+            Self::AuthResults(column) => column.finish()?,
+            Self::DkimSignatures(column) => column.finish()?,
+            Self::ReceivedHops(column) => column.finish()?,
+            Self::ReceivedSpfParsed(column) => column.finish()?,
+            Self::MicrosoftAntispam(column) => column.finish()?,
+            Self::Verdict(column) => column.finish(),
+        };
+        Ok(array)
     }
 
     /// A slot keeping only the first value of the header `name` (matched in any case).
@@ -458,9 +531,12 @@ impl Slot {
 
     /// Builds the slot matching `column`, preallocating `rows` entries where the builder
     /// supports it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per column keeps the match exhaustive, so no column is forgotten"
+    )]
     fn new(column: &Column, rows: usize) -> Self {
         let addresses = |header| Self::Addresses(header, text_list());
-        let attachments = |slot| Self::Attachments(slot);
         match column {
             Column::Position => Self::Position(UInt64Builder::with_capacity(rows)),
             Column::Offset => Self::Offset(UInt64Builder::with_capacity(rows)),
@@ -481,11 +557,25 @@ impl Slot {
             Column::ReturnPath => Self::first_header_value("return-path"),
             Column::Text => Self::Text(StringBuilder::new()),
             Column::Html => Self::Html(StringBuilder::new()),
-            Column::AttachmentNames => attachments(AttachmentSlot::Names(text_list())),
-            Column::AttachmentTypes => attachments(AttachmentSlot::Types(text_list())),
-            Column::AttachmentSizes => attachments(AttachmentSlot::sizes()),
-            Column::AttachmentSha256 => attachments(AttachmentSlot::Sha256(text_list())),
+            Column::AttachmentNames => Self::Attachments(AttachmentSlot::Names(text_list())),
+            Column::AttachmentTypes => Self::Attachments(AttachmentSlot::Types(text_list())),
+            Column::AttachmentSizes => Self::Attachments(AttachmentSlot::sizes()),
+            Column::AttachmentSha256 => Self::Attachments(AttachmentSlot::Sha256(text_list())),
             Column::Header(name) => Self::header_values(name),
+            Column::AuthResults => Self::AuthResults(Box::new(AuthResultsColumn::new())),
+            Column::ArcSets => Self::ArcSets(Box::new(ArcSetsColumn::new())),
+            Column::DkimSignatures => Self::DkimSignatures(Box::new(DkimSignaturesColumn::new())),
+            Column::ReceivedHops => Self::ReceivedHops(Box::new(ReceivedHopsColumn::new())),
+            Column::ReceivedSpfParsed => {
+                Self::ReceivedSpfParsed(Box::new(ReceivedSpfColumn::new()))
+            },
+            Column::MicrosoftAntispam => {
+                Self::MicrosoftAntispam(Box::new(MicrosoftAntispamColumn::new()))
+            },
+            Column::VerdictDmarc => Self::Verdict(VerdictColumn::new(AuthMethod::Dmarc)),
+            Column::VerdictSpf => Self::Verdict(VerdictColumn::new(AuthMethod::Spf)),
+            Column::VerdictDkim => Self::Verdict(VerdictColumn::new(AuthMethod::Dkim)),
+            Column::VerdictCompauth => Self::Verdict(VerdictColumn::new(AuthMethod::CompAuth)),
         }
     }
 }
@@ -522,32 +612,8 @@ fn depth_for(columns: &[Column]) -> Depth {
 
 /// The header `column` reads and how to decode it, or `None` when the column needs no header
 /// decoded: it reads the raw bytes, offsets, the body, or a header kept as raw text.
-const fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm)> {
-    match column {
-        Column::From => Some((HeaderName::From, HeaderForm::Addresses)),
-        Column::To => Some((HeaderName::To, HeaderForm::Addresses)),
-        Column::Cc => Some((HeaderName::Cc, HeaderForm::Addresses)),
-        Column::ReplyTo => Some((HeaderName::ReplyTo, HeaderForm::Addresses)),
-        Column::Subject => Some((HeaderName::Subject, HeaderForm::Text)),
-        Column::Date | Column::DateOffsetMinutes => Some((HeaderName::Date, HeaderForm::Date)),
-        Column::MessageId => Some((HeaderName::MessageId, HeaderForm::MessageIds)),
-        Column::Position
-        | Column::Offset
-        | Column::Size
-        | Column::Raw
-        | Column::Received
-        | Column::AuthenticationResults
-        | Column::ReceivedSpf
-        | Column::DkimSignature
-        | Column::ReturnPath
-        | Column::Text
-        | Column::Html
-        | Column::AttachmentNames
-        | Column::AttachmentTypes
-        | Column::AttachmentSizes
-        | Column::AttachmentSha256
-        | Column::Header(_) => None,
-    }
+fn header_form(column: &Column) -> Option<(HeaderName<'static>, HeaderForm)> {
+    column.header_form()
 }
 
 /// Empty UTC timestamp builder with room for `rows` entries.
@@ -593,17 +659,6 @@ fn first_header_value<'mail>(
     fields::header_values(parsed, name).next()
 }
 
-/// The Date header of `mail` as UTC microseconds, or `None` when unparsed, absent or invalid.
-fn date_micros(mail: Option<&Mail<'_>>) -> Option<i64> {
-    mail.and_then(fields::date)
-        .map(|date| micros(date.unix_seconds))
-}
-
-/// Minutes east of UTC in the Date header of `mail`, or `None` when unparsed, absent or invalid.
-fn date_offset_minutes(mail: Option<&Mail<'_>>) -> Option<i32> {
-    mail.and_then(fields::date).map(|date| date.offset_minutes)
-}
-
 /// The plain-text bodies of `mail` joined by newlines.
 fn text_body(mail: &Mail<'_>) -> String {
     joined(fields::text_bodies(mail))
@@ -614,8 +669,8 @@ fn html_body(mail: &Mail<'_>) -> String {
     joined(fields::html_bodies(mail))
 }
 
-// `fields::date` only yields years 1900..=3000 (`DateTime::is_valid`), so `unix_seconds` stays
-// below 4e10 and the product below 4e16: the saturation is unreachable.
+// `fields::date` only yields years up to 9999 (`parse_date` reads at most four digits), so
+// `unix_seconds` stays below 3e11 and the product below 3e17: the saturation is unreachable.
 /// Converts Unix seconds to microseconds, saturating at the `i64` bounds.
 const fn micros(unix_seconds: i64) -> i64 {
     unix_seconds.saturating_mul(1_000_000)
@@ -655,12 +710,13 @@ mod tests {
 
     use super::{
         AddressHeader, AttachmentSlot, Depth, Pipeline, Probe, Slot, append_addresses,
-        append_header_values, date_micros, date_offset_minutes, depth_for, first_header_value,
-        header_form, html_body, joined, text_body, utc_timestamps,
+        append_header_values, depth_for, first_header_value, header_form, html_body, joined,
+        micros, text_body, utc_timestamps,
     };
     use crate::columns::Column;
     use crate::error::MboxTurboError;
     use crate::export::{Export, Exporter};
+    use crate::fields;
     use crate::fields::Mail;
     use crate::mailbox::Mailbox;
     use crate::selection::Selection;
@@ -765,12 +821,6 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
             (Column::Cc, HeaderName::Cc, HeaderForm::Addresses),
             (Column::ReplyTo, HeaderName::ReplyTo, HeaderForm::Addresses),
             (Column::Subject, HeaderName::Subject, HeaderForm::Text),
-            (Column::Date, HeaderName::Date, HeaderForm::Date),
-            (
-                Column::DateOffsetMinutes,
-                HeaderName::Date,
-                HeaderForm::Date,
-            ),
             (
                 Column::MessageId,
                 HeaderName::MessageId,
@@ -793,6 +843,12 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
             header_form(&Column::Received).is_none(),
             "received stays raw"
         );
+        for column in [Column::Date, Column::DateOffsetMinutes] {
+            assert!(
+                header_form(&column).is_none(),
+                "{column:?} reads the raw bytes, so no Date decode"
+            );
+        }
     }
 
     #[test]
@@ -901,24 +957,27 @@ Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
 
     #[test]
     fn the_date_header_gives_utc_microseconds_and_a_minute_offset() {
-        let mail = parse(MULTIPART);
         assert_eq!(
-            date_micros(Some(&mail)),
+            fields::date(MULTIPART).map(|found| micros(found.unix_seconds)),
             Some(-5_390_000_000),
             "00:00:10 at +01:30 is 5390 seconds before the epoch"
         );
         assert_eq!(
-            date_offset_minutes(Some(&mail)),
+            fields::date(MULTIPART).map(|found| found.offset_minutes),
             Some(90_i32),
             "+0130 is 90 minutes east"
         );
     }
 
     #[test]
-    fn an_unparsed_message_has_no_date() {
-        assert_eq!(date_micros(None), None, "no micros without a message");
+    fn an_empty_message_has_no_date() {
         assert_eq!(
-            date_offset_minutes(None),
+            fields::date(b"").map(|found| micros(found.unix_seconds)),
+            None,
+            "no micros without a message"
+        );
+        assert_eq!(
+            fields::date(b"").map(|found| found.offset_minutes),
             None,
             "no offset without a message"
         );

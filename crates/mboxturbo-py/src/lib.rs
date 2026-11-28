@@ -7,8 +7,10 @@
 
 mod errors;
 mod export;
+mod exporter;
 mod mailbox;
 mod message;
+mod predicates;
 
 use pyo3::prelude::*;
 
@@ -16,11 +18,13 @@ use pyo3::prelude::*;
 #[pymodule]
 mod _core {
     #[pymodule_export]
-    use super::errors::{CorruptIndexError, MboxTurboError, StaleIndexError};
+    use super::errors::{Cancelled, CorruptIndexError, MboxTurboError, StaleIndexError};
     #[pymodule_export]
-    use super::export::Selection;
+    use super::export::{CancelToken, Selection, column_names};
     #[pymodule_export]
     use super::mailbox::Mailbox;
     #[pymodule_export]
     use super::message::{Address, Attachment, Message};
+    #[pymodule_export]
+    use super::predicates::{HeaderBuilder, Predicate, Trust, VerdictBuilder, header, verdict};
 }

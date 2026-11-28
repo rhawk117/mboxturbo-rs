@@ -7,7 +7,7 @@
 //!    | bytes   | field                                                        |
 //!    | ------- | ------------------------------------------------------------ |
 //!    | 0..8    | magic `MBOXTIDX`                                             |
-//!    | 8..12   | version, `u32`, 3                                            |
+//!    | 8..12   | version, `u32`, 4                                            |
 //!    | 12      | block shift, `u8`, 1 to 16: a block holds `2^shift` messages |
 //!    | 13      | flags, `u8`, 0                                               |
 //!    | 14..16  | reserved, `u16`                                              |
@@ -58,7 +58,7 @@ pub(crate) const ENTRY_LEN: usize = 32;
 /// Bytes before the first block payload.
 pub(crate) const HEADER_LEN: usize = 72;
 /// Format version this build writes and reads; older files count as stale, newer as corrupt.
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 
 /// A directory entry and where its payload sits.
 #[derive(Debug, Clone, Copy)]
@@ -724,12 +724,21 @@ mod tests {
     }
 
     #[test]
+    fn a_version_three_file_is_stale() {
+        let bytes = patched(file(10, 8), 8, &3_u32.to_le_bytes());
+        assert!(
+            matches!(rejection(&bytes), Rejection::Stale),
+            "a version-3 file holds mail-parser dates, so it rebuilds"
+        );
+    }
+
+    #[test]
     fn a_newer_version_is_corrupt() {
-        let bytes = patched(file(10, 8), 8, &4_u32.to_le_bytes());
+        let bytes = patched(file(10, 8), 8, &5_u32.to_le_bytes());
         assert!(
             matches!(
                 rejection(&bytes),
-                Rejection::Corrupt(Corruption::Version(4))
+                Rejection::Corrupt(Corruption::Version(5))
             ),
             "a newer version is not understood"
         );

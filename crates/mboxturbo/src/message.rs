@@ -135,11 +135,11 @@ impl Message {
         fields::addresses(self.head().and_then(mail_parser::Message::cc))
     }
 
-    /// `Date:` resolved to UTC, or `None` when absent or invalid. A numeric zone such as
-    /// `+1300` is read from the header itself, so offsets past twelve hours stay exact.
+    /// `Date:` resolved to UTC, or `None` when absent or invalid. The last `Date:` header in the
+    /// head is read by the lenient parser the index uses, so this agrees with `Mailbox::date`.
     #[must_use]
     pub fn date(&self) -> Option<Timestamp> {
-        self.head().and_then(fields::date)
+        fields::date(self.source.bytes())
     }
 
     /// Every address in `From:`.

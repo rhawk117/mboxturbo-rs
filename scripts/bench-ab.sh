@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Interleaved A/B of the export bench: a git-archive copy of REF against the working tree.
-# Usage: scripts/bench-ab.sh [REF] [ROUNDS]   (defaults: main, 3)
+# Interleaved A/B of a bench: a git-archive copy of REF against the working tree.
+# Usage: scripts/bench-ab.sh [REF] [ROUNDS] [BENCH]   (defaults: main, 3, export)
+# BENCH is export or index; index runs REF's own benches/index.rs and prints the index rows.
 # MBOXTURBO_BENCH_MESSAGES and MBOXTURBO_BENCH_SEED size the shared fixture.
 
 set -euo pipefail
@@ -10,6 +11,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/log.sh"
 
 readonly REF=${1:-main}
 readonly ROUNDS=${2:-3}
+readonly BENCH=${3:-export}
 ROOT=$(git rev-parse --show-toplevel)
 readonly ROOT
 
@@ -18,13 +20,23 @@ if [[ ! ${ROUNDS} =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-for marker in 'ab:api begin' 'ab:api end'; do
-  count=$(grep -c "^// ${marker}" "${ROOT}/crates/mboxturbo/benches/export.rs" || true)
-  if ((count != 1)); then
-    log::error "crates/mboxturbo/benches/export.rs must contain '// ${marker}' exactly once"
+case ${BENCH} in
+  export | index) ;;
+  *)
+    log::error "BENCH must be export or index, got '${BENCH}'"
     exit 2
-  fi
-done
+    ;;
+esac
+
+if [[ ${BENCH} == export ]]; then
+  for marker in 'ab:api begin' 'ab:api end'; do
+    count=$(grep -c "^// ${marker}" "${ROOT}/crates/mboxturbo/benches/export.rs" || true)
+    if ((count != 1)); then
+      log::error "crates/mboxturbo/benches/export.rs must contain '// ${marker}' exactly once"
+      exit 2
+    fi
+  done
+fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/bench-ab.XXXXXX")
 readonly WORK
@@ -35,7 +47,7 @@ export MBOXTURBO_BENCH_DIR=${MBOXTURBO_BENCH_DIR:-${ROOT}/target}
 
 bench() {
   local tree=$1 target=$2
-  (cd "${tree}" && CARGO_TARGET_DIR=${target} cargo bench -p mboxturbo --bench export "${@:3}")
+  (cd "${tree}" && CARGO_TARGET_DIR=${target} cargo bench -p mboxturbo --bench "${BENCH}" "${@:3}")
 }
 
 run() {
@@ -52,12 +64,18 @@ run() {
     exit 1
   fi
   while IFS= read -r line; do
-    case ${line} in
-      select* | parquet* | raw-parquet* | copy*) printf '%-22s round %s  %s\n' "${label}" "${round}" "${line}" ;;
-      *) ;;
-    esac
+    if [[ ${line} =~ ${ROWS} ]]; then
+      printf '%-22s round %s  %s\n' "${label}" "${round}" "${line}"
+    fi
   done <"${out}"
 }
+
+if [[ ${BENCH} == index ]]; then
+  ROWS='^(build|save|random-access|index-lookup|sequential|index-sweep|open)'
+else
+  ROWS='^(select|parquet|raw-parquet|copy)'
+fi
+readonly ROWS
 
 log::step "Extracting ${REF}"
 mkdir "${WORK}/ref"
@@ -66,7 +84,9 @@ BENCH_SRC=crates/mboxturbo/benches/export.rs
 BENCH_COMMON=crates/mboxturbo/benches/common
 mkdir -p "${WORK}/ref/${BENCH_COMMON}"
 cp "${ROOT}/${BENCH_COMMON}/mod.rs" "${WORK}/ref/${BENCH_COMMON}/mod.rs"
-if git -C "${ROOT}" cat-file -e "${REF}:crates/mboxturbo/src/export.rs" 2>/dev/null; then
+if [[ ${BENCH} == index ]]; then
+  :
+elif git -C "${ROOT}" cat-file -e "${REF}:crates/mboxturbo/src/export.rs" 2>/dev/null; then
   cp "${ROOT}/${BENCH_SRC}" "${WORK}/ref/${BENCH_SRC}"
 else
   # REF lacks the export driver the bench's API block calls: give REF's copy the block in
@@ -77,7 +97,7 @@ else
     !skip { print }
   ' "${ROOT}/${BENCH_SRC}" >"${WORK}/ref/${BENCH_SRC}"
 fi
-if ! grep -q 'name = "export"' "${WORK}/ref/crates/mboxturbo/Cargo.toml"; then
+if [[ ${BENCH} == export ]] && ! grep -q 'name = "export"' "${WORK}/ref/crates/mboxturbo/Cargo.toml"; then
   printf '\n[[bench]]\nname = "export"\nharness = false\n' >>"${WORK}/ref/crates/mboxturbo/Cargo.toml"
 fi
 
