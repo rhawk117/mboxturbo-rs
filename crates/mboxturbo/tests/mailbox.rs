@@ -666,6 +666,30 @@ body\n\n";
     }
 
     #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_reverse_iteration() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.iter().rev().collect::<Vec<_>>(),
+            reference.iter().rev().collect::<Vec<_>>(),
+            "a backward walk checks the start it does not share with the row after it"
+        );
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_parallel_iteration() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.par_iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "each parallel split checks the first start it crosses"
+        );
+    }
+
+    #[test]
     fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_rewrites_the_index() {
         let (fixture, _rewritten, saved) = moved_in_place();
         let mailbox = fixture.cached();
