@@ -14,8 +14,8 @@ mod mailbox {
     #[cfg(unix)]
     use mboxturbo::IndexSource;
     use mboxturbo::{
-        Column, Corruption, IndexOrigin, IndexPolicy, Mailbox, MailboxBuilder, MboxTurboError,
-        Message, Pipeline, Selection,
+        BoundaryCheck, Column, Corruption, IndexOrigin, IndexPolicy, Mailbox, MailboxBuilder,
+        MboxTurboError, Message, Pipeline, Selection,
     };
     use rayon::prelude::*;
     use tempfile::TempDir;
@@ -697,6 +697,49 @@ body\n\n";
             mailbox.iter().count(),
             120,
             "one separator moved, so the message count is unchanged"
+        );
+        assert_ne!(
+            fs::read(&fixture.index).expect("the index file is still readable"),
+            saved,
+            "the mismatch rewrote the saved index"
+        );
+    }
+
+    #[test]
+    fn a_trusting_builder_serves_the_stored_spans_and_leaves_the_index_unrewritten() {
+        let (fixture, rewritten, saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = MailboxBuilder::new()
+            .index(IndexPolicy::Path(fixture.index.clone()))
+            .boundary_check(BoundaryCheck::Trusted)
+            .open(&fixture.mbox)
+            .expect("the fixture opens with trusted boundaries");
+        assert_eq!(mailbox.iter().count(), 120, "the stored spans are served");
+        assert_ne!(
+            mailbox.iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "the stale spans are not corrected"
+        );
+        assert_eq!(
+            fs::read(&fixture.index).expect("the index file is still readable"),
+            saved,
+            "no mismatch was seen, so the saved index is untouched"
+        );
+    }
+
+    #[test]
+    fn a_verifying_builder_checks_boundaries_as_the_default_does() {
+        let (fixture, rewritten, saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = MailboxBuilder::new()
+            .index(IndexPolicy::Path(fixture.index.clone()))
+            .boundary_check(BoundaryCheck::Verified)
+            .open(&fixture.mbox)
+            .expect("the fixture opens with verified boundaries");
+        assert_eq!(
+            mailbox.iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "iteration answers as a mailbox with no saved index does"
         );
         assert_ne!(
             fs::read(&fixture.index).expect("the index file is still readable"),

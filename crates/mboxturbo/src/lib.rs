@@ -46,7 +46,7 @@ mod structured;
 mod verdict;
 mod width;
 
-pub use builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
+pub use builder::{BoundaryCheck, IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
 pub use columns::Column;
 pub use csv_sink::{CsvExporter, FormulaEscaping};
 pub use eml_sink::EmlExporter;

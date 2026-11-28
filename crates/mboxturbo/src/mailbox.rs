@@ -8,7 +8,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
+use crate::builder::{BoundaryCheck, IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
@@ -57,6 +57,8 @@ impl<'index> Walk<'index> {
 /// this crate only ever replaces by renaming a new file over it.
 #[derive(Debug)]
 pub struct Mailbox {
+    /// Whether stored spans are checked against `contents` before they are handed out.
+    check: BoundaryCheck,
     /// The read-only mapping, shared with every [`Message`] taken from this mailbox.
     contents: Arc<Mmap>,
     /// Start offsets of the messages within `contents`.
@@ -164,6 +166,7 @@ impl Mapped {
             index,
             source,
             origin,
+            check: BoundaryCheck::Verified,
         }
     }
 }
@@ -188,6 +191,12 @@ impl Mailbox {
             .unwrap_or((0..0, &[]))
     }
 
+    /// This mailbox with its stored spans checked, or not, as `check` says.
+    pub(crate) const fn checking(mut self, check: BoundaryCheck) -> Self {
+        self.check = check;
+        self
+    }
+
     /// Narrows `positions` to the messages that exist. A range that starts past the end becomes
     /// empty and sits at the end, never inverted.
     pub(crate) fn clamped(&self, positions: Range<usize>) -> Range<usize> {
@@ -207,7 +216,10 @@ impl Mailbox {
         checked: &Range<usize>,
     ) -> Option<Range<usize>> {
         let inside = span?;
-        if self.on_boundaries(&inside, checked) || self.index.is_rebuilt() {
+        if self.check == BoundaryCheck::Trusted
+            || self.on_boundaries(&inside, checked)
+            || self.index.is_rebuilt()
+        {
             return Some(inside);
         }
         self.index.force_rebuild();
