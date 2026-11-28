@@ -41,8 +41,8 @@ pub enum IndexPolicy {
 /// A saved index is accepted when the mbox's fingerprint (length, modification time and the
 /// first and last 4 KiB) still matches, which a file rewritten in place can survive. With
 /// [`BoundaryCheck::Verified`] every span handed out is checked to start at a message start and
-/// end at one, and a mismatch rebuilds the index, so the mailbox answers as one with no saved
-/// index would.
+/// end at one, and a mismatch at either end of a span rebuilds the index. A rewrite that leaves
+/// both ends of every stored span on message starts is not detected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BoundaryCheck {
