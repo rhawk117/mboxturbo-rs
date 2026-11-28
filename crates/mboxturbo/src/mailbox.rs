@@ -1,6 +1,5 @@
 //! An mbox file mapped read-only together with its message index.
 
-use std::array;
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
@@ -29,78 +28,25 @@ const SEPARATOR_AFTER_LINE: &[u8; 6] = b"\nFrom ";
 /// every offset of a mapping is below `isize::MAX`.
 const NONE_CHECKED: Range<usize> = usize::MAX..usize::MAX;
 
-/// Rows a walk reads ahead once it asks for consecutive positions. Their spans are taken from
-/// the index first and their boundaries checked together after, so the reads of mailbox bytes
-/// those checks make overlap instead of each waiting behind the index lookup of its row.
-const AHEAD: usize = 16;
-
-/// An index cursor for a walk over rows, with the span of the row it handed out last and the
-/// checked spans of the rows it read ahead.
+/// An index cursor for a walk over rows, with the span of the row it handed out last.
 ///
-/// Both ends of every span it holds were checked against the mapped bytes, or answered by a
-/// rebuild, so the next row, forwards or backwards, checks only the boundary it does not share
-/// with the last one.
+/// Both ends of that span were checked against the mapped bytes, or answered by a rebuild, so
+/// the next row, forwards or backwards, checks only the boundary it does not share with it.
 #[derive(Debug)]
 struct Walk<'index> {
-    /// The spans of the positions from `first`, of which the leading `ready` are checked.
-    ahead: [Range<usize>; AHEAD],
     /// The span of the last row handed out, or [`NONE_CHECKED`] before the first.
     checked: Range<usize>,
     /// The cursor answering each row's span from this mailbox's index.
     cursor: Cursor<'index>,
-    /// The position after the last row the walk may be asked for; nothing is read from it on.
-    end: usize,
-    /// The position of the first span in `ahead`.
-    first: usize,
-    /// The position after the last row handed out, so that asking for it reads ahead;
-    /// `usize::MAX`, which no row has, before the first row.
-    next: usize,
-    /// How many spans of `ahead` were read and checked.
-    ready: usize,
 }
 
 impl<'index> Walk<'index> {
-    /// The checked span read ahead for `position`, if one was.
-    #[inline]
-    fn ahead(&self, position: usize) -> Option<Range<usize>> {
-        // A position before `first` wraps past every count of `ready`.
-        let offset = position.wrapping_sub(self.first);
-        if offset < self.ready {
-            self.ahead.get(offset).cloned()
-        } else {
-            None
-        }
-    }
-
-    /// A walk over positions below `end` with no row handed out yet.
-    fn new(cursor: Cursor<'index>, end: usize) -> Self {
+    /// A walk with no row handed out yet.
+    const fn new(cursor: Cursor<'index>) -> Self {
         Self {
-            ahead: array::from_fn(|_| NONE_CHECKED),
             checked: NONE_CHECKED,
             cursor,
-            end,
-            first: 0,
-            next: usize::MAX,
-            ready: 0,
         }
-    }
-
-    /// Fills `ahead` from the cursor with the spans from `position`, up to [`AHEAD`] of them and
-    /// none at `end` or past it, and returns how many were read. Reading stops at the first span
-    /// the index cannot answer or that ends past `length`, the mapping's, which the caller
-    /// answers on its own.
-    fn read(&mut self, position: usize, length: usize) -> usize {
-        self.ready = 0;
-        self.first = position;
-        let mut read = 0_usize;
-        for (slot, ahead) in self.ahead.iter_mut().zip(position..self.end) {
-            match self.cursor.span(ahead) {
-                Some(span) if span.end <= length => *slot = span,
-                Some(_) | None => break,
-            }
-            read = read.saturating_add(1);
-        }
-        read
     }
 }
 
@@ -370,7 +316,7 @@ impl Mailbox {
     /// Raw bytes of every message, in file order.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
-        let mut walk = Walk::new(self.index.cursor(), self.len());
+        let mut walk = Walk::new(self.index.cursor());
         (0..self.len()).map(move |position| self.walk_row(&mut walk, position).1)
     }
 
@@ -442,7 +388,7 @@ impl Mailbox {
     #[must_use]
     pub fn par_iter(&self) -> impl IndexedParallelIterator<Item = &[u8]> {
         (0..self.len()).into_par_iter().map_init(
-            || Walk::new(self.index.cursor(), self.len()),
+            || Walk::new(self.index.cursor()),
             |walk, position| self.walk_row(walk, position).1,
         )
     }
@@ -490,29 +436,6 @@ impl Mailbox {
             .get(self.confirmed(position, self.index.span(position), &NONE_CHECKED)?)
     }
 
-    /// The span of `position` after reading up to [`AHEAD`] rows from it into `walk` and
-    /// checking all their boundaries. When one fails, the index is rebuilt, nothing read ahead
-    /// is kept, and the rebuild answers. A row that cannot be read ahead, because the index has
-    /// no span for it or its span ends past the mapping, is answered as a lone row is.
-    fn read_ahead(&self, walk: &mut Walk<'_>, position: usize) -> Option<Range<usize>> {
-        let read = walk.read(position, self.contents.len());
-        if read == 0 {
-            return self.confirmed(position, walk.cursor.span(position), &walk.checked);
-        }
-        let mut previous = walk.checked.clone();
-        let mut sound = true;
-        for span in walk.ahead.iter().take(read) {
-            sound &= self.on_boundaries(span, &previous);
-            previous = span.clone();
-        }
-        if sound || self.index.is_rebuilt() {
-            walk.ready = read;
-            return walk.ahead(position);
-        }
-        self.index.force_rebuild();
-        self.index.span(position)
-    }
-
     /// The span and raw bytes of the message at `position`, which must be below `len()`.
     ///
     /// The index answers every position below its count with a span inside the mapping, except
@@ -539,9 +462,8 @@ impl Mailbox {
         &self,
         positions: Range<usize>,
     ) -> impl Iterator<Item = (usize, Range<usize>, &[u8])> {
-        let clamped = self.clamped(positions);
-        let mut walk = Walk::new(self.index.cursor(), clamped.end);
-        clamped.map(move |position| {
+        let mut walk = Walk::new(self.index.cursor());
+        self.clamped(positions).map(move |position| {
             let (span, raw) = self.walk_row(&mut walk, position);
             (position, span, raw)
         })
@@ -551,12 +473,7 @@ impl Mailbox {
     /// mailbox's index, checking only the boundary the row does not share with `walk`'s last.
     #[inline]
     fn walk_row(&self, walk: &mut Walk<'_>, position: usize) -> (Range<usize>, &[u8]) {
-        let span = match walk.ahead(position) {
-            Some(inside) => Some(inside),
-            None if position == walk.next => self.read_ahead(walk, position),
-            None => self.confirmed(position, walk.cursor.span(position), &walk.checked),
-        };
-        walk.next = position.saturating_add(1);
+        let span = self.confirmed(position, walk.cursor.span(position), &walk.checked);
         walk.checked = span
             .as_ref()
             .map_or(NONE_CHECKED, |inside| self.as_checked(inside));
