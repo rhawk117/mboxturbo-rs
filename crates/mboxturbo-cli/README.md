@@ -383,7 +383,7 @@ The output of `mboxturbo info`. `earliest` and `latest` are RFC 3339 UTC strings
 The run failed. It is the last line of a failed run. `code` is the process exit code and `message` is the line written to standard error.
 
 ```json
-{"code":64,"event":"error","message":"mboxturbo: unknown column `bogus`","v":1}
+{"code":64,"event":"error","message":"mboxturbo: unknown column 'bogus'; expected one of position, offset, size, raw, from, to, cc, reply_to, subject, date, date_offset_minutes, message_id, received, authentication_results, received_spf, dkim_signature, return_path, text, html, attachment_names, attachment_types, attachment_sizes, attachment_sha256, auth_results, arc_sets, dkim_signatures, received_hops, received_spf_parsed, microsoft_antispam, verdict_dmarc, verdict_spf, verdict_dkim, verdict_compauth, or header:<Name>","v":1}
 ```
 
 <!-- Source: ran the built binary with --json export --columns bogus; crates/mboxturbo-cli/tests/json.rs (a_usage_error_before_the_mailbox_opens_is_only_an_error_event). -->

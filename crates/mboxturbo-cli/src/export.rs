@@ -423,13 +423,7 @@ fn columns(format: Format, requested: Option<&[String]>) -> Result<Vec<Column>, 
     let Some(names) = requested else {
         return Ok(Column::defaults());
     };
-    names
-        .iter()
-        .map(|name| {
-            Column::from_name(name)
-                .ok_or_else(|| Failure::Usage(format!("unknown column `{name}`")))
-        })
-        .collect()
+    Column::parse_all(names).map_err(|error| Failure::Usage(error.to_string()))
 }
 
 /// Where the output goes: standard output for `-`, otherwise a directory for eml and a file for

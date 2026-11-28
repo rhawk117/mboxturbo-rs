@@ -296,6 +296,14 @@ pub enum Column {
     VerdictSpf,
 }
 
+/// A column name [`Column::from_name`] does not recognise.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "unknown column '{0}'; expected one of {known}, or header:<Name>",
+    known = Column::names().collect::<Vec<_>>().join(", ")
+)]
+pub struct UnknownColumn(String);
+
 impl ColumnSpec {
     /// A column that reads `header` decoded as its form.
     const fn decoded(
@@ -420,6 +428,24 @@ impl Column {
         self.spec().parsed()
     }
 
+    /// The columns `names` name, in the order given.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownColumn`] for the first name [`Column::from_name`] rejects.
+    pub fn parse_all<Name>(names: &[Name]) -> Result<Vec<Self>, UnknownColumn>
+    where
+        Name: AsRef<str>,
+    {
+        names
+            .iter()
+            .map(|candidate| {
+                let text = candidate.as_ref();
+                Self::from_name(text).ok_or_else(|| UnknownColumn(text.to_owned()))
+            })
+            .collect()
+    }
+
     /// This column's catalogue row; every header column shares one row.
     #[expect(
         clippy::expect_used,
@@ -434,6 +460,14 @@ impl Column {
             .iter()
             .find(|spec| spec.column == *self)
             .expect("every non-header column has a row in NAMED")
+    }
+}
+
+impl UnknownColumn {
+    /// The rejected name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.0
     }
 }
 
@@ -552,6 +586,26 @@ mod tests {
             Column::from_name("header:"),
             None,
             "a header: prefix with no header name is rejected"
+        );
+    }
+
+    #[test]
+    fn parse_all_keeps_the_order_and_stops_at_the_first_unknown_name() {
+        assert_eq!(
+            Column::parse_all(&["size", "header:X-Mailer", "position"]),
+            Ok(vec![
+                Column::Size,
+                Column::Header("X-Mailer".to_owned()),
+                Column::Position
+            ]),
+            "known names parse in the order given"
+        );
+        let error = Column::parse_all(&["size", "subjekt", "bogus"])
+            .expect_err("a list with an unknown name is rejected");
+        assert_eq!(
+            error.name(),
+            "subjekt",
+            "the first unknown name is reported"
         );
     }
 

@@ -406,21 +406,12 @@ pub(crate) fn select_columns(
     batch_size: usize,
     filters: &Filters,
 ) -> PyResult<Selection> {
-    if batch_size == 0 {
-        return Err(PyValueError::new_err("batch size must be positive"));
-    }
-    let columns =
-        requested.map_or_else(|| Ok(Column::defaults()), |names| parse_columns(&names))?;
+    let columns = checked_columns(requested, batch_size)?;
     let names = columns
         .iter()
         .map(|column| column.name().into_owned())
         .collect();
-    let filter = filters
-        .built_filter()
-        .map_err(|error| into_py_err(py, *error))?;
-    let rows = py
-        .detach(|| filters.pick(&mailbox, filter.as_ref()))
-        .map_err(|error| into_py_err(py, *error))?;
+    let rows = narrowed_rows(py, &mailbox, filters)?;
     let extraction = filters
         .trust
         .clone()
@@ -437,19 +428,29 @@ pub(crate) fn select_columns(
     })
 }
 
-/// The columns `names` name, or `ValueError` listing the known names for the first unknown one.
-fn parse_columns(names: &[String]) -> PyResult<Vec<Column>> {
-    names
-        .iter()
-        .map(|name| {
-            Column::from_name(name).ok_or_else(|| {
-                let known = Column::names().collect::<Vec<_>>().join(", ");
-                PyValueError::new_err(format!(
-                    "unknown column '{name}'; expected one of {known}, or header:<Name>"
-                ))
-            })
-        })
-        .collect()
+/// The columns `requested` names (every default when `None`), or `ValueError` for a zero
+/// `batch_size` or an unknown column.
+fn checked_columns(requested: Option<Vec<String>>, batch_size: usize) -> PyResult<Vec<Column>> {
+    if batch_size == 0 {
+        return Err(PyValueError::new_err("batch size must be positive"));
+    }
+    requested.map_or_else(
+        || Ok(Column::defaults()),
+        |names| Column::parse_all(&names).map_err(|error| PyValueError::new_err(error.to_string())),
+    )
+}
+
+/// The rows `filters` keep in `mailbox`, found with the interpreter released.
+fn narrowed_rows(
+    py: Python<'_>,
+    mailbox: &mboxturbo::Mailbox,
+    filters: &Filters,
+) -> PyResult<Narrowed> {
+    let filter = filters
+        .built_filter()
+        .map_err(|error| into_py_err(py, *error))?;
+    py.detach(|| filters.pick(mailbox, filter.as_ref()))
+        .map_err(|error| into_py_err(py, *error))
 }
 
 /// The codec `name` names (`zstd`, `snappy` or `none`), or `ValueError` for anything else.
