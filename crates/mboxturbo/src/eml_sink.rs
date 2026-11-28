@@ -21,7 +21,7 @@ use crate::columns::Column;
 use crate::encode::{column_index, optional_index};
 use crate::error::MboxTurboError;
 use crate::export::Exporter;
-use crate::staging::{DestinationKind, Output, Staged};
+use crate::staging::{DestinationKind, MANIFEST, Output, Staged};
 use crate::width::{narrow, widen};
 
 /// What error messages call this sink.
@@ -36,8 +36,6 @@ const FROM: &[u8] = b"From ";
 const QUOTED_FROM: &[u8] = b">From ";
 /// Microseconds in a second.
 const MICROS_PER_SECOND: i64 = 1_000_000;
-/// The manifest's file name.
-const MANIFEST: &str = "manifest.jsonl";
 /// The most threads that write files at once.
 const MAX_WORKERS: usize = 8;
 /// The fewest files a worker is given, so a small batch is not spread over threads.

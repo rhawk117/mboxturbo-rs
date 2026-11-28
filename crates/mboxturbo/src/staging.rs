@@ -13,8 +13,9 @@ use crate::error::MboxTurboError;
 /// Name of the previous output inside its set-aside holder directory.
 const SET_ASIDE: &str = "previous";
 
-/// The manifest's file name, as the EML exporter writes it (`MANIFEST` in `eml_sink.rs`).
-const MANIFEST: &str = "manifest.jsonl";
+/// The manifest's file name: the EML sink writes it, and the staging check relies on it to
+/// recognise a directory left by an earlier export.
+pub(crate) const MANIFEST: &str = "manifest.jsonl";
 
 /// Where an export goes.
 #[non_exhaustive]
@@ -498,7 +499,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{Overwrite, commit_directory_with};
+    use super::{MANIFEST, Overwrite, commit_directory_with};
     use crate::error::MboxTurboError;
 
     #[test]
@@ -507,7 +508,7 @@ mod tests {
         let target = parent.path().join("out");
         fs::create_dir_all(&target).expect("previous output creates");
         fs::write(target.join("old.txt"), b"previous").expect("previous output is written");
-        fs::write(target.join("manifest.jsonl"), b"").expect("previous manifest is written");
+        fs::write(target.join(MANIFEST), b"").expect("previous manifest is written");
         let staged = TempDir::new_in(parent.path()).expect("staged directory creates");
 
         let error = commit_directory_with(staged, target.clone(), Overwrite::Replace, |_, _| {
