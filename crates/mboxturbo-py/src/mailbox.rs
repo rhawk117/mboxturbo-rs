@@ -192,7 +192,8 @@ impl Mailbox {
     /// index date) and ``where`` each narrow the rows; the selection keeps the messages every
     /// one given admits, in ascending position order. ``trust`` decides the trusted flags and
     /// verdict columns and the ``verdict`` predicates; without it they are null and never match.
-    /// ``excluded_undated`` on the result counts the undated messages a bound dropped.
+    /// ``excluded_undated`` on the result counts only the undated messages among the given
+    /// ``positions``, or in the whole mailbox without ``positions``.
     #[pyo3(signature = (
         columns = None,
         *,

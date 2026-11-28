@@ -286,3 +286,39 @@ pub(crate) mod fixtures {
         Arc::new(sets.finish())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array as _, ArrayRef, Int8Array, StructArray, UInt8Array};
+    use arrow_schema::{DataType, Field};
+    use serde_json::json;
+
+    use super::{Binary, cell_value, is_encodable};
+
+    #[test]
+    fn small_unsigned_and_signed_integers_encode_as_json_numbers() {
+        let unsigned: ArrayRef = Arc::new(UInt8Array::from(vec![255_u8]));
+        let signed: ArrayRef = Arc::new(Int8Array::from(vec![-128_i8]));
+        let cells = StructArray::from(vec![
+            (
+                Arc::new(Field::new("unsigned", DataType::UInt8, false)),
+                unsigned,
+            ),
+            (
+                Arc::new(Field::new("signed", DataType::Int8, false)),
+                signed,
+            ),
+        ]);
+        assert!(
+            is_encodable(cells.data_type(), Binary::Refused),
+            "a struct of UInt8 and Int8 fields is accepted"
+        );
+        assert_eq!(
+            cell_value(&cells, 0).expect("the small integers encode"),
+            json!({"signed": -128_i64, "unsigned": 255_u64}),
+            "each value keeps its sign and its extreme"
+        );
+    }
+}

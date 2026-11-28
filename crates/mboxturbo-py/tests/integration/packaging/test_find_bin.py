@@ -67,6 +67,26 @@ def test_non_executable_file_is_skipped(scripts_dirs: tuple[Path, Path]) -> None
     assert mboxturbo.find_mboxturbo_bin() == expected
 
 
+def test_finds_executable_in_bin_beside_the_package(
+    scripts_dirs: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    primary, user = scripts_dirs
+
+    def get_path(name: str, scheme: str | None = None) -> str:
+        assert name == 'scripts'
+        return str(tmp_path / 'venv' / 'bin') if not scheme else str(user)
+
+    monkeypatch.setattr(sysconfig, 'get_path', get_path)
+    bin_dir = tmp_path / 'site' / 'bin'
+    bin_dir.mkdir(parents=True)
+    expected = make_executable(bin_dir)
+
+    assert not any(primary.iterdir())
+    assert mboxturbo.find_mboxturbo_bin() == expected
+
+
 def test_missing_binary_raises_with_every_searched_directory(
     scripts_dirs: tuple[Path, Path],
 ) -> None:

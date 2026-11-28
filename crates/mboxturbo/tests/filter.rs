@@ -450,6 +450,34 @@ body\n";
     }
 
     #[test]
+    fn a_mailbox_past_one_scan_chunk_is_narrowed_in_ascending_order() {
+        use std::fmt::Write as _;
+
+        const MESSAGES: usize = 4097 + 50;
+        const FLAGGED: [usize; 6] = [7, 1007, 2007, 3007, 4007, MESSAGES - 1];
+        let mut contents = String::new();
+        for index in 0..MESSAGES {
+            let flag = if FLAGGED.contains(&index) {
+                "X-Spam-Flag: YES\n"
+            } else {
+                ""
+            };
+            write!(
+                contents,
+                "From a@example.com Mon Jan  1 00:00:00 2024\n\
+Subject: m{index}\n{flag}\nbody\n\n"
+            )
+            .expect("writing to a string cannot fail");
+        }
+        let fixture = Fixture::with(&contents);
+        let found = positions(&fixture, &exists("x-spam-flag"));
+        assert_eq!(
+            found, FLAGGED,
+            "matches in the first chunk and past it come back in ascending order"
+        );
+    }
+
+    #[test]
     fn out_of_range_positions_are_refused_before_the_date_step() {
         let fixture = Fixture::with(VERDICTS);
         let error = Narrowing::new()

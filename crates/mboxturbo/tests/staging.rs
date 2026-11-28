@@ -6,6 +6,8 @@ mod staging {
     use std::fs;
     use std::fs::File;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::Path;
 
     use mboxturbo::{Destination, MboxTurboError, Output, Overwrite, Staged};
@@ -304,6 +306,34 @@ mod staging {
             b"keep",
             "unchanged"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_refuses_a_symbolic_link_for_either_kind() {
+        let parent = TempDir::new().expect("the parent temp directory is created");
+        let real = parent.path().join("real");
+        fs::create_dir_all(&real).expect("the link destination is created");
+        for (name, directory) in [("file-link", false), ("directory-link", true)] {
+            let target = parent.path().join(name);
+            symlink(&real, &target).expect("the link is created");
+            let destination = if directory {
+                Destination::Directory(target.clone())
+            } else {
+                Destination::File(target.clone())
+            };
+            let reason = replace_refusal(destination, &target);
+            assert_eq!(
+                reason, "a symbolic link, which is never replaced",
+                "the reason says the target is a link"
+            );
+            assert!(
+                fs::symlink_metadata(&target)
+                    .expect("the link still exists")
+                    .is_symlink(),
+                "the link is untouched"
+            );
+        }
     }
 
     #[test]

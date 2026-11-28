@@ -470,6 +470,7 @@ fn refuse_unreplaceable(target: &Path, kind: DestinationKind) -> Result<(), Mbox
         Err(source) => return Err(MboxTurboError::io(target, source)),
     };
     let reason = match (kind, metadata.is_dir()) {
+        _ if metadata.is_symlink() => "a symbolic link, which is never replaced",
         (DestinationKind::Directory, false) => "a file where a directory goes",
         (DestinationKind::File, true) => "a directory where a file goes",
         (DestinationKind::Directory, true) if !is_replaceable_directory(target)? => {

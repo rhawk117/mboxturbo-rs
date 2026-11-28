@@ -749,6 +749,11 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 
 /// The proleptic Gregorian `(year, month, day)` of `days` since 1970-01-01, by Howard Hinnant's
 /// `civil_from_days`.
+///
+/// # Panics
+///
+/// When `days` exceeds `i64::MAX - 719_468`, because the shift to the era origin overflows.
+/// Every value below it, down to `i64::MIN`, converts.
 #[must_use]
 #[expect(
     clippy::disallowed_methods,
@@ -980,12 +985,36 @@ mod tests {
     use proptest::option;
     use proptest::prelude::*;
 
-    use super::{Instant, clean_instant, parse_date, parse_general, rfc3339, rfc3339_micros};
+    use super::{
+        Instant, civil_from_days, clean_instant, parse_date, parse_general, rfc3339, rfc3339_micros,
+    };
     use crate::caps::{Cap, MAX_HEADER_BYTES};
     use crate::issue::{Issue, IssueKind};
 
     /// 2024-01-01T12:00:00Z.
     const NOON: i64 = 1_704_110_400;
+
+    #[test]
+    fn civil_from_days_converts_up_to_its_documented_bound() {
+        assert!(
+            civil_from_days(i64::MAX - 719_468).0 > 0,
+            "the largest day count converts to a year"
+        );
+        assert!(
+            civil_from_days(i64::MIN).0 < 0,
+            "the smallest day count converts to a year"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn civil_from_days_panics_one_day_past_its_documented_bound() {
+        assert_eq!(
+            civil_from_days(i64::MAX - 719_467),
+            (0, 0, 0),
+            "the shift overflows before any date is produced"
+        );
+    }
 
     fn parse(text: &str) -> (Option<Instant>, Vec<Issue>) {
         parse_date(text.as_bytes()).into_parts()
