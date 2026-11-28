@@ -7,6 +7,7 @@
 
 use std::io;
 use std::mem::take;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow_array::ffi::{FFI_ArrowSchema, to_ffi};
@@ -157,10 +158,10 @@ impl PythonExporter {
             Ok(None) => Ok(0),
             Err(error) => {
                 self.failure.record(error);
-                Err(Box::new(MboxTurboError::Io {
-                    path: staged.target_label().to_path_buf(),
-                    source: io::Error::other("the Python exporter raised"),
-                }))
+                Err(Box::new(write_failure(
+                    staged.target(),
+                    io::Error::other("the Python exporter raised"),
+                )))
             },
         }
     }
@@ -237,17 +238,29 @@ fn arrow_error(error: &ArrowError) -> PyErr {
     PyMboxTurboError::new_err(error.to_string())
 }
 
+/// The error for a failed write to the destination `target` names: an I/O error on that file, or
+/// a stream error when the destination is a stream and has no path.
+fn write_failure(target: Option<&Path>, source: io::Error) -> MboxTurboError {
+    match target {
+        Some(path) => MboxTurboError::Io {
+            path: path.to_path_buf(),
+            source,
+        },
+        None => MboxTurboError::Stream { source },
+    }
+}
+
 /// Appends `bytes` to the staged file and returns their count; a directory takes none.
 #[expect(
     clippy::disallowed_methods,
     reason = "usize is at most 64 bits on every supported target, so the conversion never fails"
 )]
 fn append(staged: &mut Staged, bytes: &[u8]) -> Result<u64, Box<MboxTurboError>> {
-    let path = staged.target_label().to_path_buf();
+    let target = staged.target().map(Path::to_path_buf);
     match staged.output() {
         Output::Writer(writer) => writer
             .write_all(bytes)
-            .map_err(|source| Box::new(MboxTurboError::Io { path, source }))?,
+            .map_err(|source| Box::new(write_failure(target.as_deref(), source)))?,
         Output::Directory(_) => return Ok(0),
     }
     Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))

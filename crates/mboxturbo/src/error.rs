@@ -117,12 +117,12 @@ pub enum MboxTurboError {
         corruption: Corruption,
     },
     /// An export sink's encoder failed on a batch or its schema.
-    #[error("cannot encode {sink} output for {target}")]
+    #[error("cannot encode {sink} output for {}", target_label(target.as_deref()))]
     Encode {
         /// The sink that failed, as in "CSV".
         sink: &'static str,
-        /// The file or directory being written, or `a stream`.
-        target: String,
+        /// The file or directory being written; `None` for a stream.
+        target: Option<PathBuf>,
         /// The Arrow failure, boxed to keep the error type small.
         #[source]
         source: Box<arrow_schema::ArrowError>,
@@ -170,6 +170,13 @@ pub enum MboxTurboError {
     StaleIndex {
         /// The rejected index file.
         path: PathBuf,
+    },
+    /// Writing or flushing to a stream failed.
+    #[error("cannot write to a stream")]
+    Stream {
+        /// The underlying operating system error.
+        #[source]
+        source: io::Error,
     },
     /// The export target already exists and overwriting was not requested.
     #[error("export target {} already exists", path.display())]
@@ -222,6 +229,15 @@ impl MboxTurboError {
         Self::Io {
             path: path.to_path_buf(),
             source,
+        }
+    }
+
+    /// Wraps a failed write or flush as [`MboxTurboError::Io`] naming the `target` file, or as
+    /// [`MboxTurboError::Stream`] when there is no target because the destination is a stream.
+    pub(crate) fn write_failure(target: Option<&Path>, source: io::Error) -> Self {
+        match target {
+            Some(path) => Self::io(path, source),
+            None => Self::Stream { source },
         }
     }
 }

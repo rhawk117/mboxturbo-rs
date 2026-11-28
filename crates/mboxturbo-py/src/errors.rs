@@ -42,6 +42,7 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> P
             let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
             tagged.err().unwrap_or(raised)
         },
+        mboxturbo::MboxTurboError::Stream { source } => PyErr::from(source),
         mboxturbo::MboxTurboError::TargetExists { path }
         | mboxturbo::MboxTurboError::TargetNotReplaceable { path, .. } => {
             let raised = PyFileExistsError::new_err(message);

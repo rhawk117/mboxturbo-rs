@@ -92,16 +92,18 @@ mod export {
             batch: &RecordBatch,
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
-            let target = staged.target_label().to_path_buf();
+            let target = staged.target().map(Path::to_path_buf);
             let Output::Writer(writer) = staged.output() else {
                 return Err(staged.unsupported());
             };
             let mut bytes = 0_u64;
             for raw in batch.column(0).as_binary::<i64>().iter().flatten() {
-                writer.write_all(raw).map_err(|source| MboxTurboError::Io {
-                    path: target.clone(),
-                    source,
-                })?;
+                writer
+                    .write_all(raw)
+                    .map_err(|source| match target.clone() {
+                        Some(path) => MboxTurboError::Io { path, source },
+                        None => MboxTurboError::Stream { source },
+                    })?;
                 bytes = bytes.saturating_add(count(raw.len()));
             }
             Ok(bytes)
@@ -170,6 +172,19 @@ mod export {
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
             self.inner.write(batch, staged)
+        }
+    }
+
+    /// A writer that refuses every write and flush.
+    struct BrokenStream;
+
+    impl Write for BrokenStream {
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("injected flush failure"))
+        }
+
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected write failure"))
         }
     }
 
@@ -284,6 +299,19 @@ mod export {
         );
         assert_eq!(summary.path, Some(fixture.target()), "path reported");
         assert_eq!(fixture.leftovers(), ["target"], "only the target remains");
+    }
+
+    #[test]
+    fn a_failing_stream_write_is_a_stream_error_without_a_path() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .export(Destination::Stream(Box::new(BrokenStream)))
+            .run(Box::new(StreamSink))
+            .expect_err("the stream refuses the write");
+        assert!(
+            matches!(error, MboxTurboError::Stream { .. }),
+            "a stream failure names no file: {error:?}"
+        );
     }
 
     #[test]

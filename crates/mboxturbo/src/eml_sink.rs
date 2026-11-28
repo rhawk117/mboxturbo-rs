@@ -79,18 +79,18 @@ impl EmlExporter {
     }
 
     /// Appends one manifest line.
-    fn write_entry(&mut self, entry: &Value, label: &Path) -> Result<(), MboxTurboError> {
+    fn write_entry(&mut self, entry: &Value, label: Option<&Path>) -> Result<(), MboxTurboError> {
         let Some(manifest) = self.manifest.as_mut() else {
-            return Err(MboxTurboError::io(
+            return Err(MboxTurboError::write_failure(
                 label,
                 io::Error::other("the manifest is not open: `begin` was not called"),
             ));
         };
         serde_json::to_writer(&mut *manifest, entry)
-            .map_err(|source| MboxTurboError::io(label, source.into()))?;
+            .map_err(|source| MboxTurboError::write_failure(label, source.into()))?;
         manifest
             .write_all(&[NEWLINE])
-            .map_err(|source| MboxTurboError::io(label, source))
+            .map_err(|source| MboxTurboError::write_failure(label, source))
     }
 }
 
@@ -115,14 +115,14 @@ impl Exporter for EmlExporter {
     fn finish(&mut self, staged: &mut Staged) -> Result<u64, MboxTurboError> {
         if let Some(mut manifest) = self.manifest.take() {
             let flushed = manifest.flush();
-            flushed.map_err(|source| MboxTurboError::io(staged.target_label(), source))?;
+            flushed.map_err(|source| MboxTurboError::write_failure(staged.target(), source))?;
         }
         Ok(0)
     }
 
     fn write(&mut self, batch: &RecordBatch, staged: &mut Staged) -> Result<u64, MboxTurboError> {
         let columns = Columns::new(batch)?;
-        let label = staged.target_label().to_path_buf();
+        let label = staged.target().map(Path::to_path_buf);
         let Output::Directory(directory) = staged.output() else {
             // `accepts` refuses every other destination
             return Err(staged.unsupported());
@@ -140,7 +140,10 @@ impl Exporter for EmlExporter {
         }
         let bytes = write_files(&files)?;
         for (row, file) in files.iter().enumerate() {
-            self.write_entry(&columns.entry(row, file.position, &file.name), &label)?;
+            self.write_entry(
+                &columns.entry(row, file.position, &file.name),
+                label.as_deref(),
+            )?;
         }
         Ok(bytes)
     }

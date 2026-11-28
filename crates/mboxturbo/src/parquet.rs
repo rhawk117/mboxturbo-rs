@@ -1,5 +1,7 @@
 //! The Parquet sink of the export driver.
 
+use std::io;
+
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use parquet::arrow::ArrowWriter;
@@ -127,10 +129,16 @@ fn parquet_compression(compression: Compression) -> ParquetCompression {
     }
 }
 
-/// A Parquet failure on the destination `staged` writes to.
+/// A Parquet failure on the destination `staged` writes to: [`MboxTurboError::Parquet`] naming
+/// the file, or [`MboxTurboError::Stream`] for a stream, which has no path to name.
 fn parquet_failure(staged: &Staged, source: ParquetError) -> MboxTurboError {
-    MboxTurboError::Parquet {
-        path: staged.target_label().to_path_buf(),
-        source,
+    match staged.target() {
+        Some(path) => MboxTurboError::Parquet {
+            path: path.to_path_buf(),
+            source,
+        },
+        None => MboxTurboError::Stream {
+            source: io::Error::other(source),
+        },
     }
 }

@@ -16,9 +16,6 @@ const SET_ASIDE: &str = "previous";
 /// The manifest's file name, as the EML exporter writes it (`MANIFEST` in `eml_sink.rs`).
 const MANIFEST: &str = "manifest.jsonl";
 
-/// Where an error about a stream destination says it happened.
-const STREAM_LABEL: &str = "<stream>";
-
 /// Where an export goes.
 #[non_exhaustive]
 pub enum Destination {
@@ -248,7 +245,7 @@ impl Staged {
             Kind::Stream(mut writer) => {
                 writer
                     .flush()
-                    .map_err(|source| MboxTurboError::io(Path::new(STREAM_LABEL), source))?;
+                    .map_err(|source| MboxTurboError::write_failure(None, source))?;
                 Ok(None)
             },
         }
@@ -273,12 +270,6 @@ impl Staged {
             Kind::Directory { target, .. } | Kind::File { target, .. } => Some(target),
             Kind::Stream(_) => None,
         }
-    }
-
-    /// The path an error about this destination names: the target, or `<stream>` for a stream.
-    #[must_use]
-    pub fn target_label(&self) -> &Path {
-        self.target().unwrap_or_else(|| Path::new(STREAM_LABEL))
     }
 
     /// The refusal a sink returns when handed an output kind it does not accept: an
