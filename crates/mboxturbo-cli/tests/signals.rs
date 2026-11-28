@@ -20,7 +20,7 @@ mod signals {
     const WIDE_MAILBOX: usize = 20_000;
     /// Every position of the mailbox, so the date step outlasts the signal watcher's 20 ms poll
     /// and a cancel that arrives during it is still found.
-    const SELECT_ALL: &str = "0..199999\n";
+    const SELECT_ALL: &str = "0..200000\n";
     /// How long the tests wait for something that should happen at once.
     const PATIENCE: Duration = Duration::from_secs(30);
 

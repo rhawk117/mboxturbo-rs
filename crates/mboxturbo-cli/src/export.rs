@@ -557,3 +557,50 @@ fn select_file(path: &Path) -> Result<Vec<Range<usize>>, Failure> {
         .collect();
     Ok(select::parse_all(&lines)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    /// Just enough of the command line to parse the export arguments.
+    #[derive(Debug, Parser)]
+    struct Line {
+        /// The arguments under test.
+        #[command(flatten)]
+        args: ExportArgs,
+    }
+
+    /// The message `scan_failure` gives a cancelled scan of an export written to `output`.
+    fn cancelled_message(output: &str) -> String {
+        let line = Line::try_parse_from(["export", "mail.mbox", "--format", "csv", "-o", output])
+            .expect("the export arguments parse");
+        let cancel = CancelToken::new();
+        let interrupts = Interrupts::watch(cancel.clone()).expect("the signal handlers install");
+        let watch = Watch { cancel, interrupts };
+        let error = MboxTurboError::Cancelled {
+            target: None,
+            written: 0,
+        };
+        scan_failure(error, &line.args, &watch).to_string()
+    }
+
+    #[test]
+    fn a_cancelled_scan_names_the_output_path() {
+        let message = cancelled_message("out/mail.csv");
+        assert!(
+            message.contains("export to out/mail.csv cancelled after"),
+            "the message names the -o target, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_scan_names_a_stream_for_dash() {
+        let message = cancelled_message("-");
+        assert!(
+            message.contains("export to a stream cancelled after"),
+            "the message names a stream for -o -, got: {message}"
+        );
+    }
+}
