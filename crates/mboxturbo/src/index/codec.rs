@@ -18,6 +18,24 @@ const WORD_WIDTH: u8 = 57;
 /// Bytes a single code can touch: up to 64 bits starting at a bit offset of up to 7.
 const WINDOW: usize = 9;
 
+/// What a dates block answers for one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateLookup {
+    /// The message's date in unix seconds.
+    Dated(i64),
+    /// The block cannot be read: an unknown flag, a width above 64, a sentinel block of width 0,
+    /// or an index the payload does not cover.
+    Refused,
+    /// The message has no date.
+    Undated,
+}
+
+impl From<Option<i64>> for DateLookup {
+    fn from(date: Option<i64>) -> Self {
+        date.map_or(Self::Undated, Self::Dated)
+    }
+}
+
 /// Fixed-size directory entry of one block; the payload lives elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Block {
@@ -81,19 +99,19 @@ impl Frame {
     }
 
     /// Date at `index` of a dates block, as [`date`] answers it.
-    #[expect(
-        clippy::option_option,
-        reason = "the outer `None` is a refused block, the inner one a message with no date"
-    )]
-    pub(crate) fn date(&self, payload: &[u8], index: usize) -> Option<Option<i64>> {
+    pub(crate) fn date(&self, payload: &[u8], index: usize) -> DateLookup {
         if self.flags & !MISSING != 0 || (self.flags == MISSING && self.width == 0) {
-            return None;
+            return DateLookup::Refused;
         }
-        let raw = self.code(payload, index)?;
+        let Some(raw) = self.code(payload, index) else {
+            return DateLookup::Refused;
+        };
         if self.flags == MISSING && raw == mask(self.width) {
-            return Some(None);
+            return DateLookup::Undated;
         }
-        signed_of(self.base).checked_add_unsigned(raw).map(Some)
+        signed_of(self.base)
+            .checked_add_unsigned(raw)
+            .map_or(DateLookup::Refused, DateLookup::Dated)
     }
 
     /// Start at `index` of a starts block, as [`start`] answers it.
@@ -413,14 +431,11 @@ pub(crate) fn start(block: &Block, payload: &[u8], index: usize) -> Option<u64> 
     block.frame().start(payload, index)
 }
 
-/// Date at `index` of a dates block, `Some(None)` for "no date", or `None` for an unknown flag, a
-/// width above 64, a sentinel block of width 0, or an index the payload does not cover.
+/// Date at `index` of a dates block, [`DateLookup::Undated`] for "no date", or
+/// [`DateLookup::Refused`] for an unknown flag, a width above 64, a sentinel block of width 0, or
+/// an index the payload does not cover.
 #[cfg(test)]
-#[expect(
-    clippy::option_option,
-    reason = "the outer `None` is a refused block, the inner one a message with no date"
-)]
-pub(crate) fn date(block: &Block, payload: &[u8], index: usize) -> Option<Option<i64>> {
+pub(crate) fn date(block: &Block, payload: &[u8], index: usize) -> DateLookup {
     block.frame().date(payload, index)
 }
 
@@ -513,7 +528,11 @@ mod tests {
         let block = encode_dates(values, &mut payload)
             .expect("the block's present dates leave a code free for a missing date");
         let read = (0..values.len())
-            .map(|index| date(&block, &payload, index))
+            .map(|index| match date(&block, &payload, index) {
+                DateLookup::Refused => None,
+                DateLookup::Undated => Some(None),
+                DateLookup::Dated(date) => Some(Some(date)),
+            })
             .collect();
         Decoded {
             block,
@@ -708,7 +727,11 @@ mod tests {
         assert_eq!(start(&wide, &payload, 0), None, "width above 64");
         let flagged = Block { flags: 2, ..block };
         assert_eq!(start(&flagged, &payload, 0), None, "unknown flag");
-        assert_eq!(date(&flagged, &payload, 0), None, "unknown flag on dates");
+        assert_eq!(
+            date(&flagged, &payload, 0),
+            DateLookup::Refused,
+            "unknown flag on dates"
+        );
     }
 
     #[test]

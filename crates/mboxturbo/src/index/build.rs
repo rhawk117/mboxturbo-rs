@@ -169,6 +169,7 @@ where
 mod tests {
     use std::io;
 
+    use super::super::codec::DateLookup;
     use super::super::tests::dated_mailbox;
     use super::super::{date, format};
     use super::{BlockSize, stream};
@@ -269,7 +270,7 @@ mod tests {
             let message = &contents[starts[position]..end.unwrap_or(contents.len())];
             assert_eq!(
                 layout.date(&bytes, position),
-                Some(date::extract(message)),
+                DateLookup::from(date::extract(message)),
                 "position {position} carries the extractor's date"
             );
         }

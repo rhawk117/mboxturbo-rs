@@ -192,15 +192,14 @@ struct Reach<'lookup> {
 
 impl<'lookup> Reach<'lookup> {
     /// Date of the message at `position`, read from the first entry.
-    #[expect(
-        clippy::option_option,
-        reason = "the outer `None` is a refused block, the inner one a message with no date"
-    )]
-    fn date(&self, position: usize) -> Option<Option<i64>> {
-        self.first().frame().date(
-            self.payload(self.first(), position)?,
-            self.layout.place(position)?.1,
-        )
+    fn date(&self, position: usize) -> codec::DateLookup {
+        let (Some(payload), Some((_, within))) = (
+            self.payload(self.first(), position),
+            self.layout.place(position),
+        ) else {
+            return codec::DateLookup::Refused;
+        };
+        self.first().frame().date(payload, within)
     }
 
     /// The entry of the block holding the first message needed.
@@ -337,8 +336,14 @@ impl Index {
     #[must_use]
     pub fn date(&self, position: usize) -> Option<i64> {
         let needed = position..position.saturating_add(1);
-        self.lookup(Section::Dates, needed, |reach| reach.date(position))
-            .flatten()
+        let found = self.lookup(Section::Dates, needed, |reach| match reach.date(position) {
+            codec::DateLookup::Refused => None,
+            answer @ (codec::DateLookup::Dated(_) | codec::DateLookup::Undated) => Some(answer),
+        });
+        match found {
+            Some(codec::DateLookup::Dated(date)) => Some(date),
+            Some(codec::DateLookup::Refused | codec::DateLookup::Undated) | None => None,
+        }
     }
 
     /// Decodes into `bounds` the starts of original `block`, after verifying it and the block

@@ -166,16 +166,16 @@ impl Layout {
         }
     }
 
-    /// Date of message `position` in unix seconds, `Some(None)` when it has none, or `None` when
-    /// it does not exist or its block is unreadable.
+    /// Date of message `position` in unix seconds, [`codec::DateLookup::Undated`] when it has
+    /// none, or [`codec::DateLookup::Refused`] when it does not exist or its block is unreadable.
     #[cfg(test)]
-    #[expect(
-        clippy::option_option,
-        reason = "the outer `None` is a refused block, the inner one a message with no date"
-    )]
-    pub(crate) fn date(&self, bytes: &[u8], position: usize) -> Option<Option<i64>> {
-        let (block, within) = self.held(position)?;
-        let (entry, payload) = self.entry(bytes, Section::Dates, block)?;
+    pub(crate) fn date(&self, bytes: &[u8], position: usize) -> codec::DateLookup {
+        let Some((block, within)) = self.held(position) else {
+            return codec::DateLookup::Refused;
+        };
+        let Some((entry, payload)) = self.entry(bytes, Section::Dates, block) else {
+            return codec::DateLookup::Refused;
+        };
         codec::date(&entry, payload, within)
     }
 
@@ -661,7 +661,7 @@ mod tests {
             );
             assert_eq!(
                 opened.date(&bytes, position),
-                Some(*date),
+                codec::DateLookup::from(*date),
                 "date {position}"
             );
         }
@@ -981,7 +981,12 @@ mod tests {
             let dates = dates_of(count);
             for (position, (start, date)) in starts.iter().zip(&dates).enumerate() {
                 prop_assert_eq!(opened.start(&bytes, position), Some(*start), "start {}", position);
-                prop_assert_eq!(opened.date(&bytes, position), Some(*date), "date {}", position);
+                prop_assert_eq!(
+                    opened.date(&bytes, position),
+                    codec::DateLookup::from(*date),
+                    "date {}",
+                    position
+                );
             }
         }
 
