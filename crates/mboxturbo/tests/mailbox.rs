@@ -6,7 +6,7 @@ mod mailbox {
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use std::{fs, thread};
 
     use arrow_array::cast::AsArray as _;
@@ -575,6 +575,110 @@ body\n\n";
         );
         let reloaded = fixture.cached();
         assert_eq!(reloaded.index(), mailbox.index(), "rewritten cache matches");
+    }
+
+    /// A mailbox of 120 messages, about 24 KiB, so that the middle lies outside the 4 KiB head
+    /// and tail the fingerprint samples.
+    fn long_mailbox() -> String {
+        let mut contents = String::new();
+        for number in 0_u32..120 {
+            let body = "x".repeat(150);
+            write!(
+                contents,
+                "From a@x Mon Jan  1 00:00:00 2024\nSubject: {number:04}\n\n{body}\n"
+            )
+            .expect("writing to a string cannot fail");
+        }
+        contents
+    }
+
+    /// Overwrites `mbox` with `contents` and sets its modification time back to `modified`.
+    fn rewrite_in_place(mbox: &Path, contents: &[u8], modified: SystemTime) {
+        fs::write(mbox, contents).expect("the mailbox is rewritten in place");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(mbox)
+            .and_then(|file| file.set_modified(modified))
+            .expect("the modification time is restored");
+    }
+
+    /// Review finding MV-1: a mailbox rewritten in place with the length, the modification time
+    /// and the first and last 4 KiB unchanged keeps its fingerprint, so its saved index loads.
+    /// Returns the fixture, the rewritten bytes and the index file as saved before the rewrite.
+    fn moved_in_place() -> (Fixture, Vec<u8>, Vec<u8>) {
+        let original = long_mailbox();
+        let marker = original
+            .match_indices("From a@x")
+            .nth(60)
+            .map(|(offset, _)| offset)
+            .expect("the fixture holds more than sixty messages");
+        let earlier = marker.saturating_sub(50);
+        let mut rewritten = original.clone().into_bytes();
+        rewritten[marker..][..4].copy_from_slice(b"Xrom");
+        rewritten[earlier..][..6].copy_from_slice(b"\nFrom ");
+        let fixture = Fixture::holding(original.as_bytes());
+        assert_eq!(
+            fixture.cached().len(),
+            120,
+            "the saved index holds every message"
+        );
+        let saved = fs::read(&fixture.index).expect("the saved index reads back");
+        let modified = fs::metadata(&fixture.mbox)
+            .and_then(|metadata| metadata.modified())
+            .expect("the modification time is readable");
+        rewrite_in_place(&fixture.mbox, &rewritten, modified);
+        (fixture, rewritten, saved)
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_position() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.index_origin(),
+            IndexOrigin::Loaded,
+            "the unchanged fingerprint lets the stale index load"
+        );
+        let positions = 0..=reference.len();
+        assert_eq!(
+            positions
+                .clone()
+                .map(|position| mailbox.raw(position))
+                .collect::<Vec<_>>(),
+            positions
+                .map(|position| reference.raw(position))
+                .collect::<Vec<_>>(),
+            "every position answers as a mailbox with no saved index does"
+        );
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_is_found_by_iteration() {
+        let (fixture, rewritten, _saved) = moved_in_place();
+        let reference = Fixture::holding(&rewritten).mailbox();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.iter().collect::<Vec<_>>(),
+            reference.iter().collect::<Vec<_>>(),
+            "iteration answers as a mailbox with no saved index does"
+        );
+    }
+
+    #[test]
+    fn a_boundary_moved_in_place_under_an_unchanged_fingerprint_rewrites_the_index() {
+        let (fixture, _rewritten, saved) = moved_in_place();
+        let mailbox = fixture.cached();
+        assert_eq!(
+            mailbox.iter().count(),
+            120,
+            "one separator moved, so the message count is unchanged"
+        );
+        assert_ne!(
+            fs::read(&fixture.index).expect("the index file is still readable"),
+            saved,
+            "the mismatch rewrote the saved index"
+        );
     }
 
     fn sidecar_of(fixture: &Fixture) -> PathBuf {

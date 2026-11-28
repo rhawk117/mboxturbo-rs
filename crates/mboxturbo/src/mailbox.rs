@@ -17,6 +17,9 @@ use crate::mapping::map_read_only;
 use crate::message::Message;
 use crate::selection::Selection;
 
+/// The line that opens every message.
+const SEPARATOR: &[u8; 5] = b"From ";
+
 /// An mbox file mapped read-only, with the byte offset of every message.
 ///
 /// The file must not be modified or truncated while the mailbox, or any [`Message`] taken
@@ -150,9 +153,22 @@ impl Mailbox {
         positions.start.min(end)..end
     }
 
+    /// `span`, the index's answer for `position`, when it still sits on message boundaries of
+    /// the mapped bytes. Otherwise the file was rewritten under an index that its
+    /// fingerprint still accepted, so the index is rebuilt and answers again from the rescan.
+    #[inline]
+    fn confirmed(&self, position: usize, span: Option<Range<usize>>) -> Option<Range<usize>> {
+        let inside = span?;
+        if self.index.is_rebuilt() || self.on_boundaries(&inside) {
+            return Some(inside);
+        }
+        self.index.force_rebuild();
+        self.index.span(position)
+    }
+
     /// [`Mailbox::row`] with the span answered by `cursor`, which must walk this mailbox's index.
     fn cursor_row(&self, cursor: &mut Cursor<'_>, position: usize) -> (Range<usize>, &[u8]) {
-        self.bounded(cursor.span(position))
+        self.bounded(self.confirmed(position, cursor.span(position)))
     }
 
     /// Unix seconds of the Date header of the message at `position`, as the index recorded it,
@@ -240,6 +256,21 @@ impl Mailbox {
         self.index.is_empty()
     }
 
+    /// Whether `offset` is where a message starts: the first byte or the one after a line feed,
+    /// with a `From ` separator there.
+    #[inline]
+    fn is_start(&self, offset: usize) -> bool {
+        let after_line_feed = offset
+            .checked_sub(1)
+            .is_none_or(|before| self.contents.get(before) == Some(&b'\n'));
+        after_line_feed
+            && self
+                .contents
+                .get(offset..)
+                .and_then(<[u8]>::first_chunk)
+                .is_some_and(|found| found == SEPARATOR)
+    }
+
     /// Raw bytes of every message, in file order.
     #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
@@ -256,10 +287,19 @@ impl Mailbox {
     /// The message at `position`, parsed lazily on first field access.
     #[must_use]
     pub fn message(&self, position: usize) -> Option<Message> {
-        Some(Message::new(
-            Arc::clone(&self.contents),
-            self.index.span(position)?,
-        ))
+        let span = self.confirmed(position, self.index.span(position))?;
+        Some(Message::new(Arc::clone(&self.contents), span))
+    }
+
+    /// Whether `span` starts at a message start and ends at one or at the end of the mapping.
+    /// A span outside the mapping passes, because [`Mailbox::bounded`] already turns it into an
+    /// empty message.
+    #[inline]
+    fn on_boundaries(&self, span: &Range<usize>) -> bool {
+        if span.end > self.contents.len() {
+            return true;
+        }
+        self.is_start(span.start) && (span.end == self.contents.len() || self.is_start(span.end))
     }
 
     /// Maps the mbox at `path` and serves its index from the sidecar file `<path>.mbxidx`
@@ -346,7 +386,8 @@ impl Mailbox {
     /// Raw bytes of the message at `position`, including its `From ` separator line.
     #[must_use]
     pub fn raw(&self, position: usize) -> Option<&[u8]> {
-        self.contents.get(self.index.span(position)?)
+        self.contents
+            .get(self.confirmed(position, self.index.span(position))?)
     }
 
     /// The span and raw bytes of the message at `position`, which must be below `len()`.
@@ -357,7 +398,7 @@ impl Mailbox {
     /// mailbox holds. Such a position yields an empty span at 0 and an empty slice, so iterators
     /// sized from the claimed count still end without a panic.
     fn row(&self, position: usize) -> (Range<usize>, &[u8]) {
-        self.bounded(self.index.span(position))
+        self.bounded(self.confirmed(position, self.index.span(position)))
     }
 
     /// The span and raw bytes of every message in `positions`, clamped to the messages that

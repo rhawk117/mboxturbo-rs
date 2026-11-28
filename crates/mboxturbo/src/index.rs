@@ -406,10 +406,23 @@ impl Index {
         self.fingerprint
     }
 
+    /// Rescans the mailbox, as a damaged block does, and rewrites the file the index was loaded
+    /// from; every span is answered from the rebuild from then on. Concurrent callers wait for
+    /// one run.
+    pub(crate) fn force_rebuild(&self) {
+        let _rebuilt = self.rebuilt();
+    }
+
     /// Whether the mailbox holds no messages.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether a rebuild has replaced the original bytes, so every span comes from a rescan.
+    #[inline]
+    pub(crate) fn is_rebuilt(&self) -> bool {
+        self.replacement.get().is_some()
     }
 
     /// Number of messages, as counted by the rebuild once one ran.
