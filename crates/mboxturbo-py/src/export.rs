@@ -66,7 +66,8 @@ impl CancelToken {
 #[derive(Debug)]
 pub(crate) struct Filters {
     /// The window a message's indexed date must fall in to be kept: from `since` inclusive to
-    /// `until` exclusive, either side optionally open.
+    /// `until` exclusive, either side optionally open; with neither bound set no message is
+    /// dropped, undated ones included.
     dates: DateBounds,
     /// The only positions that may be kept.
     positions: Option<Vec<usize>>,
@@ -96,6 +97,17 @@ pub(crate) struct Selection {
     pipeline: Arc<Pipeline>,
     /// The rows every read visits.
     rows: mboxturbo::Selection,
+}
+
+/// Which catalogue columns `column_names` lists.
+#[derive(Clone, Copy, Debug)]
+enum ColumnGroup {
+    /// Every named column.
+    All,
+    /// The columns selected when none are named.
+    Defaults,
+    /// The columns left out of the defaults.
+    OptIn,
 }
 
 impl Filters {
@@ -264,6 +276,20 @@ impl Selection {
     }
 }
 
+impl ColumnGroup {
+    /// The group called `group`, or `ValueError` naming the allowed groups.
+    fn parse(group: &str) -> PyResult<Self> {
+        match group {
+            "all" => Ok(Self::All),
+            "defaults" => Ok(Self::Defaults),
+            "opt_in" => Ok(Self::OptIn),
+            other => Err(PyValueError::new_err(format!(
+                "unknown column group {other:?}; expected 'all', 'defaults' or 'opt_in'"
+            ))),
+        }
+    }
+}
+
 /// The policy for an existing target: replaced when `overwrite` is true, refused otherwise.
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -380,20 +406,23 @@ fn report_progress(
     });
 }
 
-/// The catalogue column names in order: the defaults when `opt_in` is false, the opt-in columns
-/// when it is true, and every named column when it is `None`.
+/// The catalogue column names in order: every named column for `all`, the defaults for
+/// `defaults` and the opt-in columns for `opt_in`; `ValueError` for any other group.
 #[pyfunction]
-#[pyo3(signature = (opt_in=None))]
-pub(crate) fn column_names(opt_in: Option<bool>) -> Vec<String> {
-    let columns = match opt_in {
-        Some(false) => Column::defaults(),
-        _ => Column::names().filter_map(Column::from_name).collect(),
+#[pyo3(signature = (group="all"))]
+pub(crate) fn column_names(group: &str) -> PyResult<Vec<String>> {
+    let columns = match ColumnGroup::parse(group)? {
+        ColumnGroup::Defaults => Column::defaults(),
+        ColumnGroup::All => Column::catalogue(),
+        ColumnGroup::OptIn => Column::catalogue()
+            .into_iter()
+            .filter(Column::is_opt_in)
+            .collect(),
     };
-    columns
+    Ok(columns
         .iter()
-        .filter(|column| opt_in != Some(true) || column.is_opt_in())
         .map(|column| column.name().into_owned())
-        .collect()
+        .collect())
 }
 
 /// A selection over the rows `filters` keep in `mailbox`, with the interpreter released while

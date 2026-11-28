@@ -29,7 +29,7 @@ GUIDE_COLUMNS = (
 
 
 def opt_in_names() -> set[str]:
-    return set(mboxturbo.column_names(opt_in=True))
+    return set(mboxturbo.column_names(group='opt_in'))
 
 
 class TestGuide:

@@ -354,6 +354,12 @@ impl ColumnSpec {
 }
 
 impl Column {
+    /// Every named column, in catalogue order.
+    #[must_use]
+    pub fn catalogue() -> Vec<Self> {
+        NAMED.iter().map(|spec| spec.column.clone()).collect()
+    }
+
     /// The Arrow type of the values this column extracts; list-typed for multi-valued headers.
     fn data_type(&self) -> DataType {
         (self.spec().data_type)()
