@@ -240,6 +240,8 @@ class TestFailures:
         kind = 'file' if isinstance(run.exporter, CsvExporter) else 'directory'
         good = Run(run.selection, run.target, exporter_of(kind, None))
         good.export()
+        if kind == 'directory':
+            (run.target / 'manifest.jsonl').write_bytes(b'')
         before = sorted((path.name, path.read_bytes()) for path in walk(run.target))
         with pytest.raises(ExporterError):
             run.export(overwrite=True)

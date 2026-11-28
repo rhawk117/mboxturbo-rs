@@ -8,7 +8,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::builder::{IndexPolicy, IndexSource, MailboxBuilder};
+use crate::builder::{IndexOrigin, IndexPolicy, IndexSource, MailboxBuilder};
 use crate::error::MboxTurboError;
 use crate::fingerprint::Fingerprint;
 use crate::hint;
@@ -28,6 +28,8 @@ pub struct Mailbox {
     contents: Arc<Mmap>,
     /// Start offsets of the messages within `contents`.
     index: Index,
+    /// Whether opening loaded `index` or built it, as reported by [`Mailbox::index_origin`].
+    origin: IndexOrigin,
     /// Where `index` came from, as reported by [`Mailbox::index_source`].
     source: IndexSource,
 }
@@ -118,11 +120,17 @@ impl Mapped {
     }
 
     /// Attaches an index that was already validated against this mapping's fingerprint.
-    pub(crate) fn with_index(self, index: Index, source: IndexSource) -> Mailbox {
+    pub(crate) fn with_index(
+        self,
+        index: Index,
+        source: IndexSource,
+        origin: IndexOrigin,
+    ) -> Mailbox {
         Mailbox {
             contents: self.contents,
             index,
             source,
+            origin,
         }
     }
 }
@@ -165,25 +173,51 @@ impl Mailbox {
     /// never the message bytes.
     #[must_use]
     pub fn date_range(&self, since: Option<i64>, until: Option<i64>) -> DateRange {
+        self.dates_among(0..self.len(), since, until)
+    }
+
+    /// [`Mailbox::date_range`] over `candidates`, which must all be below the mailbox length:
+    /// the candidates inside the bounds, in the order given, and how many of them are undated.
+    pub(crate) fn dates_among(
+        &self,
+        candidates: impl IntoIterator<Item = usize>,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> DateRange {
         let unbounded = since.is_none() && until.is_none();
-        let positions = (0..self.len())
-            .filter(|&position| {
-                self.date(position).map_or(unbounded, |date| {
+        let mut range = DateRange {
+            positions: Vec::new(),
+            undated: 0,
+        };
+        for position in candidates {
+            let kept = self.date(position).map_or_else(
+                || {
+                    range.undated = range.undated.saturating_add(1);
+                    unbounded
+                },
+                |date| {
                     since.is_none_or(|bound| bound <= date)
                         && until.is_none_or(|bound| date < bound)
-                })
-            })
-            .collect();
-        let undated = (0..self.len())
-            .filter(|&position| self.date(position).is_none())
-            .count();
-        DateRange { positions, undated }
+                },
+            );
+            if kept {
+                range.positions.push(position);
+            }
+        }
+        range
     }
 
     /// The message index.
     #[must_use]
     pub const fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Whether opening this mailbox loaded its index from a file or rebuilt it. A block rebuilt
+    /// later by a lookup does not change the answer.
+    #[must_use]
+    pub const fn index_origin(&self) -> IndexOrigin {
+        self.origin
     }
 
     /// Where the index being served came from: the file it was read from or written to, or

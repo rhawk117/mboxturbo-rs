@@ -115,6 +115,11 @@ version = "0.1.0"
 source = { editable = "." }
 default-groups = ["dev", "polars"]
 
+[package.optional-dependencies]
+cli = [
+    { name = "mboxturbo-cli" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "actionlint-py" },
@@ -137,6 +142,8 @@ security = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "mboxturbo-cli", marker = "extra == 'cli'", directory = "crates/mboxturbo-cli" }]
+provides-extras = ["cli"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -154,6 +161,10 @@ dev = [
 ]
 polars = [{ name = "polars", specifier = ">=2.1.0" }]
 security = [{ name = "pysentry-rs", specifier = ">=0.5.0" }]
+
+[[package]]
+name = "mboxturbo-cli"
+source = { directory = "crates/mboxturbo-cli" }
 
 [[package]]
 name = "packaging"

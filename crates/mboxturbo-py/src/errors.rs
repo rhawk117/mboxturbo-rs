@@ -31,8 +31,9 @@ create_exception!(
 
 /// The Python exception for a core error: `OSError` (with `filename`) for I/O, the matching
 /// `MboxTurboError` subclass for a damaged or stale index, `Cancelled` for a stopped export,
-/// `FileExistsError` (with `filename`) for an existing export target, the base class otherwise
-/// (Arrow, Parquet, invalid predicate and out-of-range position errors included).
+/// `FileExistsError` (with `filename`) for an existing export target (or one that overwriting may
+/// not replace), `ValueError` for a column a sink cannot use, the base class otherwise (Arrow,
+/// encoder, Parquet, invalid predicate and out-of-range position errors included).
 pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> PyErr {
     let message = error.to_string();
     match error {
@@ -41,7 +42,8 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> P
             let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
             tagged.err().unwrap_or(raised)
         },
-        mboxturbo::MboxTurboError::TargetExists { path } => {
+        mboxturbo::MboxTurboError::TargetExists { path }
+        | mboxturbo::MboxTurboError::TargetNotReplaceable { path, .. } => {
             let raised = PyFileExistsError::new_err(message);
             let tagged = raised.value(py).setattr(intern!(py, "filename"), path);
             tagged.err().unwrap_or(raised)
@@ -51,7 +53,9 @@ pub(crate) fn into_py_err(py: Python<'_>, error: mboxturbo::MboxTurboError) -> P
         mboxturbo::MboxTurboError::Cancelled { .. } => Cancelled::new_err(message),
         // Naming each variant that raises the base class keeps
         // `clippy::wildcard_enum_match_arm` quiet for the wildcard below.
+        mboxturbo::MboxTurboError::UnsupportedColumn { .. } => PyValueError::new_err(message),
         mboxturbo::MboxTurboError::Arrow { .. }
+        | mboxturbo::MboxTurboError::Encode { .. }
         | mboxturbo::MboxTurboError::InvalidPredicate { .. }
         | mboxturbo::MboxTurboError::Parquet { .. }
         | mboxturbo::MboxTurboError::PositionOutOfRange { .. }

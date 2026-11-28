@@ -1,0 +1,36 @@
+[package]
+name = "mboxturbo-cli"
+description = "Command-line exporter for large mbox files"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+# Ships as a maturin bin wheel (see pyproject.toml), not as a crate.
+publish = false
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "mboxturbo"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.10", features = ["derive"] }
+mboxturbo = { path = "../mboxturbo" }
+serde_json = "1.0"
+signal-hook = "0.4.6"
+
+[dev-dependencies]
+arrow-array = "60.1"
+arrow-ipc = "60.1"
+parquet = { version = "60.1", default-features = false, features = ["arrow", "zstd", "snap"] }
+tempfile = "3.27.0"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_System_Threading"] }
+
+[lints]
+workspace = true

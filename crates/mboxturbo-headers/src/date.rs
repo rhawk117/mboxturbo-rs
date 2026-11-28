@@ -14,6 +14,9 @@ use crate::tokenize::{Token, TokenKind, bound, slice_checked, tokenize};
 /// Seconds in a day.
 const DAY_SECONDS: i64 = 86_400;
 
+/// Microseconds in a second.
+const MICROS_PER_SECOND: i64 = 1_000_000;
+
 /// Month names by their first three letters; month numbers start at 1.
 const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -720,19 +723,105 @@ fn take<'src>(rest: &mut &'src [u8], width: usize, end: u8) -> Option<&'src [u8]
     Some(head)
 }
 
-/// Days from 1970-01-01 to the given proleptic Gregorian date.
+/// Days since 1970-01-01 of a proleptic Gregorian date, by Howard Hinnant's `days_from_civil`;
+/// `None` when a step overflows. The day is not checked against its month.
+#[must_use]
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let shifted_year = year.checked_sub(i64::from(month <= 2))?;
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year.rem_euclid(400);
+    let shifted_month = month.checked_add(9)?.rem_euclid(12);
+    let day_of_year = shifted_month
+        .checked_mul(153)?
+        .checked_add(2)?
+        .div_euclid(5)
+        .checked_add(day)?
+        .checked_sub(1)?;
+    let day_of_era = year_of_era
+        .checked_mul(365)?
+        .checked_add(year_of_era.div_euclid(4))?
+        .checked_sub(year_of_era.div_euclid(100))?
+        .checked_add(day_of_year)?;
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
+}
+
+/// The proleptic Gregorian `(year, month, day)` of `days` since 1970-01-01, by Howard Hinnant's
+/// `civil_from_days`.
+///
+/// # Panics
+///
+/// When `days` exceeds `i64::MAX - 719_468`, because the shift to the era origin overflows.
+/// Every value below it, down to `i64::MIN`, converts.
+#[must_use]
 #[expect(
-    clippy::arithmetic_side_effects,
-    reason = "year is at most 9999 and month and day are validated, so every term is below 10^7"
+    clippy::disallowed_methods,
+    reason = "`days` comes from an i64 count of seconds, so it is below 2^47 and no step here \
+              comes near 2^63"
 )]
-const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let shifted = if month <= 2 { year - 1 } else { year };
-    let era = shifted.div_euclid(400);
-    let year_of_era = shifted - era * 400;
-    let day_of_year = (153 * (month + 9).rem_euclid(12) + 2).div_euclid(5) + day - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era.div_euclid(4) - year_of_era.div_euclid(100) + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days.strict_add(719_468);
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = day_of_era
+        .strict_sub(day_of_era.div_euclid(1460))
+        .strict_add(day_of_era.div_euclid(36_524))
+        .strict_sub(day_of_era.div_euclid(146_096))
+        .div_euclid(365);
+    let year_days = year_of_era
+        .strict_mul(365)
+        .strict_add(year_of_era.div_euclid(4))
+        .strict_sub(year_of_era.div_euclid(100));
+    let day_of_year = day_of_era.strict_sub(year_days);
+    let shifted_month = day_of_year.strict_mul(5).strict_add(2).div_euclid(153);
+    let day = day_of_year
+        .strict_sub(shifted_month.strict_mul(153).strict_add(2).div_euclid(5))
+        .strict_add(1);
+    let month = if shifted_month < 10 {
+        shifted_month.strict_add(3)
+    } else {
+        shifted_month.strict_sub(9)
+    };
+    let year = year_of_era
+        .strict_add(era.strict_mul(400))
+        .strict_add(i64::from(month <= 2));
+    (year, month, day)
+}
+
+/// `seconds` since the Unix epoch as an RFC 3339 UTC string, to the second.
+#[must_use]
+pub fn rfc3339(seconds: i64) -> String {
+    let mut text = date_and_time(seconds);
+    text.push('Z');
+    text
+}
+
+/// `micros` since the Unix epoch as an RFC 3339 UTC string, with fractional seconds only when
+/// non-zero.
+#[must_use]
+pub fn rfc3339_micros(micros: i64) -> String {
+    let mut text = date_and_time(micros.div_euclid(MICROS_PER_SECOND));
+    let fraction = micros.rem_euclid(MICROS_PER_SECOND);
+    if fraction != 0 {
+        let digits = format!("{fraction:06}");
+        text.push('.');
+        text.push_str(digits.trim_end_matches('0'));
+    }
+    text.push('Z');
+    text
+}
+
+/// `seconds` since the Unix epoch as `YYYY-MM-DDTHH:MM:SS`, with no zone designator.
+fn date_and_time(seconds: i64) -> String {
+    let (year, month, day) = civil_from_days(seconds.div_euclid(DAY_SECONDS));
+    let rest = seconds.rem_euclid(DAY_SECONDS);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        rest.div_euclid(3600),
+        rest.rem_euclid(3600).div_euclid(60),
+        rest.rem_euclid(60)
+    )
 }
 
 /// The number of days in `month` (1 to 12) of `year`.
@@ -756,7 +845,7 @@ fn instant_of(issues: &mut Vec<Issue>, fields: &Fields) -> Option<Instant> {
         i64::from(fields.year),
         i64::from(fields.month),
         i64::from(fields.day.value),
-    );
+    )?;
     check_weekday(issues, fields.weekday, days);
     Some(Instant {
         offset_minutes: fields.zone_minutes,
@@ -896,12 +985,36 @@ mod tests {
     use proptest::option;
     use proptest::prelude::*;
 
-    use super::{Instant, clean_instant, parse_date, parse_general};
+    use super::{
+        Instant, civil_from_days, clean_instant, parse_date, parse_general, rfc3339, rfc3339_micros,
+    };
     use crate::caps::{Cap, MAX_HEADER_BYTES};
     use crate::issue::{Issue, IssueKind};
 
     /// 2024-01-01T12:00:00Z.
     const NOON: i64 = 1_704_110_400;
+
+    #[test]
+    fn civil_from_days_converts_up_to_its_documented_bound() {
+        assert!(
+            civil_from_days(i64::MAX - 719_468).0 > 0,
+            "the largest day count converts to a year"
+        );
+        assert!(
+            civil_from_days(i64::MIN).0 < 0,
+            "the smallest day count converts to a year"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn civil_from_days_panics_one_day_past_its_documented_bound() {
+        assert_eq!(
+            civil_from_days(i64::MAX - 719_467),
+            (0, 0, 0),
+            "the shift overflows before any date is produced"
+        );
+    }
 
     fn parse(text: &str) -> (Option<Instant>, Vec<Issue>) {
         parse_date(text.as_bytes()).into_parts()
@@ -1361,5 +1474,50 @@ mod tests {
                 text
             );
         }
+    }
+
+    #[test]
+    fn seconds_since_the_epoch_render_as_rfc_3339_utc() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z", "the epoch");
+        assert_eq!(
+            rfc3339(1_704_096_000),
+            "2024-01-01T08:00:00Z",
+            "a 2024 date"
+        );
+        assert_eq!(
+            rfc3339(1_709_164_799),
+            "2024-02-28T23:59:59Z",
+            "before a leap day"
+        );
+        assert_eq!(rfc3339(1_709_164_800), "2024-02-29T00:00:00Z", "a leap day");
+        assert_eq!(
+            rfc3339(-1),
+            "1969-12-31T23:59:59Z",
+            "one second before the epoch"
+        );
+    }
+
+    #[test]
+    fn fractional_seconds_appear_only_when_non_zero_without_trailing_zeros() {
+        assert_eq!(
+            rfc3339_micros(1_704_096_000_000_000),
+            "2024-01-01T08:00:00Z",
+            "whole seconds carry no fraction"
+        );
+        assert_eq!(
+            rfc3339_micros(1_704_096_000_500_000),
+            "2024-01-01T08:00:00.5Z",
+            "trailing zeros of the fraction are trimmed"
+        );
+        assert_eq!(
+            rfc3339_micros(1_704_096_000_000_001),
+            "2024-01-01T08:00:00.000001Z",
+            "leading zeros of the fraction are kept"
+        );
+        assert_eq!(
+            rfc3339_micros(-500_000),
+            "1969-12-31T23:59:59.5Z",
+            "a time before the epoch rounds down to the second"
+        );
     }
 }

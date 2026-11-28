@@ -152,7 +152,8 @@ filter admits.
   raises `MboxTurboError` at `select`.
 - `since`, `until`: keep `since <= date < until` on the index date; both must be
   timezone-aware. A message with no usable date is dropped, and
-  `Selection.excluded_undated` counts them (0 without `since` or `until`).
+  `Selection.excluded_undated` counts the undated messages among the given `positions`, or
+  in the whole mailbox without `positions` (0 without `since` or `until`).
 - `where`: a `Predicate`.
 - `trust`: the `Trust` that decides verdicts.
 

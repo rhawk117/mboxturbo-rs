@@ -1,5 +1,11 @@
 //! Harness-free timings of the default column select, of the Parquet export, of raw-only Parquet
-//! exports and of a plain copy of the mailbox, over the synthetic fixture the index bench uses.
+//! exports, of a plain copy of the mailbox and of the mbox, EML, JSONL, CSV and IPC exports, over
+//! the synthetic fixture the index bench uses. The rows, in print order, are `select`, `parquet`,
+//! `raw-parquet`, `raw-parquet-uncompressed`, `copy`, `mbox`, `eml`, `eml-floor`, `jsonl`, `csv`
+//! and `ipc`. `eml-floor` writes the files the `eml` row wrote, with the same worker count and
+//! chunking but no manifest and no selection, so it is the least the `eml` row can take. Both
+//! rows time the same work: each removes its previous output before a pass, outside the timing,
+//! so deleting a previous export is in neither.
 //! The raw-only export with compression off (`raw-parquet-uncompressed`) is the row held to three
 //! times the copy; the zstd `raw-parquet` row is reported only, because compressing the raw bytes
 //! is work a copy does not do.
@@ -63,11 +69,13 @@ mod api {
 }
 // ab:api end
 
-use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write as _};
+use std::panic::resume_unwind;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 use common::Outcome;
 use mboxturbo::{Column, Compression, Mailbox, Pipeline};
@@ -89,9 +97,20 @@ const RUNS: usize = 5;
 ///
 /// Fails when a pass fails or reports a row count other than `expected`, so a pass that drops
 /// batches cannot time faster unnoticed.
-fn median(name: &str, expected: u64, mut pass: impl FnMut() -> Outcome<u64>) -> Outcome<Duration> {
+fn median(name: &str, expected: u64, pass: impl FnMut() -> Outcome<u64>) -> Outcome<Duration> {
+    median_prepared(name, expected, || Ok(()), pass)
+}
+
+/// Like [`median`], but calls `prepare` before each pass, outside its timing.
+fn median_prepared(
+    name: &str,
+    expected: u64,
+    mut prepare: impl FnMut() -> Outcome<()>,
+    mut pass: impl FnMut() -> Outcome<u64>,
+) -> Outcome<Duration> {
     let mut runs = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
+        prepare()?;
         let start = Instant::now();
         let rows = black_box(pass()?);
         runs.push(start.elapsed());
@@ -120,7 +139,172 @@ fn report(name: &str, expected: u64, pass: impl FnMut() -> Outcome<u64>) -> Outc
     row(name, median(name, expected, pass)?)
 }
 
-/// Times the select, the Parquet exports and the copy over the fixture and prints their rows.
+/// Times the mbox, EML, EML floor, JSONL, CSV and IPC exports into `scratch` and prints their
+/// rows; the body is the block `REF` lacks the sinks for, so `REF` times nothing here.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the passes share one scratch directory and two selections"
+)]
+fn sink_rows(mailbox: &Arc<Mailbox>, scratch: &Path, expected: u64) -> Outcome<()> {
+    // ab:new begin (scripts/bench-ab.sh drops this block from REF, which lacks these sinks)
+    use mboxturbo::{
+        CsvExporter, Destination, EmlExporter, Export, Exporter, FormulaEscaping, IpcExporter,
+        JsonlExporter, MboxExporter, Overwrite,
+    };
+
+    fn export_pass(
+        pipeline: &Arc<Pipeline>,
+        mailbox: &Arc<Mailbox>,
+        destination: Destination,
+        exporter: Box<dyn Exporter>,
+    ) -> Outcome<u64> {
+        let summary = Export::new(Arc::clone(pipeline), Arc::clone(mailbox), destination)
+            .overwrite(Overwrite::Replace)
+            .run(exporter)?;
+        Ok(summary.messages)
+    }
+
+    /// A file's name and bytes.
+    type Named = (String, Vec<u8>);
+
+    /// The files of the EML directory `directory` but its manifest, sorted by name.
+    fn read_eml_files(directory: &Path) -> Outcome<Vec<Named>> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            if name != "manifest.jsonl" {
+                files.push((name, fs::read(&path)?));
+            }
+        }
+        files.sort_unstable();
+        Ok(files)
+    }
+
+    /// Writes `files` into `directory` from the worker count and contiguous chunks that
+    /// `EmlExporter` uses for one batch, and returns the first error by chunk order.
+    fn write_batch(directory: &Path, files: &[Named]) -> io::Result<()> {
+        const MAX_WORKERS: usize = 8;
+        const MIN_FILES_PER_WORKER: usize = 64;
+        let workers = thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_WORKERS)
+            .min(files.len().div_ceil(MIN_FILES_PER_WORKER))
+            .max(1);
+        let write_chunk = |chunk: &[Named]| {
+            chunk
+                .iter()
+                .try_for_each(|(name, bytes)| fs::write(directory.join(name), bytes))
+        };
+        if workers == 1 {
+            return write_chunk(files);
+        }
+        thread::scope(|scope| {
+            let handles: Vec<_> = files
+                .chunks(files.len().div_ceil(workers))
+                .map(|chunk| scope.spawn(move || write_chunk(chunk)))
+                .collect();
+            let mut first = Ok(());
+            for handle in handles {
+                let result = handle.join().unwrap_or_else(|panic| resume_unwind(panic));
+                first = first.and(result);
+            }
+            first
+        })
+    }
+
+    /// Creates `directory`, writes `files` into it a batch of `BATCH_SIZE` files at a time, and
+    /// returns the files written.
+    fn write_floor(directory: &Path, files: &[Named]) -> Outcome<u64> {
+        fs::create_dir_all(directory)?;
+        for batch in files.chunks(BATCH_SIZE) {
+            write_batch(directory, batch)?;
+        }
+        Ok(u64::try_from(files.len())?)
+    }
+
+    /// Removes `directory` and what it holds, when it exists.
+    fn remove_previous(directory: &Path) -> Outcome<()> {
+        match fs::remove_dir_all(directory) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The names of the files in `directory` but its manifest, in name order.
+    fn file_names(directory: &Path) -> Outcome<Vec<String>> {
+        Ok(read_eml_files(directory)?
+            .into_iter()
+            .map(|(name, _bytes)| name)
+            .collect())
+    }
+
+    let raw = Arc::new(Pipeline::new(
+        vec![Column::Raw, Column::Position],
+        BATCH_SIZE,
+    ));
+    let defaults = Arc::new(Pipeline::new(Column::defaults(), BATCH_SIZE));
+    let file = |name: &str| Destination::File(scratch.join(name));
+    report("mbox", expected, || {
+        export_pass(
+            &raw,
+            mailbox,
+            file("export.mbox"),
+            Box::new(MboxExporter::new()),
+        )
+    })?;
+    let eml_directory = scratch.join("eml");
+    let eml = median_prepared(
+        "eml",
+        expected,
+        || remove_previous(&eml_directory),
+        || {
+            let directory = Destination::Directory(eml_directory.clone());
+            let exporter = EmlExporter::new(mailbox.len());
+            export_pass(&raw, mailbox, directory, Box::new(exporter))
+        },
+    )?;
+    row("eml", eml)?;
+    let eml_files = read_eml_files(&eml_directory)?;
+    let floor_directory = scratch.join("eml-floor");
+    let floor = median_prepared(
+        "eml-floor",
+        expected,
+        || remove_previous(&floor_directory),
+        || write_floor(&floor_directory, &eml_files),
+    )?;
+    if file_names(&floor_directory)? != file_names(&eml_directory)? {
+        return Err("eml-floor: its file set differs from the eml row's minus the manifest".into());
+    }
+    row("eml-floor", floor)?;
+    report("jsonl", expected, || {
+        export_pass(
+            &defaults,
+            mailbox,
+            file("export.jsonl"),
+            Box::new(JsonlExporter::new()),
+        )
+    })?;
+    report("csv", expected, || {
+        let exporter = CsvExporter::new(FormulaEscaping::Prefix);
+        export_pass(&defaults, mailbox, file("export.csv"), Box::new(exporter))
+    })?;
+    report("ipc", expected, || {
+        export_pass(
+            &defaults,
+            mailbox,
+            file("export.arrows"),
+            Box::new(IpcExporter::new()),
+        )
+    })?;
+    // ab:new end
+    Ok(())
+}
+
+/// Times the select, the Parquet exports, the copy and the sink exports over the fixture and
+/// prints their rows.
 fn main() -> Outcome<()> {
     let spec = common::Spec {
         messages: common::env_number("MBOXTURBO_BENCH_MESSAGES", DEFAULT_MESSAGES)?,
@@ -148,5 +332,6 @@ fn main() -> Outcome<()> {
             api::parquet_pass(&raw, &mailbox, &target, Compression::Uncompressed)
         })?;
     }
-    report("copy", mailbox_bytes, || Ok(fs::copy(&path, &copy)?))
+    report("copy", mailbox_bytes, || Ok(fs::copy(&path, &copy)?))?;
+    sink_rows(&mailbox, scratch.path(), expected)
 }

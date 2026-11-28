@@ -46,6 +46,31 @@ pub enum IndexSource {
     Memory,
 }
 
+/// Whether opening a [`Mailbox`] loaded its index from a file or had to build one.
+///
+/// This records the state decided at open. A damaged block rebuilt later, on a lookup, does not
+/// change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IndexOrigin {
+    /// The index was read from a file that matched the mbox.
+    Loaded,
+    /// The index was built by this open: the file was missing, stale or damaged, or the index
+    /// is held in memory only.
+    Rebuilt,
+}
+
+impl IndexOrigin {
+    /// The name the origin has in events: `loaded` or `rebuilt`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Rebuilt => "rebuilt",
+        }
+    }
+}
+
 /// Opens a [`Mailbox`] with a chosen index location and block size.
 ///
 /// The default is the [`IndexPolicy::Sidecar`] policy with the default block size, which is what
@@ -97,7 +122,7 @@ impl MailboxBuilder {
         match &self.policy {
             IndexPolicy::Memory => {
                 let index = mapped.build(self.block_size);
-                Ok(mapped.with_index(index, IndexSource::Memory))
+                Ok(mapped.with_index(index, IndexSource::Memory, IndexOrigin::Rebuilt))
             },
             IndexPolicy::Path(index_path) => self.open_at(mapped, index_path),
             IndexPolicy::Sidecar => self.open_sidecar(mapped, mbox),
@@ -109,11 +134,11 @@ impl MailboxBuilder {
     fn open_at(&self, mapped: Mapped, index_path: &Path) -> Result<Mailbox, MboxTurboError> {
         let source = IndexSource::File(index_path.to_path_buf());
         match mapped.load(index_path) {
-            Ok(index) => Ok(mapped.with_index(index, source)),
+            Ok(index) => Ok(mapped.with_index(index, source, IndexOrigin::Loaded)),
             Err(error) if error.calls_for_rebuild() => {
                 let index = mapped.build(self.block_size);
                 index.save(index_path)?;
-                Ok(mapped.with_index(index, source))
+                Ok(mapped.with_index(index, source, IndexOrigin::Rebuilt))
             },
             Err(error) => Err(error),
         }
@@ -128,7 +153,8 @@ impl MailboxBuilder {
         // Any load failure, a refusal included, intentionally falls back to a rebuild: the
         // sidecar is a cache, and a refused one is replaced below.
         if let Ok(index) = mapped.load_sidecar(sidecar, mbox) {
-            return Ok(mapped.with_index(index, IndexSource::File(sidecar.to_path_buf())));
+            let source = IndexSource::File(sidecar.to_path_buf());
+            return Ok(mapped.with_index(index, source, IndexOrigin::Loaded));
         }
         let index = mapped.build(self.block_size);
         let source = match index.save(sidecar) {
@@ -136,7 +162,7 @@ impl MailboxBuilder {
             Err(MboxTurboError::Io { .. }) => IndexSource::Memory,
             Err(error) => return Err(error),
         };
-        Ok(mapped.with_index(index, source))
+        Ok(mapped.with_index(index, source, IndexOrigin::Rebuilt))
     }
 }
 

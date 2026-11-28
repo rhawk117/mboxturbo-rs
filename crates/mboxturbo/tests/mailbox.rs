@@ -13,7 +13,10 @@ mod mailbox {
     use arrow_array::types::UInt64Type;
     #[cfg(unix)]
     use mboxturbo::IndexSource;
-    use mboxturbo::{Column, Corruption, Mailbox, MboxTurboError, Message, Pipeline, Selection};
+    use mboxturbo::{
+        Column, Corruption, IndexOrigin, IndexPolicy, Mailbox, MailboxBuilder, MboxTurboError,
+        Message, Pipeline, Selection,
+    };
     use rayon::prelude::*;
     use tempfile::TempDir;
 
@@ -572,6 +575,93 @@ body\n\n";
         );
         let reloaded = fixture.cached();
         assert_eq!(reloaded.index(), mailbox.index(), "rewritten cache matches");
+    }
+
+    fn sidecar_of(fixture: &Fixture) -> PathBuf {
+        let mut name = fixture.mbox.clone().into_os_string();
+        name.push(".mbxidx");
+        PathBuf::from(name)
+    }
+
+    #[test]
+    fn a_sidecar_open_reports_rebuilt_then_loaded() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.mailbox().index_origin(),
+            IndexOrigin::Rebuilt,
+            "no sidecar exists yet"
+        );
+        assert_eq!(
+            fixture.mailbox().index_origin(),
+            IndexOrigin::Loaded,
+            "the sidecar written by the first open is intact"
+        );
+    }
+
+    #[test]
+    fn a_stale_sidecar_reports_rebuilt() {
+        let fixture = Fixture::new();
+        drop(fixture.mailbox());
+        fixture.append(BARE);
+        let mailbox = fixture.mailbox();
+        assert_eq!(
+            mailbox.len(),
+            4,
+            "the open still succeeds and sees the append"
+        );
+        assert_eq!(
+            mailbox.index_origin(),
+            IndexOrigin::Rebuilt,
+            "stale sidecar"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_sidecar_reports_rebuilt() {
+        let fixture = Fixture::new();
+        drop(fixture.mailbox());
+        let sidecar = sidecar_of(&fixture);
+        let mut damaged = fs::read(&sidecar).expect("sidecar is written");
+        damaged[60] ^= 0xFF;
+        fs::write(&sidecar, &damaged).expect("sidecar is damaged");
+        let mailbox = fixture.mailbox();
+        assert_eq!(mailbox.len(), 3, "the open still succeeds");
+        assert_eq!(
+            mailbox.index_origin(),
+            IndexOrigin::Rebuilt,
+            "corrupt sidecar"
+        );
+    }
+
+    #[test]
+    fn an_explicit_index_path_reports_rebuilt_then_loaded() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.cached().index_origin(),
+            IndexOrigin::Rebuilt,
+            "missing index file"
+        );
+        assert_eq!(
+            fixture.cached().index_origin(),
+            IndexOrigin::Loaded,
+            "intact index file"
+        );
+        fixture.append(BARE);
+        assert_eq!(
+            fixture.cached().index_origin(),
+            IndexOrigin::Rebuilt,
+            "stale index file"
+        );
+    }
+
+    #[test]
+    fn the_memory_policy_reports_rebuilt() {
+        let fixture = Fixture::new();
+        let mailbox = MailboxBuilder::new()
+            .index(IndexPolicy::Memory)
+            .open(&fixture.mbox)
+            .expect("fixture mbox opens in memory");
+        assert_eq!(mailbox.index_origin(), IndexOrigin::Rebuilt, "memory index");
     }
 
     #[test]

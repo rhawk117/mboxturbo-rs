@@ -174,9 +174,85 @@ jobs:
         env:
           HYPOTHESIS_PROFILE: ci
 
+  cli-install:
+    name: 📦 CLI Extra Install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # checkout
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ vars.UV_VERSION }}
+          cache-dependency-glob: uv.lock
+
+      - name: Install Pinned Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Restore Cargo Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: cli-install
+
+      - name: Build Extension and CLI Wheels
+        run: |
+          uv build --wheel --out-dir wheels .
+          uv build --wheel --out-dir wheels crates/mboxturbo-cli
+          ls wheels
+
+      - name: Install mboxturbo[cli] From the Local Wheels
+        run: |
+          uv venv --python 3.14 "$RUNNER_TEMP/cli-venv"
+          uv pip install --python "$RUNNER_TEMP/cli-venv" --no-index --find-links wheels "mboxturbo[cli]"
+
+      - name: Run the Installed CLI
+        run: |
+          venv_python="$RUNNER_TEMP/cli-venv/bin/python"
+          "$RUNNER_TEMP/cli-venv/bin/mboxturbo" --version
+          bin_path="$("$venv_python" -c 'import mboxturbo; print(mboxturbo.find_mboxturbo_bin())')"
+          echo "find_mboxturbo_bin: $bin_path"
+          case "$bin_path" in
+            "$RUNNER_TEMP/cli-venv/"*) ;;
+            *) echo "::error::find_mboxturbo_bin is outside the venv: $bin_path"; exit 1 ;;
+          esac
+
+  cli-tests:
+    name: 🖥️ CLI Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Pinned Toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Restore Cargo Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: .
+
+      - name: Run CLI Tests
+        run: cargo test -p mboxturbo-cli --locked
+
   workflow-narrator:
     name: 🔉 Workflow Narrator
-    needs: [labeler, rust-checks, python-checks]
+    needs: [labeler, rust-checks, python-checks, cli-install, cli-tests]
     if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5

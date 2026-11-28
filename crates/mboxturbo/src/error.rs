@@ -116,6 +116,17 @@ pub enum MboxTurboError {
         /// What failed validation.
         corruption: Corruption,
     },
+    /// An export sink's encoder failed on a batch or its schema.
+    #[error("cannot encode {sink} output for {target}")]
+    Encode {
+        /// The sink that failed, as in "CSV".
+        sink: &'static str,
+        /// The file or directory being written, or `a stream`.
+        target: String,
+        /// The Arrow failure, boxed to keep the error type small.
+        #[source]
+        source: Box<arrow_schema::ArrowError>,
+    },
     /// A predicate is malformed.
     #[error("invalid predicate at `{path}`")]
     InvalidPredicate {
@@ -165,6 +176,25 @@ pub enum MboxTurboError {
     TargetExists {
         /// The existing file or directory.
         path: PathBuf,
+    },
+    /// The export target exists, overwriting was requested, and the target may not be replaced.
+    #[error("export target {} was not replaced: it is {reason}", path.display())]
+    TargetNotReplaceable {
+        /// The existing file or directory, left unchanged.
+        path: PathBuf,
+        /// Why the existing target may not be replaced.
+        reason: &'static str,
+    },
+    /// An export sink cannot use a column, because the export did not extract a column it needs
+    /// or the column's type is one it cannot encode.
+    #[error("the `{column}` column cannot be used by the {sink} sink: {reason}")]
+    UnsupportedColumn {
+        /// The column's name.
+        column: String,
+        /// The sink that refused it, as in "CSV".
+        sink: &'static str,
+        /// Why the sink cannot use the column.
+        reason: &'static str,
     },
     /// The exporter cannot write to this kind of destination.
     #[error(

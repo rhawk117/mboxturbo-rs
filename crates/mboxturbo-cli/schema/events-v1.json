@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mboxturbo --json events, version 1",
+  "description": "One JSON object per line on standard output. A run that fails before the mailbox is open writes only an error event; an info run writes one info event; otherwise the order is start, index, progress (one or more), file, summary, and a failure after start ends the stream with an error event.",
+  "oneOf": [
+    {
+      "title": "start",
+      "description": "The export is about to run.",
+      "type": "object",
+      "required": ["v", "event", "command", "mailbox", "format", "output", "selected"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "start" },
+        "command": { "type": "string" },
+        "mailbox": { "type": "string" },
+        "format": { "enum": ["arrow", "csv", "eml", "jsonl", "mbox", "parquet"] },
+        "output": { "type": "string" },
+        "selected": { "type": "integer" }
+      }
+    },
+    {
+      "title": "index",
+      "description": "Whether opening the mailbox loaded its index or rebuilt it.",
+      "type": "object",
+      "required": ["v", "event", "origin"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "index" },
+        "origin": { "enum": ["loaded", "rebuilt"] }
+      }
+    },
+    {
+      "title": "progress",
+      "description": "At most one per second while writing, then one last event with messages equal to total.",
+      "type": "object",
+      "required": ["v", "event", "messages", "total", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "progress" },
+        "messages": { "type": "integer" },
+        "total": { "type": "integer" },
+        "bytes": { "type": "integer" }
+      }
+    },
+    {
+      "title": "file",
+      "description": "One output path: the file, or the directory of an eml export.",
+      "type": "object",
+      "required": ["v", "event", "path", "format", "messages", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "file" },
+        "path": { "type": "string" },
+        "format": { "enum": ["arrow", "csv", "eml", "jsonl", "mbox", "parquet"] },
+        "messages": { "type": "integer" },
+        "bytes": { "type": "integer" }
+      }
+    },
+    {
+      "title": "summary",
+      "description": "The export finished; the last line of a successful run. excluded_undated is present only when --since or --until was given: the undated messages the bounds excluded from the --select positions, or from the whole mailbox without --select.",
+      "type": "object",
+      "required": ["v", "event", "messages", "bytes", "path", "elapsed_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "summary" },
+        "messages": { "type": "integer" },
+        "bytes": { "type": "integer" },
+        "path": { "type": "string" },
+        "elapsed_ms": { "type": "integer" },
+        "excluded_undated": { "type": "integer", "minimum": 0 }
+      }
+    },
+    {
+      "title": "info",
+      "description": "The shape of a mailbox, from its index: the message count, the earliest and latest dates as RFC 3339 UTC strings (null when no message has a date) and the number of undated messages.",
+      "type": "object",
+      "required": ["v", "event", "count", "earliest", "latest", "undated"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "info" },
+        "count": { "type": "integer" },
+        "earliest": { "oneOf": [{ "type": "string" }, { "const": null }] },
+        "latest": { "oneOf": [{ "type": "string" }, { "const": null }] },
+        "undated": { "type": "integer" }
+      }
+    },
+    {
+      "title": "error",
+      "description": "The run failed; the last line of a failed run. The code is the process exit code and the message is the line written to standard error.",
+      "type": "object",
+      "required": ["v", "event", "code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "const": 1 },
+        "event": { "const": "error" },
+        "code": { "type": "integer" },
+        "message": { "type": "string" }
+      }
+    }
+  ]
+}

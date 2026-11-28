@@ -7,6 +7,7 @@ readonly LOGGING_UTILS="./scripts/log.sh"
 readonly PYTHON_PROJECT="."
 readonly CARGO_MANIFEST="Cargo.toml"
 readonly CORE_MANIFEST="crates/mboxturbo/Cargo.toml"
+readonly PYTHON_MANIFEST="pyproject.toml"
 readonly RELEASE_BOT_USERNAME="github-actions[bot]"
 readonly RELEASE_BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -21,6 +22,7 @@ main() {
   if [[ "${VERSION_BUMP}" != recover ]]; then
     bump_release
     synchronize_cargo_version
+    synchronize_cli_extra_pin
     record_version_bump
   fi
 
@@ -89,6 +91,9 @@ bump_release() {
   working_tree_status=$(git status --porcelain)
   [[ -z "${working_tree_status}" ]] || panic "Working tree is not clean."
 
+  uv lock --check --project "${PYTHON_PROJECT}" ||
+    panic "uv.lock is stale before the version bump; run uv lock and commit it."
+
   uv version --project "${PYTHON_PROJECT}" --bump "${VERSION_BUMP}" --no-sync
 
   release_version=$(uv version --project "${PYTHON_PROJECT}" --short)
@@ -119,6 +124,22 @@ synchronize_cargo_version() {
   synchronize_headers_pin
 
   cargo update --workspace
+
+  log::step_end
+}
+
+synchronize_cli_extra_pin() {
+  log::step "Synchronize CLI Extra Pin"
+
+  local pin="mboxturbo-cli==${release_version}"
+  sed -E "s/^(cli = \\[\")mboxturbo-cli==[^\"]*(\"\\])$/\\1${pin}\\2/" \
+    "${PYTHON_MANIFEST}" >"${PYTHON_MANIFEST}.tmp"
+  mv "${PYTHON_MANIFEST}.tmp" "${PYTHON_MANIFEST}"
+
+  grep -qxF "cli = [\"${pin}\"]" "${PYTHON_MANIFEST}" ||
+    panic "CLI extra pin did not update to ${pin}."
+
+  uv lock --project "${PYTHON_PROJECT}"
   uv lock --project "${PYTHON_PROJECT}" --check
 
   log::step_end
@@ -148,7 +169,7 @@ record_version_bump() {
   git config user.name "${RELEASE_BOT_USERNAME}"
   git config user.email "${RELEASE_BOT_EMAIL}"
 
-  git add -- "${CARGO_MANIFEST}" "${CORE_MANIFEST}" Cargo.lock pyproject.toml uv.lock
+  git add -- "${CARGO_MANIFEST}" "${CORE_MANIFEST}" Cargo.lock "${PYTHON_MANIFEST}" uv.lock
 
   git commit -m "release: ${release_tag}"
   git tag -a "${release_tag}" -m "Release ${release_tag}"
