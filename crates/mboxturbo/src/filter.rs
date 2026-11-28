@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+#[cfg(feature = "test-probes")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mboxturbo_headers::{AuthMethod, TrustSet};
@@ -16,6 +17,7 @@ use crate::mailbox::{DateRange, Mailbox};
 use crate::predicates::Predicate;
 use crate::selection::Selection;
 use crate::verdict::{AUTHENTICATION_RESULTS, RECEIVED, verdict_is};
+#[cfg(feature = "test-probes")]
 use crate::width::widen;
 
 /// The compiled-program size a pattern may reach, in bytes.
@@ -81,6 +83,7 @@ pub(crate) enum Compiled {
 #[derive(Debug)]
 pub struct Filter {
     /// The number of header values handed to the predicate so far, over every pass.
+    #[cfg(feature = "test-probes")]
     collected: AtomicU64,
     /// The predicate, compiled.
     compiled: Compiled,
@@ -161,6 +164,7 @@ impl Filter {
     /// A predicate naming only `Subject` collects one value per message that has the header
     /// and none from `Received` or `Authentication-Results`. This is a test probe and not part
     /// of the stable API.
+    #[cfg(feature = "test-probes")]
     #[doc(hidden)]
     #[must_use]
     pub fn headers_collected(&self) -> u64 {
@@ -176,6 +180,7 @@ impl Filter {
                     .any(|wanted| name.eq_ignore_ascii_case(wanted.as_bytes()))
             })
             .collect();
+        #[cfg(feature = "test-probes")]
         let _previous = self
             .collected
             .fetch_add(widen(headers.len()), Ordering::Relaxed);
@@ -224,6 +229,7 @@ impl Filter {
         let mut names = Vec::new();
         collect_names(predicate, &mut names);
         Ok(Self {
+            #[cfg(feature = "test-probes")]
             collected: AtomicU64::new(0),
             compiled: Compiled::build(predicate, "")?,
             names,
