@@ -98,20 +98,30 @@ pub struct ExportSummary {
 /// Dropping a `Staged` without committing removes the staged file or directory, leaving the
 /// target untouched.
 pub struct Staged {
-    /// The staging area or stream.
+    /// Which kind of destination was staged.
+    destination: DestinationKind,
+    /// The staging area or stream, with the target it commits to.
     kind: Kind,
     /// Whether an existing target is replaced on commit.
     overwrite: Overwrite,
-    /// The final path; `None` for a stream.
-    target: Option<PathBuf>,
 }
 
 /// The staging area behind a [`Staged`].
 enum Kind {
-    /// A staged directory, removed on drop.
-    Directory(TempDir),
-    /// A staged file, removed on drop.
-    File(NamedTempFile),
+    /// A staged directory, removed on drop, and the directory it commits to.
+    Directory {
+        /// The staging directory.
+        staging: TempDir,
+        /// The final path.
+        target: PathBuf,
+    },
+    /// A staged file, removed on drop, and the file it commits to.
+    File {
+        /// The staging file.
+        staging: NamedTempFile,
+        /// The final path.
+        target: PathBuf,
+    },
     /// The caller's writer.
     Stream(Box<dyn Write + Send>),
 }
@@ -152,7 +162,7 @@ impl fmt::Debug for Staged {
         formatter
             .debug_struct("Staged")
             .field("overwrite", &self.overwrite)
-            .field("target", &self.target)
+            .field("target", &self.target())
             .finish_non_exhaustive()
     }
 }
@@ -188,33 +198,27 @@ impl Destination {
     /// [`Overwrite::Refuse`]; this is checked before anything is created.
     /// [`MboxTurboError::Io`] when the staging area cannot be created.
     pub fn stage(self, overwrite: Overwrite) -> Result<Staged, MboxTurboError> {
-        match self {
+        let destination = self.kind();
+        let kind = match self {
             Self::Directory(target) => {
-                refuse_existing(&target, overwrite, DestinationKind::Directory)?;
-                let directory = staging_directory(parent_of(&target))
+                refuse_existing(&target, overwrite, destination)?;
+                let staging = staging_directory(parent_of(&target))
                     .map_err(|source| MboxTurboError::io(&target, source))?;
-                Ok(Staged {
-                    kind: Kind::Directory(directory),
-                    overwrite,
-                    target: Some(target),
-                })
+                Kind::Directory { staging, target }
             },
             Self::File(target) => {
-                refuse_existing(&target, overwrite, DestinationKind::File)?;
-                let file = NamedTempFile::new_in(parent_of(&target))
+                refuse_existing(&target, overwrite, destination)?;
+                let staging = NamedTempFile::new_in(parent_of(&target))
                     .map_err(|source| MboxTurboError::io(&target, source))?;
-                Ok(Staged {
-                    kind: Kind::File(file),
-                    overwrite,
-                    target: Some(target),
-                })
+                Kind::File { staging, target }
             },
-            Self::Stream(writer) => Ok(Staged {
-                kind: Kind::Stream(writer),
-                overwrite,
-                target: None,
-            }),
-        }
+            Self::Stream(writer) => Kind::Stream(writer),
+        };
+        Ok(Staged {
+            destination,
+            kind,
+            overwrite,
+        })
     }
 }
 
@@ -234,18 +238,19 @@ impl Staged {
     /// is [`Overwrite::Refuse`], and [`MboxTurboError::Io`] when flushing or renaming fails. The
     /// staged output is removed on failure.
     pub fn commit(self) -> Result<Option<PathBuf>, MboxTurboError> {
-        match (self.kind, self.target) {
-            (Kind::Directory(directory), Some(path)) => {
-                commit_directory(directory, path, self.overwrite).map(Some)
+        match self.kind {
+            Kind::Directory { staging, target } => {
+                commit_directory(staging, target, self.overwrite).map(Some)
             },
-            (Kind::File(file), Some(path)) => commit_file(file, path, self.overwrite).map(Some),
-            (Kind::Stream(mut writer), _) => {
+            Kind::File { staging, target } => {
+                commit_file(staging, target, self.overwrite).map(Some)
+            },
+            Kind::Stream(mut writer) => {
                 writer
                     .flush()
                     .map_err(|source| MboxTurboError::io(Path::new(STREAM_LABEL), source))?;
                 Ok(None)
             },
-            (Kind::Directory(_) | Kind::File(_), None) => Ok(None),
         }
     }
 
@@ -255,8 +260,8 @@ impl Staged {
     /// yields [`Output::Writer`].
     pub fn output(&mut self) -> Output<'_> {
         match &mut self.kind {
-            Kind::Directory(directory) => Output::Directory(directory.path()),
-            Kind::File(file) => Output::Writer(file),
+            Kind::Directory { staging, .. } => Output::Directory(staging.path()),
+            Kind::File { staging, .. } => Output::Writer(staging),
             Kind::Stream(writer) => Output::Writer(writer.as_mut()),
         }
     }
@@ -264,7 +269,10 @@ impl Staged {
     /// The final path, or `None` for a stream.
     #[must_use]
     pub fn target(&self) -> Option<&Path> {
-        self.target.as_deref()
+        match &self.kind {
+            Kind::Directory { target, .. } | Kind::File { target, .. } => Some(target),
+            Kind::Stream(_) => None,
+        }
     }
 
     /// The path an error about this destination names: the target, or `<stream>` for a stream.
@@ -277,14 +285,9 @@ impl Staged {
     /// [`MboxTurboError::UnsupportedDestination`] naming the staged kind and its target.
     #[must_use]
     pub fn unsupported(&self) -> MboxTurboError {
-        let kind = match self.kind {
-            Kind::Directory(_) => DestinationKind::Directory,
-            Kind::File(_) => DestinationKind::File,
-            Kind::Stream(_) => DestinationKind::Stream,
-        };
         MboxTurboError::UnsupportedDestination {
-            kind,
-            target: self.target.clone(),
+            kind: self.destination,
+            target: self.target().map(Path::to_path_buf),
         }
     }
 }
