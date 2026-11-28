@@ -1,6 +1,8 @@
 """Predicate builders and Trust: JSON forms, operators, eager validation, round trips."""
 
 import json
+import operator
+from collections.abc import Callable
 
 import pytest
 from hypothesis import given
@@ -101,11 +103,13 @@ def test_matches_rejects_bad_pattern_with_base_error() -> None:
     assert type(raised.value) is MboxTurboError
 
 
-@pytest.mark.parametrize('operator', ['&', '|'])
-def test_combining_with_a_non_predicate_raises_type_error(operator: str) -> None:
+@pytest.mark.parametrize('combine', [operator.and_, operator.or_])
+def test_combining_with_a_non_predicate_raises_type_error(
+    combine: Callable[[object, object], object],
+) -> None:
     predicate = header('x').exists()
     with pytest.raises(TypeError):
-        eval(f'predicate {operator} 1', {'predicate': predicate})  # noqa: S307
+        combine(predicate, 1)
 
 
 @pytest.mark.parametrize(
