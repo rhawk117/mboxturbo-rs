@@ -9,7 +9,7 @@
 //! | 64 | usage error: bad arguments, or a message position past the last message |
 //! | 65 | corrupt or stale index |
 //! | 66 | the mailbox does not exist (not found while opening it) |
-//! | 73 | the export target exists and `--overwrite` was not given |
+//! | 73 | the export target exists and `--overwrite` was not given, or cannot be replaced |
 //! | 74 | any other I/O error, including a path not found after the mailbox is open |
 //! | 129 | interrupted by SIGHUP |
 //! | 130 | interrupted by SIGINT (Ctrl-C), or cancelled with no signal |
@@ -28,7 +28,9 @@ mod dates;
 mod events;
 mod exit;
 mod export;
+mod failure;
 mod info;
+mod open;
 mod progress;
 mod select;
 mod show;
@@ -41,7 +43,8 @@ use std::process::ExitCode;
 use clap::{ColorChoice, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 use crate::events::Report;
-use crate::export::{ExportArgs, Failure};
+use crate::export::ExportArgs;
+use crate::failure::Failure;
 use crate::info::InfoArgs;
 use crate::progress::{Environment, Feedback};
 use crate::show::ShowArgs;
@@ -123,14 +126,14 @@ fn usage_error(error: &clap::Error) -> ExitCode {
     // A clap message that cannot be written (a closed stdout or stderr) has nowhere left to be
     // reported, so it exits 1, "any other failure", rather than the code it carried.
     let code = if error.print().is_err() {
-        1
+        exit::OTHER
     } else if error.use_stderr() {
         exit::USAGE
     } else {
         0
     };
     if json && error.use_stderr() && events::error(code, &error.to_string()).is_err() {
-        return ExitCode::from(74);
+        return ExitCode::from(exit::IO);
     }
     ExitCode::from(code)
 }
@@ -142,12 +145,12 @@ fn usage_error(error: &clap::Error) -> ExitCode {
 fn describe(failure: &Failure, report: Report) -> ExitCode {
     let line = format!("mboxturbo: {failure}");
     let code = if writeln!(io::stderr(), "{line}").is_err() {
-        1
+        exit::OTHER
     } else {
         failure.code()
     };
     if report == Report::Events && events::error(code, &line).is_err() {
-        return ExitCode::from(74);
+        return ExitCode::from(exit::IO);
     }
     ExitCode::from(code)
 }

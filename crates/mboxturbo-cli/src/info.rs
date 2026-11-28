@@ -7,7 +7,8 @@ use clap::Args;
 use mboxturbo::rfc3339;
 
 use crate::events::{self, Info, Report};
-use crate::export::{self, Failure};
+use crate::failure::{self, Failure};
+use crate::open::open;
 use crate::progress::{self, Feedback};
 
 /// The arguments of `mboxturbo info`.
@@ -27,8 +28,8 @@ pub(crate) struct InfoArgs {
 /// A [`Failure::Core`] for everything opening the mailbox refuses and for a write to standard
 /// output or standard error that fails.
 pub(crate) fn run(args: &InfoArgs, report: Report, feedback: Feedback) -> Result<(), Failure> {
-    let mailbox = export::open(&args.mailbox, args.index.as_deref())?;
-    progress::note_origin(feedback, mailbox.index_origin()).map_err(export::stderr_failure)?;
+    let mailbox = open(&args.mailbox, args.index.as_deref())?;
+    progress::note_origin(feedback, mailbox.index_origin()).map_err(failure::stderr_failure)?;
     let dates: Vec<i64> = (0..mailbox.len())
         .filter_map(|position| mailbox.date(position))
         .collect();
@@ -42,7 +43,7 @@ pub(crate) fn run(args: &InfoArgs, report: Report, feedback: Feedback) -> Result
         Report::Events => events::info(&info),
         Report::Text => print_text(&info),
     }
-    .map_err(export::stdout_failure)
+    .map_err(failure::stdout_failure)
 }
 
 /// Writes `info` as plain lines; the span lines are left out when no message has a date.

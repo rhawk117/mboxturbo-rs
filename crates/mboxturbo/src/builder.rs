@@ -60,6 +60,17 @@ pub enum IndexOrigin {
     Rebuilt,
 }
 
+impl IndexOrigin {
+    /// The name the origin has in events: `loaded` or `rebuilt`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Rebuilt => "rebuilt",
+        }
+    }
+}
+
 /// Opens a [`Mailbox`] with a chosen index location and block size.
 ///
 /// The default is the [`IndexPolicy::Sidecar`] policy with the default block size, which is what

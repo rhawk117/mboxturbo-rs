@@ -5,7 +5,7 @@ use std::io;
 use mboxturbo::MboxTurboError;
 
 /// Exit code for a failure with no more specific code.
-const OTHER: u8 = 1;
+pub(crate) const OTHER: u8 = 1;
 /// Exit code for a usage error.
 pub(crate) const USAGE: u8 = 64;
 /// Exit code for a corrupt or stale index.
@@ -15,17 +15,17 @@ const NOT_FOUND: u8 = 66;
 /// Exit code for an export target that exists without `--overwrite`.
 const TARGET_EXISTS: u8 = 73;
 /// Exit code for any other I/O error.
-const IO: u8 = 74;
+pub(crate) const IO: u8 = 74;
 /// Exit code for an interrupted export.
 const INTERRUPTED: u8 = 130;
 
 /// Where a failure arose, which decides whether a `NotFound` means the mailbox is missing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stage {
-    /// Everything after the mailbox is open, such as writing the export.
-    AfterOpen,
     /// The mailbox itself is missing: the only stage whose `NotFound` is exit 66.
     OpeningMailbox,
+    /// Everything except opening the mailbox, such as parsing arguments or writing the export.
+    Other,
 }
 
 /// Maps one failure to its process exit code.
@@ -89,7 +89,7 @@ mod tests {
     use super::*;
 
     fn code(error: &MboxTurboError) -> u8 {
-        error_code(Stage::AfterOpen, error)
+        error_code(Stage::Other, error)
     }
 
     fn opening_code(error: &MboxTurboError) -> u8 {

@@ -1,100 +1,31 @@
 //! The `export` subcommand: opens a mailbox and writes the selected messages in one format.
 
-use std::error::Error as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
-use std::{fmt, fs, io};
+use std::{fs, io};
 
 use clap::{Args, ValueEnum};
 use mboxturbo::{
     CancelToken, Column, Compression, CsvExporter, Destination, EmlExporter, Export, ExportSummary,
-    Exporter, Filter, FormulaEscaping, IndexOrigin, IndexPolicy, IpcExporter, JsonlExporter,
-    Mailbox, MailboxBuilder, MboxExporter, MboxTurboError, Narrowed, Narrowing, Overwrite,
-    ParquetExporter, Pipeline, Predicate, Progress,
+    Exporter, Filter, FormulaEscaping, IndexOrigin, IpcExporter, JsonlExporter, Mailbox,
+    MboxExporter, MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline,
+    Predicate, Progress,
 };
 
-use crate::dates::{Bounds, DateError};
+use crate::dates::Bounds;
 use crate::events::{self, Counts, File, Report, Start, Summary, Throttle};
-use crate::exit::{self, Stage};
+use crate::failure::{Failure, signal_failure, stderr_failure, stdout_failure};
+use crate::open::open;
 use crate::progress::{self, Bar, Feedback};
-use crate::select::{self, SelectError};
+use crate::select;
 use crate::signals::Interrupts;
 
 /// Messages per batch: the unit the pipeline extracts and a sink writes at a time.
 const BATCH_SIZE: usize = 4096;
 /// The `--output` value that means standard output.
 const STDOUT: &str = "-";
-
-/// Why an export failed, and so which exit code it gets.
-#[derive(Debug)]
-pub(crate) enum Failure {
-    /// The library failed at this stage.
-    Core {
-        /// The library error.
-        error: Box<MboxTurboError>,
-        /// Whether the mailbox was open when it failed.
-        stage: Stage,
-    },
-    /// A termination signal stopped the export; the process exits with the signal's code.
-    Interrupted {
-        /// The library's cancellation error.
-        error: Box<MboxTurboError>,
-        /// The exit code of the signal that arrived.
-        code: u8,
-    },
-    /// The command line was well formed but asks for something that cannot be done.
-    Usage(String),
-}
-
-impl Failure {
-    /// A library failure after the mailbox is open.
-    pub(crate) const fn after_open(error: Box<MboxTurboError>) -> Self {
-        Self::Core {
-            error,
-            stage: Stage::AfterOpen,
-        }
-    }
-
-    /// The process exit code for this failure.
-    pub(crate) fn code(&self) -> u8 {
-        match self {
-            Self::Core { error, stage } => exit::error_code(*stage, error),
-            Self::Interrupted { code, .. } => *code,
-            Self::Usage(_) => exit::USAGE,
-        }
-    }
-}
-
-impl fmt::Display for Failure {
-    #[expect(
-        clippy::renamed_function_params,
-        reason = "the trait calls it `f`, a one-letter name the min_ident_chars lint bans"
-    )]
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Core { error, .. } => write_chain(formatter, error),
-            Self::Interrupted { error, .. } => {
-                formatter.write_str("interrupted: ")?;
-                write_chain(formatter, error)
-            },
-            Self::Usage(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl From<DateError> for Failure {
-    fn from(error: DateError) -> Self {
-        Self::Usage(error.to_string())
-    }
-}
-
-impl From<SelectError> for Failure {
-    fn from(error: SelectError) -> Self {
-        Self::Usage(error.to_string())
-    }
-}
 
 /// The arguments of `mboxturbo export`.
 #[derive(Debug, Args)]
@@ -435,7 +366,7 @@ fn core_failure(error: MboxTurboError, interrupts: &Interrupts) -> Failure {
             error: Box::new(error),
             code,
         },
-        None => Failure::after_open(Box::new(error)),
+        None => Failure::other(Box::new(error)),
     }
 }
 
@@ -473,41 +404,6 @@ fn finish_events(reported: &Reported<'_>, summary: &ExportSummary, path: &Path) 
     })
 }
 
-/// Writes `error` and each of its causes, separated by `: `.
-fn write_chain(formatter: &mut fmt::Formatter<'_>, error: &MboxTurboError) -> fmt::Result {
-    write!(formatter, "{error}")?;
-    let mut cause = error.source();
-    while let Some(source) = cause {
-        write!(formatter, ": {source}")?;
-        cause = source.source();
-    }
-    Ok(())
-}
-
-/// An event that could not be written to standard output, as an I/O failure.
-pub(crate) fn stdout_failure(source: io::Error) -> Failure {
-    Failure::after_open(Box::new(MboxTurboError::Io {
-        path: PathBuf::from("standard output"),
-        source,
-    }))
-}
-
-/// Signal handlers that could not be installed, as an I/O failure.
-fn signal_failure(source: io::Error) -> Failure {
-    Failure::after_open(Box::new(MboxTurboError::Io {
-        path: PathBuf::from("signal handlers"),
-        source,
-    }))
-}
-
-/// A line that could not be written to standard error, as an I/O failure.
-pub(crate) fn stderr_failure(source: io::Error) -> Failure {
-    Failure::after_open(Box::new(MboxTurboError::Io {
-        path: PathBuf::from("standard error"),
-        source,
-    }))
-}
-
 /// The columns to extract: a fixed set for the formats that write whole messages, otherwise the
 /// requested columns by name, or the library defaults when none are named.
 fn columns(format: Format, requested: Option<&[String]>) -> Result<Vec<Column>, Failure> {
@@ -524,7 +420,8 @@ fn columns(format: Format, requested: Option<&[String]>) -> Result<Vec<Column>, 
     if let Some(fixed) = whole {
         if requested.is_some() {
             return Err(Failure::Usage(format!(
-                "--columns cannot be used with {format:?}, which writes whole messages"
+                "--columns cannot be used with {}, which writes whole messages",
+                format.name()
             )));
         }
         return Ok(fixed);
@@ -556,39 +453,9 @@ fn destination(format: Format, output: &Path) -> Result<Destination, Failure> {
         return Ok(Destination::Stream(Box::new(io::stdout())));
     }
     Err(Failure::Usage(format!(
-        "{format:?} output cannot be written to standard output, so `-o -` is not allowed"
+        "{} output cannot be written to standard output, so `-o -` is not allowed",
+        format.name()
     )))
-}
-
-/// Opens the mailbox, with the index at `index` when one is named.
-pub(crate) fn open(path: &Path, index: Option<&Path>) -> Result<Mailbox, Failure> {
-    let policy = index.map_or(IndexPolicy::Sidecar, |index_path| {
-        IndexPolicy::Path(index_path.to_path_buf())
-    });
-    MailboxBuilder::new()
-        .index(policy)
-        .open(path)
-        .map_err(|error| {
-            let stage = if is_missing(&error, path) {
-                Stage::OpeningMailbox
-            } else {
-                Stage::AfterOpen
-            };
-            Failure::Core {
-                error: Box::new(error),
-                stage,
-            }
-        })
-}
-
-/// Whether `error` is the mailbox at `mailbox` not existing, as opposed to any other missing path
-/// such as the index directory.
-fn is_missing(error: &MboxTurboError, mailbox: &Path) -> bool {
-    matches!(
-        error,
-        MboxTurboError::Io { path, source }
-            if path == mailbox && source.kind() == io::ErrorKind::NotFound
-    )
 }
 
 /// The messages to export: those `args` select by position, or every message, that also fall
@@ -640,18 +507,17 @@ fn filter(args: &ExportArgs) -> Result<Option<Filter>, Failure> {
     let text = match (&args.limits.where_json, &args.limits.where_file) {
         (Some(json), _) => json.clone(),
         (None, Some(path)) => fs::read_to_string(path).map_err(|source| {
-            Failure::after_open(Box::new(MboxTurboError::Io {
+            Failure::other(Box::new(MboxTurboError::Io {
                 path: path.clone(),
                 source,
             }))
         })?,
         (None, None) => return Ok(None),
     };
-    let predicate =
-        Predicate::from_json(&text).map_err(|error| Failure::after_open(Box::new(error)))?;
+    let predicate = Predicate::from_json(&text).map_err(|error| Failure::other(Box::new(error)))?;
     Filter::new(&predicate)
         .map(Some)
-        .map_err(|error| Failure::after_open(Box::new(error)))
+        .map_err(|error| Failure::other(Box::new(error)))
 }
 
 /// The ascending positions named by `ranges` (from `--select`) united with the `--select-file`
@@ -679,7 +545,7 @@ fn chosen_positions(
 /// The ranges named by the lines of the file at `path`; blank lines are ignored.
 fn select_file(path: &Path) -> Result<Vec<Range<usize>>, Failure> {
     let text = fs::read_to_string(path).map_err(|source| {
-        Failure::after_open(Box::new(MboxTurboError::Io {
+        Failure::other(Box::new(MboxTurboError::Io {
             path: path.to_path_buf(),
             source,
         }))

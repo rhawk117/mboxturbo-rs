@@ -165,8 +165,7 @@ pub(crate) fn file(file: &File<'_>) -> io::Result<()> {
 ///
 /// The I/O error of writing to standard output.
 pub(crate) fn index(origin: IndexOrigin) -> io::Result<()> {
-    let name = format!("{origin:?}").to_lowercase();
-    emit(&json!({ "v": VERSION, "event": "index", "origin": name }))
+    emit(&json!({ "v": VERSION, "event": "index", "origin": origin.name() }))
 }
 
 /// Writes an `info` event.

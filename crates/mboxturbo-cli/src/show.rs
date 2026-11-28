@@ -7,7 +7,8 @@ use clap::Args;
 use mboxturbo::MboxTurboError;
 
 use crate::events::Report;
-use crate::export::{self, Failure};
+use crate::failure::{self, Failure};
+use crate::open::open;
 use crate::progress::{self, Feedback};
 
 /// The arguments of `mboxturbo show`.
@@ -35,10 +36,10 @@ pub(crate) fn run(args: &ShowArgs, report: Report, feedback: Feedback) -> Result
             "--json cannot be used with `show`: standard output carries the message".to_owned(),
         ));
     }
-    let mailbox = export::open(&args.mailbox, args.index.as_deref())?;
-    progress::note_origin(feedback, mailbox.index_origin()).map_err(export::stderr_failure)?;
+    let mailbox = open(&args.mailbox, args.index.as_deref())?;
+    progress::note_origin(feedback, mailbox.index_origin()).map_err(failure::stderr_failure)?;
     let Some(raw) = mailbox.raw(args.position) else {
-        return Err(Failure::after_open(Box::new(
+        return Err(Failure::other(Box::new(
             MboxTurboError::PositionOutOfRange {
                 position: args.position,
                 len: mailbox.len(),
@@ -46,6 +47,6 @@ pub(crate) fn run(args: &ShowArgs, report: Report, feedback: Feedback) -> Result
         )));
     };
     let mut stdout = io::stdout().lock();
-    stdout.write_all(raw).map_err(export::stdout_failure)?;
-    stdout.flush().map_err(export::stdout_failure)
+    stdout.write_all(raw).map_err(failure::stdout_failure)?;
+    stdout.flush().map_err(failure::stdout_failure)
 }
