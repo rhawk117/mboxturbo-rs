@@ -232,6 +232,16 @@ struct Reported<'run> {
     report: Report,
     /// How many undated messages the date bounds excluded; `None` when no bound was given.
     undated: Option<usize>,
+    /// The cancellation shared with the export and the signal handlers.
+    watch: &'run Watch,
+}
+
+/// The token a signal cancels and the handlers that cancel it, installed before the first scan.
+struct Watch {
+    /// Cancelled by a signal, and by the observer when an event cannot be written.
+    cancel: CancelToken,
+    /// The signal handlers.
+    interrupts: Interrupts,
 }
 
 /// Receives the library's progress: redraws the bar and, with events, writes throttled
@@ -311,27 +321,24 @@ impl Observer {
 /// anything is written; a [`Failure::Core`] for everything the library refuses, including a
 /// predicate that is not valid, and for an event that cannot be written to standard output.
 ///
-/// The predicate scan and the date scan run before the signal handlers are installed, so a
-/// signal that arrives during them ends the process by its default action, with nothing
-/// written yet.
+/// The signal handlers are installed before anything is read or scanned, so a signal that
+/// arrives during the predicate scan or the date scan cancels it and is reported as
+/// [`Failure::Interrupted`], naming the `-o` target, with nothing written.
 pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Result<(), Failure> {
     refuse_events_on_stdout(args, report)?;
+    let cancel = CancelToken::new();
+    let interrupts = Interrupts::watch(cancel.clone()).map_err(signal_failure)?;
+    let watch = Watch { cancel, interrupts };
     let columns = columns(args.format, args.columns.as_deref())?;
     let destination = destination(args.format, &args.output)?;
-    let ranges = select::parse_all(&args.select)?;
-    let bounds = Bounds::parse(args.limits.since.as_deref(), args.limits.until.as_deref())?;
-    let filter = filter(args)?;
+    let restrictions = restrictions(args)?;
     let mailbox = Arc::new(open(&args.mailbox, args.index.as_deref())?);
-    let restrictions = Restrictions {
-        bounds,
-        filter,
-        ranges,
-    };
-    let selected = kept(args, restrictions, &mailbox)?;
+    let selected = kept(args, restrictions, &mailbox, &watch)?;
     let pipeline = Arc::new(Pipeline::new(columns, BATCH_SIZE));
     let exporter = args.format.exporter(mailbox.len());
     let origin = mailbox.index_origin();
     let export = Export::new(pipeline, mailbox, destination)
+        .cancel_token(watch.cancel.clone())
         .selection(selected.selection)
         .overwrite(args.overwrite_policy());
     let reported = Reported {
@@ -341,9 +348,20 @@ pub(crate) fn run(args: &ExportArgs, report: Report, feedback: Feedback) -> Resu
         origin,
         report,
         undated: selected.excluded_undated,
+        watch: &watch,
     };
     progress::note_origin(feedback, origin).map_err(stderr_failure)?;
     run_export(export, exporter, &reported)
+}
+
+/// Parses `--select`, `--since`, `--until` and the predicate, all before the mailbox is opened
+/// so a bad one costs no scan.
+fn restrictions(args: &ExportArgs) -> Result<Restrictions, Failure> {
+    Ok(Restrictions {
+        ranges: select::parse_all(&args.select)?,
+        bounds: Bounds::parse(args.limits.since.as_deref(), args.limits.until.as_deref())?,
+        filter: filter(args)?,
+    })
 }
 
 /// Standard output carries the events, so it cannot also carry the data.
@@ -371,11 +389,12 @@ fn run_export(
         write_start(reported).map_err(stdout_failure)?;
     }
     let failure = Arc::new(OnceLock::new());
-    let cancel = CancelToken::new();
-    let interrupts = Interrupts::watch(cancel.clone()).map_err(signal_failure)?;
-    let mut observer = Observer::new(reported, Arc::clone(&failure), cancel.clone());
+    let mut observer = Observer::new(
+        reported,
+        Arc::clone(&failure),
+        reported.watch.cancel.clone(),
+    );
     let result = export
-        .cancel_token(cancel)
         .on_progress(move |progress| observer.observe(progress))
         .run(exporter);
     if reported.feedback.draws() {
@@ -389,7 +408,7 @@ fn run_export(
             source.to_string(),
         )));
     }
-    let summary = result.map_err(|error| core_failure(error, &interrupts))?;
+    let summary = result.map_err(|error| core_failure(error, &reported.watch.interrupts))?;
     finish(reported, &summary)
 }
 
@@ -581,6 +600,7 @@ fn kept(
     args: &ExportArgs,
     restrictions: Restrictions,
     mailbox: &Mailbox,
+    watch: &Watch,
 ) -> Result<Narrowed, Failure> {
     let bounds = restrictions.bounds;
     let mut narrowing = Narrowing::new();
@@ -594,8 +614,22 @@ fn kept(
         narrowing = narrowing.filter(filter);
     }
     narrowing
-        .select(mailbox, None)
-        .map_err(|error| Failure::after_open(Box::new(error)))
+        .select(mailbox, Some(&watch.cancel))
+        .map_err(|error| scan_failure(error, args, watch))
+}
+
+/// The failure for an `error` from the scan: a cancellation names the `-o` target, or a stream
+/// for `-o -`, since the scan itself knows no target.
+fn scan_failure(error: MboxTurboError, args: &ExportArgs, watch: &Watch) -> Failure {
+    let named = if let MboxTurboError::Cancelled { written, .. } = error {
+        MboxTurboError::Cancelled {
+            target: (args.output.as_os_str() != STDOUT).then(|| args.output.clone()),
+            written,
+        }
+    } else {
+        error
+    };
+    core_failure(named, &watch.interrupts)
 }
 
 /// The filter that `--where` or `--where-file` asks for; `None` when the command line has

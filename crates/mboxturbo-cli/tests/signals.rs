@@ -18,6 +18,8 @@ mod signals {
     const LONG_MAILBOX: usize = 200_000;
     /// Enough csv text that standard output fills the pipe buffer when nobody reads it.
     const WIDE_MAILBOX: usize = 20_000;
+    /// Long enough for the CLI's signal watcher, which polls every 20 ms, to cancel the run.
+    const SETTLE: Duration = Duration::from_millis(250);
     /// How long the tests wait for something that should happen at once.
     const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -66,6 +68,58 @@ mod signals {
         /// The path the export writes, which does not exist before it runs.
         fn target(&self) -> PathBuf {
             self.out_dir().join("out.parquet")
+        }
+    }
+
+    /// A `--json` parquet export that reads `flag` from a FIFO, with `extra` arguments.
+    struct FifoRun {
+        child: Child,
+        events: BufReader<ChildStdout>,
+        fifo: PathBuf,
+    }
+
+    impl FifoRun {
+        /// Sends `signal` once the CLI has the FIFO open, then writes `contents` to it.
+        fn signal_then_write(&self, signal: &str, contents: &str) {
+            let mut writer = fs::OpenOptions::new()
+                .write(true)
+                .open(&self.fifo)
+                .expect("the FIFO is opened once the CLI reads it");
+            send(&self.child, signal);
+            thread::sleep(SETTLE);
+            writer
+                .write_all(contents.as_bytes())
+                .expect("the FIFO takes the text");
+        }
+
+        /// Starts the export; it blocks reading the FIFO.
+        fn start(fixture: &Fixture, flag: &str, extra: &[&str]) -> Self {
+            let fifo = fixture.dir.path().join("fifo");
+            let made = Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("the mkfifo command runs so the test can control when the CLI reads");
+            assert!(made.success(), "the FIFO is created");
+            let target = fixture.target();
+            let target_text = target.to_str().expect("the fixture path is UTF-8");
+            let fifo_text = fifo.to_str().expect("the fixture path is UTF-8");
+            let mut args = vec![
+                flag,
+                fifo_text,
+                "-o",
+                target_text,
+                "--format",
+                "parquet",
+                "--json",
+            ];
+            args.extend_from_slice(extra);
+            let mut child = fixture.spawn(&args);
+            let events = BufReader::new(child.stdout.take().expect("standard output is piped"));
+            Self {
+                child,
+                events,
+                fifo,
+            }
         }
     }
 
@@ -310,5 +364,45 @@ mod signals {
             .expect("the last line is JSON");
         assert_eq!(last["event"], "error", "the error event is still written");
         assert_eq!(last["code"], 1_i32, "the event carries the exit code");
+    }
+
+    /// Interrupts a run that is still reading `flag` from a FIFO, and checks that it exits with
+    /// `expected`, writes nothing and ends on the error event.
+    fn interrupt_before_the_scan(flag: &str, extra: &[&str], signal: &str, contents: &str) {
+        let expected = if signal == "TERM" { 143_i32 } else { 130_i32 };
+        let fixture = Fixture::new(LONG_MAILBOX);
+        let mut run = FifoRun::start(&fixture, flag, extra);
+        run.signal_then_write(signal, contents);
+        let events = events(run.events.lines());
+        assert_eq!(
+            exit_code(&mut run.child),
+            expected,
+            "{signal} before the export exits with its code"
+        );
+        assert!(
+            !fixture.target().exists(),
+            "an interrupted run leaves no target"
+        );
+        assert!(
+            is_empty(&fixture.out_dir()),
+            "an interrupted run leaves no staged file"
+        );
+        assert_interrupted(&events, expected);
+    }
+
+    #[test]
+    fn sigterm_while_the_where_file_is_read_exits_143() {
+        let predicate = r#"{"op":"contains","header":"subject","value":"o"}"#;
+        interrupt_before_the_scan("--where-file", &[], "TERM", predicate);
+    }
+
+    #[test]
+    fn sigint_before_a_since_scan_exits_130() {
+        interrupt_before_the_scan(
+            "--select-file",
+            &["--since", "2024-01-01"],
+            "INT",
+            "0..10\n",
+        );
     }
 }

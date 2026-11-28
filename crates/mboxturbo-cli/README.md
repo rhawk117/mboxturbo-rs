@@ -203,10 +203,6 @@ exported 0 messages, 0 bytes to - in 0.0s (4 undated excluded)
 
 <!-- Source: ran the built binary on an undated mailbox; crates/mboxturbo-cli/tests/dates.rs (since_is_inclusive_to_the_second_and_until_exclusive, a_plain_date_is_midnight_utc, the_summary_line_says_how_many_undated_messages_were_excluded, the_summary_event_counts_the_undated_messages_a_bound_excluded). -->
 
-A signal that arrives during the `--since`, `--until` or `--where` scan, before the export starts, ends the process by the signal's default action. No `--json` `error` event is written and nothing is written to the target. The [Signals](#signals) handling starts only once the export does.
-
-<!-- Source: crates/mboxturbo-cli/src/signals.rs and the T21 finding FC-2 on the scan that runs before the export starts. -->
-
 ## Predicates
 
 `--where` takes a predicate in its JSON form: an object with an `op`, such as `contains` or `equals` on a `header`, and the combinators `and` and `or`, whose `args` must not be empty. `--where-file` reads the same JSON from a file, and the two flags conflict. A predicate that is not JSON or is not valid exits 64 and names the operator at fault. A `--where-file` that cannot be read exits 74 and names the file.
