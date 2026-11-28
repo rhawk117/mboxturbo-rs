@@ -2,6 +2,8 @@
 //! record batches, and stream them to a consumer. See [`Export`](crate::Export) and
 //! [`ParquetExporter`](crate::ParquetExporter) for files.
 
+mod slots;
+
 use std::cell::OnceCell;
 use std::fmt::Debug;
 use std::ops::Range;
@@ -11,6 +13,8 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use mail_parser::{HeaderForm, HeaderName, MessageParser};
 use mboxturbo_headers::TrustSet;
+pub(crate) use slots::ColumnBuilder;
+use slots::column_builder;
 
 use crate::columns::Column;
 use crate::error::MboxTurboError;
@@ -21,11 +25,6 @@ use crate::mailbox::Mailbox;
 use crate::message::Timestamp;
 use crate::selection::{Plan, Selection};
 use crate::stream::Ordered;
-
-mod slots;
-
-pub(crate) use slots::ColumnBuilder;
-use slots::column_builder;
 
 /// Parquet page compression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -705,7 +704,7 @@ Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filen
     }
 
     #[test]
-    fn header_columns_get_slots_named_by_their_lowercase_header() {
+    fn header_columns_read_each_value_from_the_header_they_name() {
         let list = |column| list_cells(built(&column, HEADERS).as_list::<i32>(), 0);
         assert_eq!(
             list(Column::DkimSignature),

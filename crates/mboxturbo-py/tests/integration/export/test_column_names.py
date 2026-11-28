@@ -31,4 +31,5 @@ class TestColumnNames:
     @pytest.mark.parametrize('group', ['', 'ALL', 'default', 'opt-in'])
     def test_an_unknown_group_names_the_allowed_ones(self, group: str) -> None:
         with pytest.raises(ValueError, match=r"'all', 'defaults' or 'opt_in'"):
+            # Deliberately outside the Literal, to exercise the ValueError at runtime.
             mboxturbo.column_names(group=group)  # ty: ignore[invalid-argument-type]

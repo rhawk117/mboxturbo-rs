@@ -457,7 +457,8 @@ pub(crate) fn select_columns(
     })
 }
 
-/// The names of `columns`, in order.
+/// The names of `columns`, in order, in the form [`Column::from_name`] accepts (`header:<Name>` for
+/// header columns).
 fn names_of(columns: &[Column]) -> Vec<String> {
     columns
         .iter()

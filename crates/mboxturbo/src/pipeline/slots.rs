@@ -281,7 +281,7 @@ impl AddressHeader {
     }
 }
 
-/// Boxes `builder` as a [`ColumnBuilder`].
+/// Erases the builder type so every arm of [`column_builder`] returns the same boxed type.
 fn boxed(builder: impl ColumnBuilder + 'static) -> Box<dyn ColumnBuilder> {
     Box::new(builder)
 }
