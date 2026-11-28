@@ -116,7 +116,8 @@ impl ExportWriter {
 /// ``finish(out)`` on a Python object. A raised exception is recorded in the shared
 /// [`Failure`] and a core error is returned, so the driver discards the staged output.
 pub(crate) struct PythonExporter {
-    /// Bytes written by ``begin``, counted with the first batch because ``begin`` reports none.
+    /// Bytes written by ``begin``, counted with the first batch, or at ``finish`` when no batch
+    /// was written, because ``begin`` reports none.
     carried: u64,
     /// Where the Python exception goes when a call raises.
     failure: Arc<Failure>,

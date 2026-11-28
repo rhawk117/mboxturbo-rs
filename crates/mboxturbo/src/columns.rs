@@ -423,7 +423,7 @@ impl Column {
     /// This column's catalogue row; every header column shares one row.
     #[expect(
         clippy::expect_used,
-        reason = "the test `every_non_header_variant_has_a_named_row` pins one NAMED row per \
+        reason = "the test `every_non_header_variant_has_its_own_named_row` pins one NAMED row per \
                   non-header variant, so a miss is a catalogue bug, not an input"
     )]
     fn spec(&self) -> &'static ColumnSpec {
