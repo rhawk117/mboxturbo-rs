@@ -14,8 +14,9 @@ mod export {
     use arrow_array::cast::AsArray as _;
     use arrow_schema::SchemaRef;
     use mboxturbo::{
-        CancelToken, Column, Compression, Destination, DestinationKind, Export, Exporter, Mailbox,
-        MboxTurboError, Output, Overwrite, ParquetExporter, Pipeline, Progress, Selection, Staged,
+        CancelToken, Column, Compression, Destination, DestinationKind, Export, Exporter,
+        JsonlExporter, Mailbox, MboxTurboError, Output, Overwrite, ParquetExporter, Pipeline,
+        Progress, Selection, Staged,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::metadata::RowGroupMetaData;
@@ -92,18 +93,16 @@ mod export {
             batch: &RecordBatch,
             staged: &mut Staged,
         ) -> Result<u64, MboxTurboError> {
-            let target = staged.target().map(Path::to_path_buf);
+            let target = staged.target().map_or_else(PathBuf::new, Path::to_path_buf);
             let Output::Writer(writer) = staged.output() else {
                 return Err(staged.unsupported());
             };
             let mut bytes = 0_u64;
             for raw in batch.column(0).as_binary::<i64>().iter().flatten() {
-                writer
-                    .write_all(raw)
-                    .map_err(|source| match target.clone() {
-                        Some(path) => MboxTurboError::Io { path, source },
-                        None => MboxTurboError::Stream { source },
-                    })?;
+                writer.write_all(raw).map_err(|source| MboxTurboError::Io {
+                    path: target.clone(),
+                    source,
+                })?;
                 bytes = bytes.saturating_add(count(raw.len()));
             }
             Ok(bytes)
@@ -175,16 +174,29 @@ mod export {
         }
     }
 
-    /// A writer that refuses every write and flush.
-    struct BrokenStream;
+    /// A writer that refuses every write.
+    struct WriteFails;
 
-    impl Write for BrokenStream {
+    impl Write for WriteFails {
         fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::other("injected flush failure"))
+            Ok(())
         }
 
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
             Err(io::Error::other("injected write failure"))
+        }
+    }
+
+    /// A writer that accepts every write and refuses to flush.
+    struct FlushFails;
+
+    impl Write for FlushFails {
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("injected flush failure"))
+        }
+
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
         }
     }
 
@@ -305,12 +317,25 @@ mod export {
     fn a_failing_stream_write_is_a_stream_error_without_a_path() {
         let fixture = Fixture::new();
         let error = fixture
-            .export(Destination::Stream(Box::new(BrokenStream)))
-            .run(Box::new(StreamSink))
+            .export(Destination::Stream(Box::new(WriteFails)))
+            .run(Box::new(JsonlExporter::new()))
             .expect_err("the stream refuses the write");
         assert!(
             matches!(error, MboxTurboError::Stream { .. }),
-            "a stream failure names no file: {error:?}"
+            "a stream write failure names no file: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_stream_flush_is_a_stream_error_without_a_path() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .export(Destination::Stream(Box::new(FlushFails)))
+            .run(Box::new(JsonlExporter::new()))
+            .expect_err("the stream refuses the flush");
+        assert!(
+            matches!(error, MboxTurboError::Stream { .. }),
+            "a stream flush failure names no file: {error:?}"
         );
     }
 
