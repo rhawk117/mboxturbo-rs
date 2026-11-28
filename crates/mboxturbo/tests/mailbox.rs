@@ -14,8 +14,8 @@ mod mailbox {
     #[cfg(unix)]
     use mboxturbo::IndexSource;
     use mboxturbo::{
-        BoundaryCheck, Column, Corruption, IndexOrigin, IndexPolicy, Mailbox, MailboxBuilder,
-        MboxTurboError, Message, Pipeline, Selection,
+        BoundaryCheck, Column, Corruption, DateBounds, IndexOrigin, IndexPolicy, Mailbox,
+        MailboxBuilder, MboxTurboError, Message, Pipeline, Selection,
     };
     use rayon::prelude::*;
     use tempfile::TempDir;
@@ -320,7 +320,7 @@ body\n\n";
     #[test]
     fn a_date_range_includes_since_and_excludes_until_at_the_exact_second() {
         let (_directory, mailbox) = mixed();
-        let range = mailbox.date_range(Some(MIDNIGHT), Some(MIDNIGHT + 1));
+        let range = mailbox.date_range(DateBounds::new(Some(MIDNIGHT), Some(MIDNIGHT + 1)));
         assert_eq!(
             range.positions,
             vec![1],
@@ -330,13 +330,13 @@ body\n\n";
             range.undated, 2,
             "a missing and an unparsable Date are undated"
         );
-        let wider = mailbox.date_range(Some(MIDNIGHT - 1), Some(MIDNIGHT + 2));
+        let wider = mailbox.date_range(DateBounds::new(Some(MIDNIGHT - 1), Some(MIDNIGHT + 2)));
         assert_eq!(
             wider.positions,
             vec![0, 1, 2],
             "one second wider on both sides"
         );
-        let next = mailbox.date_range(Some(MIDNIGHT + 1), Some(MIDNIGHT + 2));
+        let next = mailbox.date_range(DateBounds::new(Some(MIDNIGHT + 1), Some(MIDNIGHT + 2)));
         assert_eq!(
             next.positions,
             vec![2],
@@ -348,16 +348,20 @@ body\n\n";
     fn an_open_bound_leaves_that_side_unlimited() {
         let (_directory, mailbox) = mixed();
         assert_eq!(
-            mailbox.date_range(Some(MIDNIGHT), None).positions,
+            mailbox
+                .date_range(DateBounds::new(Some(MIDNIGHT), None))
+                .positions,
             vec![1, 2],
             "since alone"
         );
         assert_eq!(
-            mailbox.date_range(None, Some(MIDNIGHT)).positions,
+            mailbox
+                .date_range(DateBounds::new(None, Some(MIDNIGHT)))
+                .positions,
             vec![0],
             "until alone"
         );
-        let unbounded = mailbox.date_range(None, None);
+        let unbounded = mailbox.date_range(DateBounds::new(None, None));
         assert_eq!(
             unbounded.positions,
             vec![0, 1, 2, 3, 4],
@@ -370,7 +374,7 @@ body\n\n";
     fn since_at_or_past_until_selects_nothing() {
         let (_directory, mailbox) = mixed();
         for until in [MIDNIGHT, MIDNIGHT - 1] {
-            let range = mailbox.date_range(Some(MIDNIGHT), Some(until));
+            let range = mailbox.date_range(DateBounds::new(Some(MIDNIGHT), Some(until)));
             assert!(range.positions.is_empty(), "since {MIDNIGHT} until {until}");
             assert_eq!(range.undated, 2, "undated is reported for an empty range");
         }
@@ -384,11 +388,11 @@ body\n\n";
             (None, Some(MIDNIGHT)),
             (Some(0), Some(MIDNIGHT)),
         ] {
-            let range = mailbox.date_range(since, until);
+            let range = mailbox.date_range(DateBounds::new(since, until));
             assert!(range.positions.is_empty(), "bounds {since:?}..{until:?}");
             assert_eq!(range.undated, 3, "bounds {since:?}..{until:?}");
         }
-        let unbounded = mailbox.date_range(None, None);
+        let unbounded = mailbox.date_range(DateBounds::new(None, None));
         assert_eq!(unbounded.positions, vec![0, 1, 2], "no bound returns all");
         assert_eq!(unbounded.undated, 3, "all three are undated");
     }
@@ -396,7 +400,7 @@ body\n\n";
     #[test]
     fn a_date_range_selects_exactly_its_messages_through_the_pipeline() {
         let (_directory, mailbox) = mixed();
-        let range = mailbox.date_range(Some(MIDNIGHT - 1), Some(MIDNIGHT + 1));
+        let range = mailbox.date_range(DateBounds::new(Some(MIDNIGHT - 1), Some(MIDNIGHT + 1)));
         assert_eq!(range.positions, vec![0, 1], "the range under test");
         let pipeline = Arc::new(Pipeline::new(vec![Column::Position, Column::Subject], 10));
         let batch = pipeline

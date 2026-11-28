@@ -237,15 +237,15 @@ impl Mailbox {
     /// The positions of the messages whose index date `d` satisfies `since <= d < until`, in
     /// ascending order, and the number of messages with no index date.
     ///
-    /// Bounds are unix seconds, inclusive for `since` and exclusive for `until`; `None` leaves
-    /// that side open. Both bounds with `since >= until` select nothing. A message without an
+    /// The bounds are unix seconds, inclusive for `since` and exclusive for `until`; an open
+    /// side has no limit. Both bounds with `since >= until` select nothing. A message without an
     /// index date (no Date header, or one that did not parse) matches no bound, so it is
     /// excluded whenever either bound is given; with neither, every position is returned.
     /// [`DateRange::undated`] counts those messages in every case. Only the index is read,
     /// never the message bytes.
     #[must_use]
-    pub fn date_range(&self, since: Option<i64>, until: Option<i64>) -> DateRange {
-        self.dates_among(0..self.len(), DateBounds::new(since, until))
+    pub fn date_range(&self, bounds: DateBounds) -> DateRange {
+        self.dates_among(0..self.len(), bounds)
     }
 
     /// [`Mailbox::date_range`] over `candidates`, which must all be below the mailbox length:

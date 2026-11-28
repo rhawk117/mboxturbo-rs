@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use mboxturbo::days_from_civil;
+use mboxturbo::{DateBounds, days_from_civil};
 
 /// Seconds in a day.
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -35,32 +35,16 @@ impl fmt::Display for DateError {
     }
 }
 
-/// The date bounds of an export, as unix seconds; `since` is inclusive and `until` exclusive.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Bounds {
-    /// The earliest date kept; `None` leaves that side open.
-    pub since: Option<i64>,
-    /// The first date not kept; `None` leaves that side open.
-    pub until: Option<i64>,
-}
-
-impl Bounds {
-    /// Whether neither bound is given, so every message is in range.
-    pub(crate) const fn is_open(&self) -> bool {
-        self.since.is_none() && self.until.is_none()
-    }
-
-    /// The bounds named by the `--since` and `--until` values.
-    ///
-    /// # Errors
-    ///
-    /// A [`DateError`] naming the flag and value of the first one that does not parse.
-    pub(crate) fn parse(since: Option<&str>, until: Option<&str>) -> Result<Self, DateError> {
-        Ok(Self {
-            since: since.map(|text| parse("--since", text)).transpose()?,
-            until: until.map(|text| parse("--until", text)).transpose()?,
-        })
-    }
+/// The bounds named by the `--since` and `--until` values.
+///
+/// # Errors
+///
+/// A [`DateError`] naming the flag and value of the first one that does not parse.
+pub(crate) fn bounds(since: Option<&str>, until: Option<&str>) -> Result<DateBounds, DateError> {
+    Ok(DateBounds::new(
+        since.map(|text| parse("--since", text)).transpose()?,
+        until.map(|text| parse("--until", text)).transpose()?,
+    ))
 }
 
 /// Unix seconds of `text`, the value of `flag`.
@@ -251,7 +235,7 @@ mod tests {
 
     #[test]
     fn the_error_names_the_flag_and_the_value() {
-        let error = Bounds::parse(None, Some("soon")).expect_err("`soon` is not a WHEN");
+        let error = bounds(None, Some("soon")).expect_err("`soon` is not a WHEN");
         assert_eq!(
             error,
             DateError {

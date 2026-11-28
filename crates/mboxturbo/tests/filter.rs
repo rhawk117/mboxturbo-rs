@@ -8,8 +8,8 @@ mod filter {
 
     use arrow_array::cast::AsArray as _;
     use mboxturbo::{
-        CancelToken, Column, Filter, Mailbox, MboxTurboError, Narrowing, Pipeline, Predicate,
-        PredicateFault, Selection, TrustSet, VerdictMethod,
+        CancelToken, Column, DateBounds, Filter, Mailbox, MboxTurboError, Narrowing, Pipeline,
+        Predicate, PredicateFault, Selection, TrustSet, VerdictMethod,
     };
     use proptest::prelude::*;
     use tempfile::TempDir;
@@ -482,7 +482,7 @@ Subject: m{index}\n{flag}\nbody\n\n"
         let fixture = Fixture::with(VERDICTS);
         let error = Narrowing::new()
             .positions(vec![1, 3, 9])
-            .dates(Some(0), None)
+            .dates(DateBounds::new(Some(0), None))
             .select(&fixture.mailbox, None)
             .expect_err("position 3 is past a mailbox of 3");
         assert!(

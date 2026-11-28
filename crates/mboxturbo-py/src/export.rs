@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use mboxturbo::{
-    Column, Compression, Destination, DestinationKind, Export, ExportSummary, Exporter, Filter,
-    MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline, Progress,
+    Column, Compression, DateBounds, Destination, DestinationKind, Export, ExportSummary, Exporter,
+    Filter, MboxTurboError, Narrowed, Narrowing, Overwrite, ParquetExporter, Pipeline, Progress,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -65,16 +65,14 @@ impl CancelToken {
 /// The narrowing a ``select`` call asks for, converted from its Python arguments.
 #[derive(Debug)]
 pub(crate) struct Filters {
+    /// The index dates kept.
+    dates: DateBounds,
     /// The only positions that may be kept.
     positions: Option<Vec<usize>>,
     /// The predicate rows must satisfy.
     predicate: Option<mboxturbo::Predicate>,
-    /// The inclusive lower bound of the index date, in unix seconds.
-    since: Option<i64>,
     /// The trust set that decides verdicts and trusted flags.
     trust: Option<mboxturbo::TrustSet>,
-    /// The exclusive upper bound of the index date, in unix seconds.
-    until: Option<i64>,
 }
 
 /// Chosen columns over a mailbox. Any Arrow consumer reads it directly (``pyarrow.table``,
@@ -126,13 +124,15 @@ impl Filters {
         Ok(Self {
             positions,
             predicate: predicate.map(|wrapped| wrapped.predicate().clone()),
-            since: since
-                .map(|moment| unix_seconds(py, moment, "since"))
-                .transpose()?,
+            dates: DateBounds::new(
+                since
+                    .map(|moment| unix_seconds(py, moment, "since"))
+                    .transpose()?,
+                until
+                    .map(|moment| unix_seconds(py, moment, "until"))
+                    .transpose()?,
+            ),
             trust: trust.map(|wrapped| wrapped.trust_set().clone()),
-            until: until
-                .map(|moment| unix_seconds(py, moment, "until"))
-                .transpose()?,
         })
     }
 
@@ -143,7 +143,7 @@ impl Filters {
         mailbox: &mboxturbo::Mailbox,
         filter: Option<&Filter>,
     ) -> Result<Narrowed, Box<MboxTurboError>> {
-        let mut narrowing = Narrowing::new().dates(self.since, self.until);
+        let mut narrowing = Narrowing::new().dates(self.dates);
         if let Some(positions) = &self.positions {
             narrowing = narrowing.positions(positions.clone());
         }

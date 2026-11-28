@@ -309,11 +309,10 @@ impl<'filter> Narrowing<'filter> {
         )
     }
 
-    /// This narrowing keeping only the messages whose index date is at or after `since` and
-    /// before `until`, in unix seconds; `None` leaves that side open. A message with no index
-    /// date is dropped once either bound is given.
-    pub const fn dates(mut self, since: Option<i64>, until: Option<i64>) -> Self {
-        self.dates = DateBounds::new(since, until);
+    /// This narrowing keeping only the messages whose index date `bounds` admit. A message with
+    /// no index date is dropped once either bound is given.
+    pub const fn dates(mut self, bounds: DateBounds) -> Self {
+        self.dates = bounds;
         self
     }
 
